@@ -8733,13 +8733,14 @@ def _render_streamlit_tab_analises(
             margin=dict(t=100, l=56, r=52, b=112),
         )
         _xr_m = _plotly_xaxis_range_from_dates(dates)
-        if _xr_m:
-            _lo_m = {**_lo_m_base, "xaxis": {**_lo_m_base["xaxis"], "range": _xr_m}}
-        else:
-            _lo_m = _lo_m_base
-        fig_m.update_layout(**_lo_m)
-        st.plotly_chart(fig_m, width="stretch", config=_pc)
-        _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
+    
+    if _xr_m:
+        _lo_m = {**_lo_m_base, "xaxis": {**_lo_m_base["xaxis"], "range": _xr_m}}
+    else:
+        _lo_m = _lo_m_base
+    fig_m.update_layout(**_lo_m)
+    st.plotly_chart(fig_m, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
     st.divider()
     oa_key, oa_model = _openai_key_and_model()
