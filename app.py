@@ -439,6 +439,18 @@ from sklearn.base import clone
 from sklearn.metrics import mean_absolute_error
 from tqdm.auto import tqdm
 
+
+def _pv_tqdm(*args: Any, **kwargs: Any) -> Any:
+    """tqdm com flush frequente e intervalo curto — no Streamlit a barra deixa de parecer congelada."""
+    import sys
+
+    kwargs.setdefault("file", sys.stderr)
+    kwargs.setdefault("mininterval", 0.12)
+    kwargs.setdefault("miniters", 1)
+    kwargs.setdefault("dynamic_ncols", True)
+    return tqdm(*args, **kwargs)
+
+
 def _clip_pos(arr: np.ndarray, cap: float) -> np.ndarray:
     return np.clip(np.nan_to_num(arr, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap)
 
@@ -471,7 +483,7 @@ def run_model_benchmark(
 
     it = specs
     if show_progress:
-        it = tqdm(specs, desc="Benchmark modelos", leave=False, unit="m")
+        it = _pv_tqdm(specs, desc="Benchmark modelos", leave=False, unit="m")
 
     for name, tpl, use_sw in it:
         spec_by_name[name] = (tpl, use_sw)
@@ -1024,6 +1036,11 @@ def _optuna_objective_lgbm(
     if LGBMRegressor is None:
         raise RuntimeError("lightgbm não instalado")
 
+    import sys
+
+    sys.stderr.write(f"\n[Optuna] Trial {trial.number + 1} • {target_name} • H={horizon}\n")
+    sys.stderr.flush()
+
     is_qtd = target_name == "qtd"
     long_h = int(horizon) >= 21
     n = max(int(len(X_train)), 35)
@@ -1069,24 +1086,30 @@ def _optuna_objective_lgbm(
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     scores: list[float] = []
-    for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
-        model = LGBMRegressor(**param)
-        y_tr = y_train.iloc[tr_idx]
-        sw = sample_weights(y_tr, True, target_name, horizon)
-        model.fit(X_train.iloc[tr_idx], y_tr, sample_weight=sw)
-        p = model.predict(X_train.iloc[va_idx])
-        fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
-        scores.append(fold_mae)
-        trial.report(float(np.mean(scores)), step)
-        if step >= 1 and trial.should_prune():
-            raise optuna.TrialPruned()
+    try:
+        for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
+            sys.stderr.write(f"\r[Optuna] trial {trial.number + 1} • fold {step + 1}/{n_splits}…\033[K")
+            sys.stderr.flush()
+            model = LGBMRegressor(**param)
+            y_tr = y_train.iloc[tr_idx]
+            sw = sample_weights(y_tr, True, target_name, horizon)
+            model.fit(X_train.iloc[tr_idx], y_tr, sample_weight=sw)
+            p = model.predict(X_train.iloc[va_idx])
+            fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
+            scores.append(fold_mae)
+            trial.report(float(np.mean(scores)), step)
+            if step >= 1 and trial.should_prune():
+                raise optuna.TrialPruned()
 
-    mean_mae = float(np.mean(scores))
-    std_mae = float(np.std(scores)) if len(scores) > 1 else 0.0
-    spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
-    pen_std = 0.12 if long_h else 0.15
-    pen_sp = 0.09 if long_h else 0.105
-    return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
+        mean_mae = float(np.mean(scores))
+        std_mae = float(np.std(scores)) if len(scores) > 1 else 0.0
+        spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
+        pen_std = 0.12 if long_h else 0.15
+        pen_sp = 0.09 if long_h else 0.105
+        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
+    finally:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def _wrap_log(reg: Any) -> Any:
@@ -1483,7 +1506,7 @@ def _pick_super_ensemble(
     scored: list[tuple[float, str, Pipeline, bool]] = []
     it = specs
     if show_progress:
-        it = tqdm(
+        it = _pv_tqdm(
             specs,
             desc=f"Candidatos ({target_name})",
             leave=False,
@@ -2732,7 +2755,7 @@ def _inject_ts_and_stl_features(
         seas_amp = np.zeros(n)
         idx_iter = range(win, n)
         if show_progress:
-            idx_iter = tqdm(
+            idx_iter = _pv_tqdm(
                 idx_iter,
                 desc=f"STL {short}",
                 leave=False,
@@ -4617,30 +4640,32 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         {{ x: dates, y: D.vol_agend, name: 'Agend.', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(59,130,246,0.4)', type: 'scatter', mode: 'lines' }},
         {{ x: dates, y: D.vol_visit, name: 'Visitas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(99,102,241,0.4)', type: 'scatter', mode: 'lines' }},
         {{ x: dates, y: D.vol_pastas, name: 'Pastas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(139,92,246,0.45)', type: 'scatter', mode: 'lines' }},
-        {{ x: dates, y: D.target_qtd, name: 'Vendas (qtd)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
-        {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (mi R$)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
+        {{ x: dates, y: D.target_qtd, name: 'Vendas (linha)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (linha)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
       ], {{
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
-        margin: {{ t: 40, l: 52, r: 56, b: 72 }},
-        xaxis: Object.assign({{ title: 'Data' }}, xAxisRangeFromDates(dates)),
-        yaxis: {{ title: 'Funil (empilhado)', gridcolor: '#e5e7eb' }},
-        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Qtd vendas', showgrid: false }},
-        yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'VGV mi', showgrid: false }},
-        legend: {{ orientation: 'h', y: -0.28 }}
+        margin: {{ t: 96, l: 52, r: 56, b: 56 }},
+        xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+        yaxis: {{ title: 'Eixo Y₁ — funil empilhado', gridcolor: '#e5e7eb' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — qtd (/ dia)', showgrid: false }},
+        yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'Eixo Y₃ — valor (mi R$ / dia)', showgrid: false }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.06, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, font: {{ size: 10 }}, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
       }}, {{ responsive: true }});
 
       var dl = D.dow_labels || [];
       Plotly.newPlot('an_dow', [
-        {{ x: dl, y: D.dow_mean_qtd || [], name: 'Qtd média', type: 'bar', marker: {{ color: '#334155' }} }},
-        {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'VGV médio (mi)', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
+        {{ x: dl, y: D.dow_mean_qtd || [], name: 'Barras — qtd', type: 'bar', marker: {{ color: '#334155' }} }},
+        {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'Barras — VGV', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
       ], {{
         barmode: 'group',
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
-        yaxis: {{ title: 'Qtd' }},
-        yaxis2: {{ overlaying: 'y', side: 'right', title: 'mi R$' }},
+        xaxis: {{ title: 'Eixo X — dia da semana' }},
+        yaxis: {{ title: 'Eixo Y₁ — média qtd (/ dia)' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — média VGV (mi R$ / dia)' }},
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
-        margin: {{ t: 28, l: 48, r: 48, b: 48 }}
+        margin: {{ t: 56, l: 48, r: 48, b: 48 }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.04, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#e2e8f0', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
       }}, {{ responsive: true }});
 
       var labs = D.corr_labels || [];
@@ -4667,7 +4692,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           marker: {{ size: 7, opacity: 0.5, color: '#3b82f6', line: {{ width: 0.5, color: '#ffffff' }} }}
         }}], {{
           paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
-          xaxis: {{ title: 'Leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Vendas (qtd)', gridcolor: '#e5e7eb' }},
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — qtd vendida', gridcolor: '#e5e7eb' }},
           margin: {{ t: 20, l: 52, r: 28, b: 52 }},
           font: {{ family: 'Plus Jakarta Sans', size: 11 }}
         }}, {{ responsive: true }});
@@ -4676,7 +4701,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           marker: {{ size: 7, opacity: 0.5, color: '#0d9488', line: {{ width: 0.5, color: '#ffffff' }} }}
         }}], {{
           paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
-          xaxis: {{ title: 'Leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'VGV (mi R$)', gridcolor: '#e5e7eb' }},
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — VGV (mi R$)', gridcolor: '#e5e7eb' }},
           margin: {{ t: 20, l: 52, r: 28, b: 52 }},
           font: {{ family: 'Plus Jakarta Sans', size: 11 }}
         }}, {{ responsive: true }});
@@ -4695,9 +4720,10 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
           title: 'Macro (z-score por série)',
           font: {{ family: 'Plus Jakarta Sans', size: 11 }},
-          margin: {{ t: 48, l: 48, r: 28, b: 48 }},
-          xaxis: Object.assign({{}}, xAxisRangeFromDates(dates)),
-          yaxis: {{ title: 'z' }}, legend: {{ orientation: 'h', y: -0.22 }}
+          margin: {{ t: 72, l: 48, r: 28, b: 48 }},
+          xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+          yaxis: {{ title: 'Eixo Y — z-score' }},
+          legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.05, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
         }}, {{ responsive: true }});
       }} else {{
         document.getElementById('an_macro_wrap').style.display = 'none';
@@ -5227,6 +5253,21 @@ PLOT_GRID = "#e2e8f0"
 PLOTLY_PAPER_BG = "rgba(0,0,0,0)"
 PLOTLY_PLOT_BG = "rgba(0,0,0,0)"
 
+# Legenda acima da área do gráfico (evita confundir com títulos dos eixos em baixo)
+def _plotly_legend_top() -> dict[str, Any]:
+    return dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.04,
+        x=0.5,
+        xanchor="center",
+        font=dict(size=10),
+        bgcolor="rgba(248,250,252,0.94)",
+        bordercolor="#cbd5e1",
+        borderwidth=1,
+        title=dict(text="Séries", font=dict(size=10, color="#64748b")),
+    )
+
 
 def _plotly_layout_direcional(
     title: str | None = None,
@@ -5287,18 +5328,6 @@ def _plotly_layout_direcional(
     return lo
 
 
-def _plotly_traces_hidden_until_legend_click(fig: Any) -> None:
-    """
-    Todas as séries começam ocultas; o utilizador clica nos itens da legenda para mostrá-las
-    (comportamento nativo do Plotly com visible='legendonly').
-    """
-    try:
-        if len(fig.data) > 1:
-            fig.update_traces(visible="legendonly")
-    except (AttributeError, TypeError):
-        pass
-
-
 def _plotly_xaxis_range_from_dates(dates: Any) -> list[Any] | None:
     """Intervalo [mín, máx] das datas da série para o eixo X (sem folga além do necessário)."""
     if not dates:
@@ -5332,6 +5361,42 @@ SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in
     "true",
     "yes",
 )
+
+
+def _configure_streamlit_progress() -> None:
+    """Reduz bufferização da saída e força flush nas barras tqdm (Streamlit / terminal)."""
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+    try:
+        import tqdm.std as _tqdm_std
+
+        if getattr(_tqdm_std.tqdm, "_pv_flush_patched", False):
+            return
+        _orig_update = _tqdm_std.tqdm.update
+
+        def _update_flush(self: Any, n: int = 1) -> Any:
+            r = _orig_update(self, n)
+            try:
+                fp = getattr(self, "fp", None)
+                if fp is not None and hasattr(fp, "flush"):
+                    fp.flush()
+            except Exception:
+                pass
+            return r
+
+        _tqdm_std.tqdm.update = _update_flush  # type: ignore[method-assign]
+        _tqdm_std.tqdm._pv_flush_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 
 DEFAULT_SPREADSHEET_IDS: dict[str, str] = {
     "formulario_previsao": "1lBliB3AjR5vJyRy9SoDi6DQOA9x5LC5wYfNNo5cz0bE",
@@ -5413,7 +5478,7 @@ def inject_css() -> None:
   100% {{ background-position: 200% 50%; }}
 }}
 :root {{
-  --pv-content-max: min(880px, 93vw);
+  --pv-content-max: min(1320px, 98vw);
 }}
 html, body {{
   font-family: 'Inter', sans-serif;
@@ -5487,9 +5552,36 @@ header[data-testid="stHeader"],
 [data-testid="stHeader"] button:hover {{
   background: rgba(255, 255, 255, 0.12) !important;
 }}
+/* Tabelas HTML (ex.: Introdução): ocupam toda a largura útil do cartão */
+.pv-fullbleed-table-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 0 1rem 0 !important;
+  box-sizing: border-box;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}}
+.pv-fullbleed-table-wrap table {{
+  width: 100% !important;
+  border-collapse: collapse;
+  table-layout: auto;
+}}
+.pv-fullbleed-table-wrap th,
+.pv-fullbleed-table-wrap td {{
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}}
+/* Dataframes Streamlit: mesma largura útil (evita coluna estreita no cartão largo) */
+div[data-testid="stDataFrame"],
+div[data-testid="stDataFrame"] > div,
+div[data-testid="stDataFrameResizable"] {{
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+}}
 [data-testid="stMain"] {{
-  padding-left: clamp(4px, 1.2vw, 16px) !important;
-  padding-right: clamp(4px, 1.2vw, 16px) !important;
+  padding-left: clamp(2px, 0.9vw, 14px) !important;
+  padding-right: clamp(2px, 0.9vw, 14px) !important;
   padding-top: clamp(12px, 3.5vh, 40px) !important;
   padding-bottom: clamp(14px, 4vh, 44px) !important;
   box-sizing: border-box !important;
@@ -5506,7 +5598,7 @@ section.main > div {{
   margin-right: auto !important;
   margin-top: clamp(4px, 1vh, 14px) !important;
   margin-bottom: clamp(4px, 1vh, 14px) !important;
-  padding: 1rem clamp(0.65rem, 2vw, 1rem) 1.1rem clamp(0.65rem, 2vw, 1rem) !important;
+  padding: 1rem clamp(0.5rem, 1.6vw, 1.1rem) 1.1rem clamp(0.5rem, 1.6vw, 1.1rem) !important;
   background: rgba(255, 255, 255, 0.97) !important;
   backdrop-filter: blur(14px) saturate(1.2);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
@@ -5624,11 +5716,20 @@ div[data-testid="stTabs"] [aria-selected="true"] {{
 }}
 [data-testid="stMarkdownContainer"] p.pv-section-title,
 [data-testid="stMarkdownContainer"] p.pv-hero-title,
-[data-testid="stMarkdownContainer"] p.pv-hero-sub {{
+[data-testid="stMarkdownContainer"] p.pv-hero-sub,
+[data-testid="stMarkdownContainer"] p.pv-foot,
+[data-testid="stMarkdownContainer"] .pv-hero-block,
+[data-testid="stMarkdownContainer"] .pv-foot-wrap {{
   text-align: center !important;
   text-justify: auto !important;
   hyphens: none !important;
   -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"]:has(.pv-hero-block),
+[data-testid="stMarkdownContainer"]:has(.pv-foot-wrap) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
 }}
 [data-testid="stMarkdownContainer"] h1,
 [data-testid="stMarkdownContainer"] h2,
@@ -5660,6 +5761,25 @@ div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] p {{
 [data-testid="stCaptionContainer"],
 [data-testid="stCaptionContainer"] * {{
   color: #475569 !important;
+}}
+/* Legenda sob métricas (Análises): matriz diária — centrada */
+[data-testid="stMarkdownContainer"] p.pv-caption-center {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+  color: #475569 !important;
+  font-size: 0.875rem !important;
+  line-height: 1.5 !important;
+  margin: 0.35rem auto 0.85rem auto !important;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}}
+[data-testid="stMarkdownContainer"]:has(p.pv-caption-center) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
 }}
 [data-testid="stWidgetLabel"] label,
 [data-testid="stWidgetLabel"] p,
@@ -5817,6 +5937,26 @@ a[href*="wa.me"] {{
   color: {COR_AZUL_ESC};
   box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
 }}
+/* Bloco do título principal: ocupa a largura e centra texto (evita herdar alinhamento do Streamlit) */
+.pv-hero-block {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  box-sizing: border-box !important;
+  text-align: center !important;
+  display: block !important;
+}}
+.pv-hero-block p {{
+  text-align: center !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+[data-testid="element-container"]:has(.pv-hero-block),
+[data-testid="stVerticalBlock"] [data-testid="stMarkdownContainer"]:has(.pv-hero-block) {{
+  width: 100% !important;
+  max-width: 100% !important;
+}}
 .pv-logo-wrap, .ficha-logo-wrap {{
   text-align: center;
   padding: 0.1rem 0 0.45rem 0;
@@ -5912,12 +6052,23 @@ div.metric-card .val {{
   color: {COR_AZUL_ESC} !important;
   font-weight: 600 !important;
 }}
+.pv-foot-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  text-align: center !important;
+  display: block !important;
+  box-sizing: border-box !important;
+}}
 .pv-foot, .footer {{
-  text-align: center;
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   padding: 0.85rem 0 0.35rem 0;
   color: {COR_TEXTO_MUTED};
   font-size: 0.82rem;
-  margin-top: 1rem;
+  margin: 1rem auto 0 auto;
   border-top: 1px solid {COR_BORDA};
 }}
 </style>
@@ -6673,25 +6824,25 @@ def _render_tab_introducao() -> None:
     )
     st.markdown(
         """
-<div style="text-align:center;margin:0 auto 1rem auto;overflow-x:auto">
-<table style="margin:0 auto;border-collapse:collapse;font-size:0.92rem;color:#334155">
+<div class="pv-fullbleed-table-wrap">
+<table style="font-size:0.92rem;color:#334155">
 <thead><tr style="border-bottom:2px solid #e2e8f0">
-<th style="padding:8px 12px;text-align:center">Bloco</th>
-<th style="padding:8px 12px;text-align:center">Conteúdo típico</th>
+<th style="padding:10px 12px;text-align:left;width:22%">Bloco</th>
+<th style="padding:10px 12px;text-align:left">Conteúdo típico</th>
 </tr></thead>
 <tbody>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Descritivas</td>
-<td style="padding:8px;text-align:center">Média, mediana, moda, DP, quartis, percentis, curtose</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Outliers IQR</td>
-<td style="padding:8px;text-align:center">Limites Q1−1,5·IQR e Q3+1,5·IQR</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Correlação</td>
-<td style="padding:8px;text-align:center">Pearson entre <em>features</em> e alvos amostrados</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">VIF</td>
-<td style="padding:8px;text-align:center">Redundância linear (subconjunto de colunas)</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Distribuições</td>
-<td style="padding:8px;text-align:center">Histogramas de qtd e VGV diários</td></tr>
-<tr><td style="padding:8px;text-align:center">Perfil semanal</td>
-<td style="padding:8px;text-align:center">Médias por dia da semana</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Descritivas</td>
+<td style="padding:10px 12px;text-align:left">Média, mediana, moda, DP, quartis, percentis, curtose</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Outliers IQR</td>
+<td style="padding:10px 12px;text-align:left">Limites Q1−1,5·IQR e Q3+1,5·IQR</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Correlação</td>
+<td style="padding:10px 12px;text-align:left">Pearson entre <em>features</em> e alvos amostrados</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">VIF</td>
+<td style="padding:10px 12px;text-align:left">Redundância linear (subconjunto de colunas)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Distribuições</td>
+<td style="padding:10px 12px;text-align:left">Histogramas de qtd e VGV diários</td></tr>
+<tr><td style="padding:10px 12px;text-align:left;vertical-align:top">Perfil semanal</td>
+<td style="padding:10px 12px;text-align:left">Médias por dia da semana</td></tr>
 </tbody></table></div>
 """,
         unsafe_allow_html=True,
@@ -6793,34 +6944,35 @@ def _render_tab_introducao() -> None:
         **_plotly_layout_direcional(
             title="Duas séries (exemplo)",
             height=340,
-            xaxis_title="Índice",
-            yaxis_title="Unidades",
+            xaxis_title="Eixo X — ordem no tempo",
+            yaxis_title="Eixo Y — valor",
         ),
+        legend=_plotly_legend_top(),
+        margin=dict(t=100, l=56, r=48, b=52),
     )
-    _plotly_traces_hidden_until_legend_click(fig_ser)
     st.plotly_chart(fig_ser, use_container_width=True, config=_ipc)
 
     st.markdown("#### 9 · Abas")
     _ix("Segue-se um resumo orientativo das secções da aplicação:")
     st.markdown(
         """
-<div style="text-align:center;margin:0 auto 1.5rem auto;overflow-x:auto">
-<table style="margin:0 auto;border-collapse:collapse;font-size:0.92rem;color:#334155">
+<div class="pv-fullbleed-table-wrap" style="margin-bottom:1.5rem !important">
+<table style="font-size:0.92rem;color:#334155">
 <thead><tr style="border-bottom:2px solid #e2e8f0">
-<th style="padding:8px 14px;text-align:center">Secção</th>
-<th style="padding:8px 14px;text-align:center">Conteúdo</th>
+<th style="padding:10px 14px;text-align:left;width:22%">Secção</th>
+<th style="padding:10px 14px;text-align:left">Conteúdo</th>
 </tr></thead>
 <tbody>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Introdução</strong></td>
-<td style="padding:8px;text-align:center">Conceitos e notação</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Análises</strong></td>
-<td style="padding:8px;text-align:center">Indicadores e gráficos da série diária</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Previsões</strong></td>
-<td style="padding:8px;text-align:center">Treino, tabela e exportação HTML</td></tr>
-<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Dossiê</strong></td>
-<td style="padding:8px;text-align:center">EDA; métricas e importância de <em>features</em> na sub-aba <strong>Modelos</strong> (com treino)</td></tr>
-<tr><td style="padding:8px;text-align:center"><strong>Apêndice</strong></td>
-<td style="padding:8px;text-align:center">Metodologia e hiperparâmetros</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Introdução</strong></td>
+<td style="padding:10px 14px;text-align:left">Conceitos e notação</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Análises</strong></td>
+<td style="padding:10px 14px;text-align:left">Indicadores e gráficos da série diária</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Previsões</strong></td>
+<td style="padding:10px 14px;text-align:left">Treino, tabela e exportação HTML</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Dossiê</strong></td>
+<td style="padding:10px 14px;text-align:left">EDA; métricas e importância de <em>features</em> na sub-aba <strong>Modelos</strong> (com treino)</td></tr>
+<tr><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Apêndice</strong></td>
+<td style="padding:10px 14px;text-align:left">Metodologia e hiperparâmetros</td></tr>
 </tbody></table></div>
 """,
         unsafe_allow_html=True,
@@ -6945,9 +7097,11 @@ def _render_streamlit_tab_analises(
     with k8:
         st.metric("Conversão leads → vendas", f"{conv:.2f} %")
 
-    st.caption(
+    st.markdown(
+        "<p class=\"pv-caption-center\">"
         f"A matriz diária subjacente contém {daily.get('n_rows', 0):,} dias e {daily.get('n_features', 0)} colunas "
-        f"após engenharia de atributos."
+        "após engenharia de atributos.</p>",
+        unsafe_allow_html=True,
     )
 
     dates = daily.get("dates") or []
@@ -7009,11 +7163,11 @@ def _render_streamlit_tab_analises(
         go.Scatter(
             x=dates,
             y=daily["target_qtd"],
-            name="Vendas (qtd)",
+            name="Vendas (linha)",
             yaxis="y2",
             mode="lines",
             line=dict(color=PLOT_AZUL, width=2.8),
-            hovertemplate="%{x}<br>Vendas: %{y:,.0f}<extra></extra>",
+            hovertemplate="%{x}<br>Quantidade: %{y:,.0f}<extra></extra>",
         )
     )
     vgv_mi = [float(v) / 1e6 for v in daily["target_valor"]]
@@ -7021,11 +7175,11 @@ def _render_streamlit_tab_analises(
         go.Scatter(
             x=dates,
             y=vgv_mi,
-            name="VGV (mi R$)",
+            name="VGV (linha)",
             yaxis="y3",
             mode="lines",
             line=dict(color=PLOT_VERMELHO, width=2.2, dash="dot"),
-            hovertemplate="%{x}<br>VGV: %{y:.3f} mi R$<extra></extra>",
+            hovertemplate="%{x}<br>Valor: %{y:.3f} mi R$<extra></extra>",
         )
     )
     _lo_f = _plotly_layout_direcional(title="Funil diário (empilhado) e alvos", height=500)
@@ -7034,12 +7188,17 @@ def _render_streamlit_tab_analises(
         _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
     fig_f.update_layout(
         **_lo_f,
-        xaxis_title="Data",
-        yaxis_title="Funil (empilhado)",
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
+        legend=_plotly_legend_top(),
+        margin=dict(t=108, l=58, r=62, b=60),
         yaxis2=dict(
             overlaying="y",
             side="right",
-            title=dict(text="Qtd vendas", font=dict(size=12, color=PLOT_AZUL)),
+            title=dict(
+                text="Eixo Y₂ — quantidade vendida (/ dia)",
+                font=dict(size=12, color=PLOT_AZUL),
+            ),
             showgrid=False,
             tickfont=dict(size=11),
         ),
@@ -7048,12 +7207,14 @@ def _render_streamlit_tab_analises(
             overlaying="y",
             side="right",
             position=0.97,
-            title=dict(text="VGV (mi R$)", font=dict(size=12, color=PLOT_VERMELHO)),
+            title=dict(
+                text="Eixo Y₃ — valor vendido (mi R$ / dia)",
+                font=dict(size=12, color=PLOT_VERMELHO),
+            ),
             showgrid=False,
             tickfont=dict(size=11),
         ),
     )
-    _plotly_traces_hidden_until_legend_click(fig_f)
     st.plotly_chart(fig_f, use_container_width=True, config=_pc)
     _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
@@ -7064,7 +7225,7 @@ def _render_streamlit_tab_analises(
         go.Scatter(
             x=dates,
             y=tq.tolist(),
-            name="Vendas/dia",
+            name="Observado (dia a dia)",
             line=dict(color=PLOT_MUTED, width=1.2),
         )
     )
@@ -7072,18 +7233,24 @@ def _render_streamlit_tab_analises(
         go.Scatter(
             x=dates,
             y=roll7.tolist(),
-            name="Média móvel 7d",
+            name="Suavização (MM7)",
             line=dict(color=PLOT_AZUL, width=2.8),
         )
     )
     _lo_roll = _plotly_layout_direcional(
-        title="Vendas diárias e suavização (7 dias)", height=380, xaxis_title="Data", yaxis_title="Quantidade"
+        title="Vendas diárias e suavização (7 dias)",
+        height=380,
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y — quantidade vendida (/ dia)",
     )
     _xr_roll = _plotly_xaxis_range_from_dates(dates)
     if _xr_roll:
         _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
-    fig_roll.update_layout(**_lo_roll)
-    _plotly_traces_hidden_until_legend_click(fig_roll)
+    fig_roll.update_layout(
+        **_lo_roll,
+        legend=_plotly_legend_top(),
+        margin=dict(t=100, l=56, r=52, b=58),
+    )
     st.plotly_chart(fig_roll, use_container_width=True, config=_pc)
     _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
 
@@ -7101,8 +7268,8 @@ def _render_streamlit_tab_analises(
         **_plotly_layout_direcional(
             title="Dispersão: leads vs vendas (mesmo dia)",
             height=400,
-            xaxis_title="Leads",
-            yaxis_title="Vendas (qtd)",
+            xaxis_title="Eixo X — leads (/ dia)",
+            yaxis_title="Eixo Y — quantidade vendida (/ dia)",
         ),
     )
     st.plotly_chart(fig_sc, use_container_width=True, config=_pc)
@@ -7114,7 +7281,7 @@ def _render_streamlit_tab_analises(
         go.Bar(
             x=dl,
             y=daily.get("dow_mean_qtd") or [],
-            name="Qtd média",
+            name="Barras — quantidade",
             marker_color=PLOT_AZUL,
             marker_line=dict(width=0),
         )
@@ -7123,7 +7290,7 @@ def _render_streamlit_tab_analises(
         go.Bar(
             x=dl,
             y=[float(v) / 1e6 for v in (daily.get("dow_mean_valor") or [])],
-            name="VGV médio (mi R$)",
+            name="Barras — VGV",
             marker_color=PLOT_VERMELHO,
             marker_line=dict(width=0),
             yaxis="y2",
@@ -7132,16 +7299,18 @@ def _render_streamlit_tab_analises(
     fig_d.update_layout(
         **_plotly_layout_direcional(title="Perfil por dia da semana (média histórica)", height=420),
         barmode="group",
-        yaxis_title="Qtd média",
+        xaxis_title="Eixo X — dia da semana",
+        yaxis_title="Eixo Y₁ — média de quantidade (/ dia)",
+        legend=_plotly_legend_top(),
+        margin=dict(t=100, l=56, r=52, b=56),
         yaxis2=dict(
             overlaying="y",
             side="right",
-            title="VGV médio (mi R$)",
+            title="Eixo Y₂ — média de VGV (mi R$ / dia)",
             showgrid=False,
             tickfont=dict(size=11),
         ),
     )
-    _plotly_traces_hidden_until_legend_click(fig_d)
     st.plotly_chart(fig_d, use_container_width=True, config=_pc)
     _st_interpretacao_grafico("Média por dia da semana", _interpret_text_dow(daily))
 
@@ -7267,8 +7436,8 @@ def _render_streamlit_tab_analises(
                         **_plotly_layout_direcional(
                             title=f"Dispersão: {xlab} × {ylab}",
                             height=440,
-                            xaxis_title=xlab,
-                            yaxis_title=ylab,
+                            xaxis_title=f"Eixo X — {xlab}",
+                            yaxis_title=f"Eixo Y — {ylab}",
                         ),
                         margin=dict(t=56, l=56, r=48, b=56),
                     )
@@ -7314,15 +7483,15 @@ def _render_streamlit_tab_analises(
         _lo_m = _plotly_layout_direcional(
             title="Indicadores macro (z-score por série)",
             height=400,
-            xaxis_title="Data",
-            yaxis_title="Desvios σ",
-            legend=dict(orientation="h", yanchor="bottom", y=-0.42, x=0.5, xanchor="center"),
+            xaxis_title="Eixo X — data",
+            yaxis_title="Eixo Y — desvio em σ (por série)",
+            legend=_plotly_legend_top(),
+            margin=dict(t=100, l=56, r=52, b=56),
         )
         _xr_m = _plotly_xaxis_range_from_dates(dates)
         if _xr_m:
             _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
         fig_m.update_layout(**_lo_m)
-        _plotly_traces_hidden_until_legend_click(fig_m)
         st.plotly_chart(fig_m, use_container_width=True, config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
@@ -7345,11 +7514,6 @@ def _render_streamlit_tab_analises(
                     )
             if st.session_state.get("pv_eda_openai_syn"):
                 st.markdown(st.session_state["pv_eda_openai_syn"])
-    else:
-        st.caption(
-            "Caso pretenda uma síntese em prosa, defina `OPENAI_API_KEY` nas secrets do Streamlit ou como variável de ambiente; "
-            "alternativamente, utilize a secção `[openai]` com `api_key` e `model` (por exemplo, `gpt-4o-mini`)."
-        )
 
 
 def _render_streamlit_tab_apendice(
@@ -7606,10 +7770,10 @@ def _render_streamlit_dossie_ml(
                 ),
                 margin=dict(t=56, l=56, r=48, b=56),
             )
-            fig_td3.update_xaxes(title_text="Leads", row=1, col=1)
-            fig_td3.update_xaxes(title_text="Leads", row=1, col=2)
-            fig_td3.update_yaxes(title_text="Qtd", row=1, col=1)
-            fig_td3.update_yaxes(title_text="mi R$", row=1, col=2)
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=1)
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=2)
+            fig_td3.update_yaxes(title_text="Eixo Y₁ — qtd vendida (/ dia)", row=1, col=1)
+            fig_td3.update_yaxes(title_text="Eixo Y₂ — VGV (mi R$ / dia)", row=1, col=2)
             st.plotly_chart(fig_td3, use_container_width=True, config=_dpc)
 
         st.divider()
@@ -7742,8 +7906,8 @@ def _render_streamlit_dossie_ml(
             fig_s.update_layout(
                 **_plotly_layout_direcional(
                     height=420,
-                    xaxis_title="Leads",
-                    yaxis_title="Vendas (qtd)",
+                    xaxis_title="Eixo X — leads (/ dia)",
+                    yaxis_title="Eixo Y — quantidade vendida (/ dia)",
                 ),
             )
             st.plotly_chart(fig_s, use_container_width=True, config=_dpc)
@@ -7854,12 +8018,15 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+    _configure_streamlit_progress()
     inject_css()
     _exibir_logo_topo()
 
     st.markdown(
-        f'<p class="pv-hero-title">Previsão de vendas</p>'
-        f'<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>',
+        '<div class="pv-hero-block">'
+        '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
+        '<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>'
+        "</div>",
         unsafe_allow_html=True,
     )
     st.markdown('<div class="pv-bar-wrap"><div class="pv-bar"></div></div>', unsafe_allow_html=True)
@@ -7906,9 +8073,7 @@ def main() -> None:
                 f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
             )
         elif d_ini is None and d_fim is None:
-            st.caption(
-                "Sem intervalo opcional: apenas os horizontes 3, 7 e 30 dias. No final da página, pode limpar o cenário ou o cache das planilhas."
-            )
+            pass
         else:
             st.warning(
                 "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
@@ -8210,7 +8375,9 @@ def main() -> None:
             )
 
     st.markdown(
-        '<p class="pv-foot">Direcional Engenharia · Previsão de vendas</p>',
+        '<div class="pv-foot-wrap">'
+        '<p class="pv-foot">Direcional Engenharia · Previsão de vendas</p>'
+        "</div>",
         unsafe_allow_html=True,
     )
 
