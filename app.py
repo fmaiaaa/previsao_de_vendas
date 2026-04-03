@@ -816,7 +816,9 @@ from sklearn.ensemble import (
     StackingRegressor,
 )
 from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.svm import SVR
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
@@ -939,12 +941,34 @@ def _metrics_dict(
     return out
 
 
-def temporal_train_test_indices(n: int, train_frac: float = 0.8) -> tuple[slice, slice]:
-    """Primeiros train_frac para treino; resto para teste out-of-sample."""
+def _accuracy_vs_train_median(
+    y_true: np.ndarray, y_pred: np.ndarray, y_train_reference: np.ndarray
+) -> float:
+    """
+    Acurácia direcional auxiliar: concordância com a mediana do treino (acima/abaixo).
+    Complementa MAE/R² na avaliação sem substituir métricas de regressão.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ref = np.asarray(y_train_reference, dtype=float)
+    ref = ref[np.isfinite(ref)]
+    if len(y_true) < 5 or len(ref) < 5:
+        return float("nan")
+    med = float(np.median(ref))
+    if not np.isfinite(med):
+        return float("nan")
+    tb = (y_true > med).astype(int)
+    pb = (y_pred > med).astype(int)
+    return float((tb == pb).mean())
+
+
+def temporal_train_test_indices(n: int, train_frac: float = 0.7) -> tuple[slice, slice]:
+    """Primeiros train_frac para treino; resto para teste out-of-sample (ex.: 70%/30%)."""
     i_tr = max(1, int(n * train_frac))
     if i_tr >= n:
         raise ValueError(
-            "Série muito curta para 80%/20%. Aumente o histórico diário ou reduza o horizonte."
+            "Série muito curta para o split temporal (treino/teste). "
+            "Aumente o histórico diário ou reduza o horizonte."
         )
     return slice(0, i_tr), slice(i_tr, n)
 
@@ -992,62 +1016,77 @@ def _optuna_objective_lgbm(
     target_name: str,
     horizon: int = 7,
 ) -> float:
+    """
+    Otimização orientada à generalização temporal:
+    limites de complexidade escalonados com n, penalização de variância entre folds
+    (sensível a overfitting) e amplitude fold-a-fold (instabilidade).
+    """
     if LGBMRegressor is None:
         raise RuntimeError("lightgbm não instalado")
 
     is_qtd = target_name == "qtd"
     long_h = int(horizon) >= 21
-    if long_h:
-        param = {
-            "n_estimators": trial.suggest_int("n_estimators", 160, 520),
-            "max_depth": trial.suggest_int("max_depth", 4, 10),
-            "learning_rate": trial.suggest_float("learning_rate", 0.032, 0.16, log=True),
-            "subsample": trial.suggest_float("subsample", 0.58, 0.92),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.58, 0.92),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 12.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.03, 22.0, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 22, 84),
-            "min_child_samples": trial.suggest_int(
-                "min_child_samples", 16 if is_qtd else 10, 95 if is_qtd else 72
-            ),
-            "min_split_gain": trial.suggest_float("min_split_gain", 0.0008, 0.95, log=True),
-            "random_state": random_state,
-            "verbosity": -1,
-            "n_jobs": -1,
-        }
-        pen_std = 0.055
-    else:
-        param = {
-            "n_estimators": trial.suggest_int("n_estimators", 90, 420),
-            "max_depth": trial.suggest_int("max_depth", 3, 8),
-            "learning_rate": trial.suggest_float("learning_rate", 0.035, 0.14, log=True),
-            "subsample": trial.suggest_float("subsample", 0.62, 0.92),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.62, 0.92),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.02, 18.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.05, 28.0, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 16, 56),
-            "min_child_samples": trial.suggest_int(
-                "min_child_samples", 28 if is_qtd else 18, 130 if is_qtd else 95
-            ),
-            "min_split_gain": trial.suggest_float("min_split_gain", 0.002, 1.2, log=True),
-            "random_state": random_state,
-            "verbosity": -1,
-            "n_jobs": -1,
-        }
-        pen_std = 0.10
+    n = max(int(len(X_train)), 35)
+
+    leaves_cap = int(
+        min(76 if long_h else 48, max(20, int(14 + 5.2 * float(np.sqrt(float(n))))))
+    )
+    depth_cap = int(
+        min(9 if long_h else 7, max(3, 2 + int(np.log2(max(n // 42, 6)))))
+    )
+    depth_lo = 4 if long_h else 3
+    depth_cap = max(depth_lo, depth_cap)
+
+    ne_hi = int(min(495 if long_h else 360, max(125, min(430, n // 2 + 55))))
+    ne_lo = int(max(88 if long_h else 78, ne_hi - (285 if long_h else 245)))
+    ne_lo = min(max(ne_lo, 68), ne_hi - 22)
+
+    mcs_lo = int(max(26 if is_qtd else 22, min(52, n // 24 + 16)))
+    mcs_hi = int(max(mcs_lo + 14, min(112 if is_qtd else 86, n // 3 + 24)))
+
+    lr_lo, lr_hi = ((0.028, 0.13) if long_h else (0.034, 0.11))
+    subs_lo, subs_hi = ((0.52, 0.86) if long_h else (0.56, 0.86))
+    cols_lo, cols_hi = ((0.52, 0.86) if long_h else (0.58, 0.86))
+    ra_lo, ra_hi = ((0.035, 10.5) if long_h else (0.05, 14.0))
+    rl_lo, rl_hi = ((0.12, 22.0) if long_h else (0.14, 20.0))
+    mg_lo, mg_hi = ((0.002, 0.82) if long_h else (0.004, 0.95))
+
+    param = {
+        "n_estimators": trial.suggest_int("n_estimators", ne_lo, ne_hi),
+        "max_depth": trial.suggest_int("max_depth", depth_lo, depth_cap),
+        "learning_rate": trial.suggest_float("learning_rate", lr_lo, lr_hi, log=True),
+        "subsample": trial.suggest_float("subsample", subs_lo, subs_hi),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", cols_lo, cols_hi),
+        "reg_alpha": trial.suggest_float("reg_alpha", ra_lo, ra_hi, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", rl_lo, rl_hi, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 18, max(22, leaves_cap)),
+        "min_child_samples": trial.suggest_int("min_child_samples", mcs_lo, mcs_hi),
+        "min_split_gain": trial.suggest_float("min_split_gain", mg_lo, mg_hi, log=True),
+        "random_state": random_state,
+        "verbosity": -1,
+        "n_jobs": -1,
+    }
+
     tscv = TimeSeriesSplit(n_splits=n_splits)
     scores: list[float] = []
-    for tr_idx, va_idx in tscv.split(X_train):
+    for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
         model = LGBMRegressor(**param)
         y_tr = y_train.iloc[tr_idx]
         sw = sample_weights(y_tr, True, target_name, horizon)
         model.fit(X_train.iloc[tr_idx], y_tr, sample_weight=sw)
         p = model.predict(X_train.iloc[va_idx])
-        scores.append(mean_absolute_error(y_train.iloc[va_idx], p))
+        fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
+        scores.append(fold_mae)
+        trial.report(float(np.mean(scores)), step)
+        if step >= 1 and trial.should_prune():
+            raise optuna.TrialPruned()
+
     mean_mae = float(np.mean(scores))
-    if len(scores) > 1:
-        mean_mae += pen_std * float(np.std(scores))
-    return mean_mae
+    std_mae = float(np.std(scores)) if len(scores) > 1 else 0.0
+    spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
+    pen_std = 0.12 if long_h else 0.15
+    pen_sp = 0.09 if long_h else 0.105
+    return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
 
 
 def _wrap_log(reg: Any) -> Any:
@@ -1064,13 +1103,13 @@ def build_ridge_pipe(rs: int) -> Pipeline:
     return Pipeline(
         [
             ("scaler", _mm()),
-            ("model", Ridge(alpha=24.0, random_state=rs)),
+            ("model", Ridge(alpha=38.0, random_state=rs)),
         ]
     )
 
 
 def build_elastic_net_pipe(rs: int, target_name: str) -> Pipeline:
-    a = 0.14 if target_name == "qtd" else 72000.0
+    a = 0.18 if target_name == "qtd" else 88000.0
     return Pipeline(
         [
             ("scaler", _mm()),
@@ -1095,9 +1134,11 @@ def build_random_forest_pipe(rs: int, horizon: int) -> Pipeline:
             (
                 "model",
                 RandomForestRegressor(
-                    n_estimators=450 if long_h else 340,
-                    max_depth=18 if long_h else 14,
-                    min_samples_leaf=3,
+                    n_estimators=300 if long_h else 240,
+                    max_depth=11 if long_h else 9,
+                    min_samples_leaf=8,
+                    min_samples_split=16,
+                    max_features="sqrt",
                     random_state=rs,
                     n_jobs=-1,
                 ),
@@ -1145,9 +1186,9 @@ def build_hgb_pipe(rs: int, target_name: str) -> Pipeline:
         hgb = HistGradientBoostingRegressor(
             max_iter=480,
             max_depth=4,
-            min_samples_leaf=42,
-            learning_rate=0.06,
-            l2_regularization=4.8,
+            min_samples_leaf=44,
+            learning_rate=0.055,
+            l2_regularization=6.2,
             early_stopping=True,
             validation_fraction=0.14,
             n_iter_no_change=22,
@@ -1157,9 +1198,9 @@ def build_hgb_pipe(rs: int, target_name: str) -> Pipeline:
         hgb = HistGradientBoostingRegressor(
             max_iter=560,
             max_depth=5,
-            min_samples_leaf=28,
-            learning_rate=0.04,
-            l2_regularization=3.4,
+            min_samples_leaf=30,
+            learning_rate=0.038,
+            l2_regularization=4.6,
             early_stopping=True,
             validation_fraction=0.14,
             n_iter_no_change=26,
@@ -1185,8 +1226,8 @@ def build_xgb_only_pipe(
         "learning_rate": float(best_params.get("learning_rate", 0.055)),
         "subsample": float(min(0.9, best_params.get("subsample", 0.82) + 0.02)),
         "colsample_bytree": float(min(0.9, best_params.get("colsample_bytree", 0.82) + 0.02)),
-        "reg_alpha": float(max(0.05, best_params.get("reg_alpha", 0.18) * 1.15)),
-        "reg_lambda": float(max(0.5, best_params.get("reg_lambda", 1.4) * 1.35)),
+        "reg_alpha": float(max(0.08, best_params.get("reg_alpha", 0.18) * 1.22)),
+        "reg_lambda": float(max(0.65, best_params.get("reg_lambda", 1.4) * 1.52)),
         "random_state": rs,
         "n_jobs": -1,
         "verbosity": 0,
@@ -1203,11 +1244,11 @@ def build_catboost_pipe(use_log: bool, rs: int, target_name: str) -> Pipeline | 
     cb = CatBoostRegressor(
         iterations=max(200, iters),
         depth=5,
-        learning_rate=0.032,
-        l2_leaf_reg=14.0,
-        random_strength=0.45,
-        bagging_temperature=0.35,
-        rsm=0.82,
+        learning_rate=0.03,
+        l2_leaf_reg=22.0,
+        random_strength=0.52,
+        bagging_temperature=0.32,
+        rsm=0.78,
         border_count=254,
         random_seed=rs,
         verbose=False,
@@ -1219,19 +1260,59 @@ def build_catboost_pipe(use_log: bool, rs: int, target_name: str) -> Pipeline | 
     return Pipeline([("scaler", _mm()), ("model", inner)])
 
 
+def build_svm_pipe(rs: int, target_name: str) -> Pipeline:
+    """SVR com regularização moderada (C não excessivo) para limitar overfitting."""
+    c = 3.2 if target_name == "qtd" else 4.0
+    eps = 0.15 if target_name == "qtd" else 95_000.0
+    return Pipeline(
+        [
+            ("scaler", _mm()),
+            (
+                "model",
+                SVR(
+                    kernel="rbf",
+                    C=c,
+                    epsilon=eps,
+                    gamma="scale",
+                    max_iter=4000,
+                ),
+            ),
+        ]
+    )
+
+
+def build_knn_pipe(rs: int, target_name: str) -> Pipeline:
+    """k-NN com pesos por distância e k relativamente alto — suaviza ruído."""
+    k = 13 if target_name == "qtd" else 11
+    return Pipeline(
+        [
+            ("scaler", _mm()),
+            (
+                "model",
+                KNeighborsRegressor(
+                    n_neighbors=k,
+                    weights="distance",
+                    p=2,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+
 def build_extratrees_pipe(
     best_params: dict[str, Any], use_log: bool, rs: int, horizon: int = 7
 ) -> Pipeline:
     long_h = int(horizon) >= 21
-    n_cap = 520 if long_h else 420
-    d_cap = 14 if long_h else 12
-    n_est = min(n_cap, max(260 if long_h else 240, int(best_params.get("n_estimators", 400))))
-    depth = min(d_cap, max(7 if long_h else 6, int(best_params.get("max_depth", 8))))
+    n_cap = 380 if long_h else 320
+    d_cap = 11 if long_h else 10
+    n_est = min(n_cap, max(220 if long_h else 200, int(best_params.get("n_estimators", 320))))
+    depth = min(d_cap, max(6 if long_h else 5, int(best_params.get("max_depth", 7))))
     et = ExtraTreesRegressor(
         n_estimators=n_est,
         max_depth=depth,
-        min_samples_leaf=8,
-        min_samples_split=16,
+        min_samples_leaf=10,
+        min_samples_split=20,
         max_features="sqrt",
         random_state=rs,
         n_jobs=-1,
@@ -1275,7 +1356,7 @@ def build_light_stack_pipe(
     )
     stack = StackingRegressor(
         estimators=[("lgb", lgb), ("hgb", hgb)],
-        final_estimator=Ridge(alpha=32.0),
+        final_estimator=Ridge(alpha=44.0),
         passthrough=False,
         n_jobs=-1,
     )
@@ -1378,6 +1459,9 @@ def _collect_candidate_specs(
             if ls2 is not None:
                 out.append(("Stack+log1p", ls2, False))
 
+    out.append(("SVM (SVR)", build_svm_pipe(rs, target_name), False))
+    out.append(("k-NN", build_knn_pipe(rs, target_name), False))
+
     out.append(("Baseline mediana", build_dummy_median_pipe(), False))
     return out
 
@@ -1441,7 +1525,7 @@ def _pick_super_ensemble(
     mae_blend = float(mean_absolute_error(y_val, pred_b))
 
     rel_gain = (best_mae - mae_blend) / (best_mae + 1e-9)
-    rel_min = 0.011 if long_h else 0.015
+    rel_min = 0.02 if long_h else 0.024
     if mae_blend < best_mae and k >= 2 and rel_gain > rel_min:
         short = "+".join(names[: min(4, len(names))])
         if len(names) > 4:
@@ -1476,12 +1560,12 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
-    """n_trials <= 0 → escala com log do tamanho da amostra (faixa ~55–140)."""
+    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
     if n_trials > 0:
         return n_trials
-    base = int(max(55, min(140, int(24 * np.log1p(n_samples)))))
+    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(158, base + 24)
+        base = min(178, base + 28)
     return base
 
 
@@ -1497,6 +1581,7 @@ def train_one_target(
     blend_top_k: int = 5,
     show_progress: bool = True,
     full_period_train: bool = False,
+    train_frac: float = 0.7,
 ) -> TrainResult:
     n = len(X)
     hz = int(horizon)
@@ -1513,7 +1598,7 @@ def train_one_target(
         X_imp = X_fit
         y_imp = y_fit
     else:
-        sl_tr, sl_te = temporal_train_test_indices(n, 0.8)
+        sl_tr, sl_te = temporal_train_test_indices(n, float(train_frac))
         X_80 = X.iloc[sl_tr]
         y_80 = y.iloc[sl_tr]
         X_test = X.iloc[sl_te]
@@ -1538,29 +1623,29 @@ def train_one_target(
     if LGBMRegressor is None:
         if hz >= 21:
             best_params = {
-                "n_estimators": 300,
-                "max_depth": 7,
-                "learning_rate": 0.062,
-                "subsample": 0.74,
+                "n_estimators": 270,
+                "max_depth": 6,
+                "learning_rate": 0.065,
+                "subsample": 0.72,
                 "colsample_bytree": 0.72,
-                "reg_alpha": 0.14,
-                "reg_lambda": 1.55,
-                "num_leaves": 54,
-                "min_child_samples": 22,
-                "min_split_gain": 0.018,
+                "reg_alpha": 0.32,
+                "reg_lambda": 3.0,
+                "num_leaves": 38,
+                "min_child_samples": 46,
+                "min_split_gain": 0.032,
             }
         else:
             best_params = {
-                "n_estimators": 220,
-                "max_depth": 6,
-                "learning_rate": 0.07,
-                "subsample": 0.78,
-                "colsample_bytree": 0.78,
-                "reg_alpha": 0.35,
-                "reg_lambda": 2.2,
-                "num_leaves": 40,
-                "min_child_samples": 36,
-                "min_split_gain": 0.045,
+                "n_estimators": 200,
+                "max_depth": 5,
+                "learning_rate": 0.068,
+                "subsample": 0.75,
+                "colsample_bytree": 0.75,
+                "reg_alpha": 0.42,
+                "reg_lambda": 3.6,
+                "num_leaves": 32,
+                "min_child_samples": 50,
+                "min_split_gain": 0.04,
             }
     else:
 
@@ -1575,12 +1660,18 @@ def train_one_target(
                 horizon=hz,
             )
 
+        n_startup = max(12, min(32, nt // 3))
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
                 multivariate=True,
                 n_startup_trials=max(10, min(28, nt // 4)),
+            ),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=n_startup,
+                interval_steps=1,
+                n_warmup_steps=1,
             ),
         )
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1589,7 +1680,41 @@ def train_one_target(
             n_trials=nt,
             show_progress_bar=show_progress,
         )
-        best_params = study.best_params
+        completed = [
+            t
+            for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if completed:
+            best_params = study.best_params
+        else:
+            best_params = (
+                {
+                    "n_estimators": 280,
+                    "max_depth": 6,
+                    "learning_rate": 0.065,
+                    "subsample": 0.72,
+                    "colsample_bytree": 0.72,
+                    "reg_alpha": 0.35,
+                    "reg_lambda": 3.2,
+                    "num_leaves": 36,
+                    "min_child_samples": 48,
+                    "min_split_gain": 0.035,
+                }
+                if hz >= 21
+                else {
+                    "n_estimators": 210,
+                    "max_depth": 5,
+                    "learning_rate": 0.07,
+                    "subsample": 0.76,
+                    "colsample_bytree": 0.76,
+                    "reg_alpha": 0.45,
+                    "reg_lambda": 3.8,
+                    "num_leaves": 32,
+                    "min_child_samples": 52,
+                    "min_split_gain": 0.042,
+                }
+            )
 
     specs_bm = _collect_candidate_specs(target_name, best_params, random_state, hz)
 
@@ -1712,6 +1837,13 @@ def train_one_target(
     metrics_test = _metrics_dict(np.asarray(y_test, dtype=float), pred_test, target_name)
     metrics_val["n_features"] = float(X.shape[1])
     metrics_test["n_features"] = float(X.shape[1])
+    y_tr_ref = np.asarray(y_train, dtype=float)
+    metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        y_val.values, pred_val, y_tr_ref
+    )
+    metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        np.asarray(y_test, dtype=float), pred_test, y_tr_ref
+    )
 
     importance = pd.Series(dtype=float)
     if LGBMRegressor is not None:
@@ -2007,6 +2139,24 @@ def _to_day(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.normalize()
 
 
+def _strip_timezone_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    return pd.DatetimeIndex(idx).normalize()
+
+
+def _winsorize_positive_series(s: pd.Series, pct: float = 99.5, mult_vs_median: float = 80.0) -> pd.Series:
+    """Limita cauda superior de valores positivos (erros de digitação em VGV) sem cortar dias normais."""
+    v = pd.to_numeric(s, errors="coerce").fillna(0.0).clip(lower=0.0)
+    pos = v[v > 0]
+    if len(pos) < 25:
+        return v
+    cap = float(np.nanpercentile(pos.to_numpy(dtype=float), pct))
+    med = float(pos.median()) if len(pos) else 0.0
+    hi = max(cap, med * mult_vs_median) if med > 0 else cap
+    return v.clip(upper=max(hi, 1.0))
+
+
 def _resolve_leads(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     date_c = find_column_any(
         df,
@@ -2026,6 +2176,7 @@ def _resolve_leads(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         )
     out = df[[date_c]].copy()
     out["_d"] = _to_day(out[date_c])
+    out = out.loc[out["_d"].notna()].copy()
     return out, date_c
 
 
@@ -2045,6 +2196,7 @@ def _resolve_agendamentos(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     out = df[[c_ag, c_vis]].copy()
     out["_dag"] = _to_day(out[c_ag])
     out["_dvi"] = _to_day(out[c_vis])
+    out = out.loc[out["_dag"].notna()].copy()
     return out, c_ag, c_vis
 
 
@@ -2063,6 +2215,7 @@ def _resolve_pastas(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         )
     out = df[[c]].copy()
     out["_d"] = _to_day(out[c])
+    out = out.loc[out["_d"].notna()].copy()
     return out, c
 
 
@@ -2095,7 +2248,8 @@ def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
         )
     out = df[[c_data, c_val]].copy()
     out["_d"] = _to_day(out[c_data])
-    out["_valor"] = pd.to_numeric(out[c_val], errors="coerce").fillna(0.0)
+    out = out.loc[out["_d"].notna()].copy()
+    out["_valor"] = _winsorize_positive_series(out[c_val])
     return out, c_data, c_val
 
 
@@ -2155,6 +2309,247 @@ def forward_calendar_features(index: pd.DatetimeIndex, horizon: int) -> pd.DataF
         },
         index=index,
     )
+
+
+def forward_sum_offsets(series: pd.Series, offsets: list[int]) -> pd.Series:
+    """Soma das vendas nos dias t+off para cada off em `offsets` (off > 0)."""
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    offs = sorted({int(o) for o in offsets if int(o) > 0})
+    y = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        s = 0.0
+        ok = True
+        for o in offs:
+            j = i + o
+            if j >= n:
+                ok = False
+                break
+            s += arr[j]
+        if ok:
+            y[i] = s
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_offsets(
+    index: pd.DatetimeIndex, offsets: list[int]
+) -> pd.DataFrame:
+    """Calendário e feriados BR apenas nos dias exatos t+off (ex.: combinação 4,11,12)."""
+    from datetime import timedelta
+
+    offs = sorted({int(o) for o in offsets if int(o) > 0})
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    for i, ts in enumerate(index):
+        for o in offs:
+            dt = (ts + pd.Timedelta(days=int(o))).normalize()
+            dow = int(dt.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = dt.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+    h = float(len(offs)) if offs else 1.0
+    return pd.DataFrame(
+        {
+            "fwd_h_custom": h,
+            "fwd_wknd_custom": fwd_wknd,
+            "fwd_bday_custom": fwd_bday,
+            "fwd_wknd_ratio_custom": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_custom": fwd_fer,
+            "fwd_vesperas_custom": fwd_ves,
+            "fwd_pos_feriado_custom": fwd_pos,
+            "fwd_feriado_ponte_custom": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def forward_sum_same_month_dom(series: pd.Series, doms: list[int]) -> pd.Series:
+    """
+    Soma vendas nos dias do mês (calendário) estritamente posteriores ao dia corrente.
+    Ex.: no dia 3, com doms [7,14,15], soma vendas nos dias 7, 14 e 15 do mesmo mês.
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(series.index).normalize())
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    date_to_pos = {idx[i]: i for i in range(n)}
+    y = np.full(n, np.nan, dtype=float)
+    doms_u = sorted({int(d) for d in doms if 1 <= int(d) <= 31})
+
+    for i in range(n):
+        ts = idx[i]
+        y0, m0, d0 = ts.year, ts.month, ts.day
+        total = 0.0
+        n_hit = 0
+        valid = True
+        for dom in doms_u:
+            if dom <= d0:
+                continue
+            try:
+                fut = pd.Timestamp(year=y0, month=m0, day=dom).normalize()
+            except ValueError:
+                valid = False
+                break
+            j = date_to_pos.get(fut)
+            if j is None:
+                valid = False
+                break
+            total += arr[j]
+            n_hit += 1
+        if not valid:
+            y[i] = np.nan
+        elif n_hit == 0:
+            y[i] = 0.0
+        else:
+            y[i] = total
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_dom(
+    index: pd.DatetimeIndex, doms: list[int]
+) -> pd.DataFrame:
+    """Fins de semana e feriados nos dias-alvo (mesmo mês, dia do mês > dia de t)."""
+    from datetime import timedelta
+
+    doms_u = sorted({int(d) for d in doms if 1 <= int(d) <= 31})
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    n_days = np.zeros(n, dtype=float)
+
+    for i, ts in enumerate(index):
+        y0, m0, d0 = ts.year, ts.month, ts.day
+        for dom in doms_u:
+            if dom <= d0:
+                continue
+            try:
+                dti = pd.Timestamp(year=y0, month=m0, day=dom).normalize()
+            except ValueError:
+                continue
+            n_days[i] += 1.0
+            dow = int(dti.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = dti.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+
+    h = np.maximum(n_days, 1.0)
+    return pd.DataFrame(
+        {
+            "fwd_h_dom": n_days,
+            "fwd_wknd_dom": fwd_wknd,
+            "fwd_bday_dom": fwd_bday,
+            "fwd_wknd_ratio_dom": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_dom": fwd_fer,
+            "fwd_vesperas_dom": fwd_ves,
+            "fwd_pos_feriado_dom": fwd_pos,
+            "fwd_feriado_ponte_dom": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def build_xy_custom_offsets(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    offsets: list[int],
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_offsets(df_master[target_daily_col], offsets)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_offsets(df_master.index, offsets)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def build_xy_custom_dom(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    doms: list[int],
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_same_month_dom(df_master[target_daily_col], doms)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_dom(df_master.index, doms)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
+def predict_last_row_custom_offsets(
+    df_master: pd.DataFrame, pipeline: Any, offsets: list[int]
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_offsets(df_master.index, offsets)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+
+def predict_last_row_custom_dom(
+    df_master: pd.DataFrame, pipeline: Any, doms: list[int]
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_dom(df_master.index, doms)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
 
 
 def _inject_ts_and_stl_features(
@@ -2386,6 +2781,8 @@ def build_daily_master(
         .fillna(0.0)
         .sort_index()
     )
+    if df_master.index.duplicated().any():
+        df_master = df_master[~df_master.index.duplicated(keep="last")]
 
     df_form = dict_dfs.get("formulario_previsao")
     if df_form is not None and len(df_form) > 0:
@@ -2457,7 +2854,10 @@ def build_daily_master(
     _inject_ts_and_stl_features(df_master, show_progress=show_progress)
 
     df_master.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df_master = df_master.dropna(how="any")
+    bad_tgt = df_master["target_qtd"].isna() | df_master["target_valor"].isna()
+    df_master = df_master.loc[~bad_tgt].copy()
+    feat_only = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    df_master[feat_only] = df_master[feat_only].fillna(0.0)
     return df_master
 
 
@@ -2513,6 +2913,12 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 EXPORT_URL = "https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
+# Fallback quando o export oficial devolve 403/HTML a partir de datacenters (ex.: Streamlit Cloud).
+GVIZ_CSV_URL = "https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&gid={gid}"
+_CSV_FETCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 ROLE_LABELS: dict[str, str] = {
     "leads": "BD Leads",
@@ -2742,6 +3148,42 @@ def _service_account_info_from_env() -> dict[str, Any] | None:
     return None
 
 
+def _secret_str(val: Any) -> str:
+    """Streamlit / TOML podem devolver tipos especiais; normaliza para string."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and "]" in s):
+        return s
+    return s
+
+
+def _service_account_from_flat_streamlit_root(st: Any) -> dict[str, Any] | None:
+    """Secrets com chaves do JSON Google na raiz do TOML (sem embutir JSON inteiro)."""
+    try:
+        if "client_email" not in st.secrets or "private_key" not in st.secrets:
+            return None
+        d: dict[str, Any] = {}
+        for k in _SERVICE_ACCOUNT_JSON_KEYS:
+            if k in st.secrets:
+                v = st.secrets[k]
+                if v is None:
+                    continue
+                if k == "private_key":
+                    pk = str(v).replace("\r\n", "\n").strip()
+                    if pk:
+                        d[k] = pk
+                else:
+                    sv = str(v).strip()
+                    if sv:
+                        d[k] = sv
+        if _service_account_credenciais_preenchidas(d):
+            return d
+    except Exception:
+        pass
+    return None
+
+
 def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
     """Lê JSON completo (raiz ou [google_sheets]) ou secção TOML tipo ficheiro Google Cloud."""
     try:
@@ -2749,9 +3191,13 @@ def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
     except ImportError:
         return None
     try:
+        root_flat = _service_account_from_flat_streamlit_root(st)
+        if root_flat:
+            return root_flat
+
         if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
-            raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
-            if isinstance(raw, str) and raw.strip():
+            raw = _secret_str(st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
+            if raw:
                 info = _parse_service_account_json_string(raw)
                 if info and _service_account_credenciais_preenchidas(info):
                     return info
@@ -2764,8 +3210,8 @@ def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
                 "SERVICE_ACCOUNT_JSON",
                 "service_account_json",
             ):
-                raw = gs.get(jkey)
-                if isinstance(raw, str) and raw.strip():
+                raw = _secret_str(gs.get(jkey))
+                if raw:
                     info = _parse_service_account_json_string(raw)
                     if info and _service_account_credenciais_preenchidas(info):
                         return info
@@ -2809,6 +3255,16 @@ def gspread_client_from_streamlit() -> Any | None:
     except Exception as e:
         logger.warning("gspread (Streamlit): %s", e)
         return None
+
+
+def _sa_fingerprint_for_cache() -> str:
+    """Muda quando as credenciais mudam — evita cache CSV quando a API passa a estar disponível."""
+    info = service_account_info_from_streamlit_secrets() or _service_account_info_from_env()
+    if not info:
+        return "no_sa"
+    em = str(info.get("client_email") or "").strip()
+    kid = str(info.get("private_key_id") or "").strip()
+    return f"{em}|{kid}" if em else "sa_no_email"
 
 
 def load_best_worksheet_gspread(
@@ -2865,19 +3321,41 @@ def load_best_worksheet_gspread(
     return best_df, meta
 
 
-def _fetch_csv_bytes(sheet_id: str, gid: str) -> bytes | None:
-    url = EXPORT_URL.format(sid=sheet_id, gid=gid)
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; PrevisaoVendas/1.1)"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return resp.read()
-    except urllib.error.HTTPError:
-        return None
-    except Exception:
-        return None
+def _fetch_csv_bytes_dual(sheet_id: str, gid: str) -> tuple[bytes | None, str]:
+    """
+    Tenta export oficial e, em seguida, endpoint gviz (útil quando o primeiro devolve 403/HTML).
+    Devolve (bytes, "") ou (None, motivo) para diagnóstico.
+    """
+    headers = {
+        "User-Agent": _CSV_FETCH_UA,
+        "Accept": "text/csv,text/plain,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    last_err = ""
+    for label, tmpl in (("export", EXPORT_URL), ("gviz", GVIZ_CSV_URL)):
+        url = tmpl.format(sid=sheet_id, gid=gid)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+                head = data[:1200].lower()
+                if b"<html" in head or b"<!doctype html" in head:
+                    last_err = f"{label}:HTML({resp.status})"
+                    continue
+                if b"sign in" in head or b"accounts.google" in head:
+                    last_err = f"{label}:login({resp.status})"
+                    continue
+                if len(data) < 30:
+                    last_err = f"{label}:curto({resp.status})"
+                    continue
+                return data, ""
+        except urllib.error.HTTPError as e:
+            last_err = f"{label}:HTTP{e.code}"
+        except urllib.error.URLError as e:
+            last_err = f"{label}:URL({e.reason!s})"
+        except Exception as e:
+            last_err = f"{label}:{type(e).__name__}"
+    return None, last_err or "?"
 
 
 def load_best_worksheet_csv_public(
@@ -2904,11 +3382,11 @@ def load_best_worksheet_csv_public(
     best_hdr = -1
 
     for gid in gids_ordered:
-        raw = _fetch_csv_bytes(spreadsheet_id, gid)
+        raw, why = _fetch_csv_bytes_dual(spreadsheet_id, gid)
         if raw is None:
-            tried.append(f"{gid}:HTTP-?")
+            tried.append(f"{gid}:{why}")
             continue
-        tried.append(gid)
+        tried.append(f"{gid}:ok")
         for enc in ("utf-8", "utf-8-sig", "latin-1"):
             try:
                 buf = io.BytesIO(raw)
@@ -2934,8 +3412,10 @@ def load_best_worksheet_csv_public(
     if best_df is None:
         raise ValueError(
             f"CSV público: nenhum gid válido para {spreadsheet_id} "
-            f"(tentados: {', '.join(tried[:20])}…). "
-            "Use conta de serviço nas secrets ou torne a planilha pública."
+            f"(tentados: {', '.join(tried[:12])}…). "
+            "Em muitos ambientes na nuvem o Google bloqueia export CSV anónimo: use **API com conta de serviço** "
+            "(secrets `GOOGLE_SERVICE_ACCOUNT_JSON`) e partilhe cada livro com o e-mail `client_email` como **Leitor**, "
+            "com APIs **Google Sheets** e **Google Drive** ativas no projeto GCP."
         )
     meta = {
         "spreadsheet_id": spreadsheet_id,
@@ -2966,9 +3446,96 @@ import math
 from datetime import datetime
 from typing import Any
 
+import numpy as np
+import pandas as pd
+
 
 def _json_safe(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
+
+
+def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
+    """Séries agregadas para gráficos (HTML + Streamlit); evita expor matriz completa de features."""
+    if df is None or len(df) == 0:
+        z = [0.0] * 7
+        return {
+            "dates": [],
+            "vol_leads": [],
+            "vol_agend": [],
+            "vol_visit": [],
+            "vol_pastas": [],
+            "target_qtd": [],
+            "target_valor": [],
+            "dow_labels": ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"],
+            "dow_mean_qtd": z,
+            "dow_mean_valor": z,
+            "macro": {},
+            "corr_labels": [],
+            "corr_z": [],
+            "n_rows": 0,
+            "n_features": 0,
+        }
+    idx = pd.DatetimeIndex(df.index)
+    dates = [d.strftime("%Y-%m-%d") for d in idx]
+
+    def col(name: str) -> list[float]:
+        if name not in df.columns:
+            return [0.0] * len(df)
+        s = pd.to_numeric(df[name], errors="coerce").fillna(0.0)
+        return [float(x) if np.isfinite(x) else 0.0 for x in s]
+
+    macro_cols = [c for c in df.columns if str(c).startswith("macro_")][:15]
+    macro_data: dict[str, list[float]] = {c: col(c) for c in macro_cols}
+
+    dff = df.copy()
+    dff["_dow"] = idx.dayofweek
+    dow_order = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+    gq = dff.groupby("_dow", sort=True)["target_qtd"].mean() if "target_qtd" in dff.columns else None
+    gv = dff.groupby("_dow", sort=True)["target_valor"].mean() if "target_valor" in dff.columns else None
+    dow_q = [float(gq.get(i, 0.0) or 0.0) for i in range(7)] if gq is not None else [0.0] * 7
+    dow_v = [float(gv.get(i, 0.0) or 0.0) for i in range(7)] if gv is not None else [0.0] * 7
+
+    num_cols = [
+        c
+        for c in df.select_dtypes(include=[np.number]).columns
+        if c
+        in (
+            "vol_leads",
+            "vol_agend",
+            "vol_visit",
+            "vol_pastas",
+            "target_qtd",
+            "target_valor",
+        )
+        or str(c).startswith("macro_")
+    ]
+    num_cols = num_cols[:35]
+    corr_labels: list[str] = []
+    corr_z: list[list[float]] = []
+    if len(num_cols) >= 2:
+        sub = df[num_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        if len(sub) > 1:
+            cm = sub.corr().fillna(0.0)
+            corr_labels = [str(c) for c in cm.columns]
+            corr_z = [[float(cm.iloc[i, j]) for j in range(len(corr_labels))] for i in range(len(corr_labels))]
+
+    return {
+        "dates": dates,
+        "vol_leads": col("vol_leads"),
+        "vol_agend": col("vol_agend"),
+        "vol_visit": col("vol_visit"),
+        "vol_pastas": col("vol_pastas"),
+        "target_qtd": col("target_qtd"),
+        "target_valor": col("target_valor"),
+        "dow_labels": dow_order,
+        "dow_mean_qtd": dow_q,
+        "dow_mean_valor": dow_v,
+        "macro": macro_data,
+        "corr_labels": corr_labels,
+        "corr_z": corr_z,
+        "n_rows": int(len(df)),
+        "n_features": int(df.shape[1]),
+    }
 
 
 def _cell_metric(
@@ -2999,7 +3566,7 @@ def _appendix_for_horizon_target(
     Gera HTML do apêndice + script Plotly (ROC + barras MAE teste).
     slug: 'qtd' | 'valor'
     """
-    hold_lbl = "in-sample (100%)" if full_period_train else "holdout (20%)"
+    hold_lbl = "in-sample (100%)" if full_period_train else "holdout (30%)"
     if not ba or not ba.get("rows"):
         empty = (
             f'<div class="glass-card p-5 mb-6"><h4 class="font-bold text-slate-800 mb-2">{title} — H={h}d</h4>'
@@ -3191,13 +3758,186 @@ def _appendix_for_horizon_target(
     return html_frag, script
 
 
+def _methodology_appendix_block(
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
+) -> str:
+    hz_txt = ", ".join(str(x) for x in horizontes)
+    modo = (
+        "O pipeline final reajusta o modelo em <b>100% da série</b> disponível; a escolha do ensemble usa uma "
+        "fatia final (~8%) apenas para ranquear candidatos, sem conjunto de teste separado nas métricas principais."
+        if full_period_train
+        else "A série diária é dividida em <b>70% treino</b> e <b>30% teste</b> cronológicos. "
+        "Dentro dos 70%, reserva-se ~8% no fim para validação interna na escolha do ensemble. "
+        "Métricas reportadas (MAE, RMSE, R², etc.) referem-se ao <b>bloco de teste (30%)</b>, exceto quando indicado."
+    )
+    params_blocks: list[str] = []
+    for h in horizontes:
+        pq = best_params_preview.get(h, {}).get("qtd", {})
+        pv = best_params_preview.get(h, {}).get("valor", {})
+        ql = html_lib.escape(str(por_horizonte[h]["qtd"].get("model_label", "—")))
+        vl = html_lib.escape(str(por_horizonte[h]["valor"].get("model_label", "—")))
+        pj = html_lib.escape(json.dumps(pq, indent=2, ensure_ascii=False)[:12000])
+        pjv = html_lib.escape(json.dumps(pv, indent=2, ensure_ascii=False)[:12000])
+        params_blocks.append(
+            f'<div class="glass-card p-5 mb-5 border-t-4 border-slate-700">'
+            f'<h4 class="font-bold text-slate-900 mb-2">Horizonte {h} dias — modelo operacional</h4>'
+            f'<p class="text-sm text-slate-600 mb-2">Volume: <b>{ql}</b> · VGV: <b>{vl}</b></p>'
+            f'<p class="text-xs font-bold text-slate-500 uppercase mb-1">Hiperparâmetros LightGBM (Optuna)</p>'
+            f'<pre class="text-xs overflow-auto max-h-56 bg-slate-50 p-3 rounded-lg border mb-3">{pj}</pre>'
+            f'<p class="text-xs font-bold text-slate-500 uppercase mb-1">Hiperparâmetros LightGBM — alvo VGV</p>'
+            f'<pre class="text-xs overflow-auto max-h-56 bg-slate-50 p-3 rounded-lg border">{pjv}</pre></div>'
+        )
+    candidatos = (
+        "Ridge, ElasticNet, RandomForest, LightGBM (regressão, fair, quantis, log1p para VGV), "
+        "XGBoost e CatBoost quando disponíveis, HistGradientBoosting, ExtraTrees, NGBoost (VGV), "
+        "regressão TS-linear, stacks leves e baseline mediana."
+    )
+    return f"""
+    <div class="glass-card p-8 mb-8 border-l-4 border-blue-600">
+      <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia e escolha de modelos</h2>
+      <div class="text-sm text-slate-700 space-y-4 leading-relaxed">
+        <p><b>Formulação.</b> Para cada dia <code>t</code>, o alvo é a <b>soma de vendas (quantidade ou VGV) nos próximos <code>H</code> dias</b>, com <code>H</code> ∈ {{{hz_txt}}}. As features usam apenas informação até <code>t</code> (lags, médias móveis, calendário, STL, feriados RJ, macro BCB quando ativo, formulário com defasagem, etc.).</p>
+        <p><b>Dimensão dos dados.</b> <b>{n_rows:,}</b> dias na matriz diária consolidada; <b>{n_features}</b> colunas após engenharia.</p>
+        <p><b>Validação temporal.</b> {modo}</p>
+        <p><b>LightGBM e Optuna (generalização).</b> Hiperparâmetros por <code>Optuna</code> (TPE) com <code>TimeSeriesSplit</code>, <b>limites de complexidade proporcionais a n</b>, objetivo = MAE médio nos folds + penalização da <b>variância entre folds</b> e da <b>amplitude</b> fold-a-fold (penaliza overfitting/instabilidade), e <code>MedianPruner</code> para descartar configurações fracas cedo. Semente <b>{random_seed}</b>. Modelos lineares e arbóreos do <i>benchmark</i> usam regularização mais conservadora para equilibrar viés-variância.</p>
+        <p><b>Benchmark.</b> Candidatos: {candidatos} O ranking usa o MAE na validação interna. Os <b>{blend_top_k}</b> melhores compõem um super-ensemble com pesos <code>∝ exp(−(MAE−MAE_min)/τ)</code>; se o ganho for relevante, o blend é adotado; senão, o melhor modelo isolado.</p>
+        <p><b>Pré-processamento.</b> <b>MinMaxScaler (0,1) com clip</b> nas entradas numéricas dos pipelines.</p>
+        <p><b>Métricas binárias nas tabelas.</b> Complementares: comparam valores preditos vs mediana de <code>y</code> no treino do benchmark.</p>
+      </div>
+    </div>
+    <h3 class="text-lg font-black text-slate-800 mb-3">Parâmetros LightGBM finais (pós-Optuna) por horizonte</h3>
+    {"".join(params_blocks)}
+    """
+
+
+def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
+    dj = _json_safe(daily)
+    html_frag = """
+    <div class="glass-card p-6 mb-6">
+      <h3 class="text-xl font-black text-slate-900 mb-2">Séries diárias — funil e alvos</h3>
+      <p class="text-sm text-slate-600 mb-4">Contagens do funil (empilhadas), vendas diárias em quantidade e VGV.</p>
+      <div id="an_combo" style="height:480px;width:100%;"></div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Média por dia da semana</h4>
+        <div id="an_dow" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Correlação (variáveis-chave)</h4>
+        <div id="an_corr" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
+    <div class="glass-card p-6 mb-6" id="an_macro_wrap">
+      <h4 class="font-bold text-slate-800 mb-2">Indicadores macro (normalizados)</h4>
+      <div id="an_macro" style="height:360px;width:100%;"></div>
+    </div>
+    """
+    script = f"""
+    (function() {{
+      var D = {dj};
+      var dates = D.dates || [];
+      function zscore(arr) {{
+        var m = arr.reduce(function(a,b){{return a+b;}},0) / (arr.length || 1);
+        var v = arr.reduce(function(a,b){{return a+Math.pow(b-m,2);}},0) / (arr.length || 1);
+        var s = Math.sqrt(v) || 1;
+        return arr.map(function(x) {{ return (x - m) / s; }});
+      }}
+      Plotly.newPlot('an_combo', [
+        {{ x: dates, y: D.vol_leads, name: 'Leads', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(15,23,42,0.35)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_agend, name: 'Agend.', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(59,130,246,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_visit, name: 'Visitas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(99,102,241,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_pastas, name: 'Pastas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(139,92,246,0.45)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_qtd, name: 'Vendas (qtd)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (mi R$)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
+      ], {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fafafa',
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 40, l: 52, r: 56, b: 72 }},
+        xaxis: {{ title: 'Data' }},
+        yaxis: {{ title: 'Funil (empilhado)', gridcolor: '#e5e7eb' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Qtd vendas', showgrid: false }},
+        yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'VGV mi', showgrid: false }},
+        legend: {{ orientation: 'h', y: -0.28 }}
+      }}, {{ responsive: true }});
+
+      var dl = D.dow_labels || [];
+      Plotly.newPlot('an_dow', [
+        {{ x: dl, y: D.dow_mean_qtd || [], name: 'Qtd média', type: 'bar', marker: {{ color: '#334155' }} }},
+        {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'VGV médio (mi)', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
+      ], {{
+        barmode: 'group',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fff',
+        yaxis: {{ title: 'Qtd' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'mi R$' }},
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 28, l: 48, r: 48, b: 48 }}
+      }}, {{ responsive: true }});
+
+      var labs = D.corr_labels || [];
+      var z = D.corr_z || [];
+      if (labs.length > 1 && z.length) {{
+        Plotly.newPlot('an_corr', [{{
+          z: z, x: labs, y: labs, type: 'heatmap', colorscale: 'RdBu', zmid: 0,
+          hoverongaps: false
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 28, l: 120, r: 28, b: 120 }},
+          font: {{ size: 10 }}, xaxis: {{ tickangle: -45 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_corr').innerHTML = '<p class="text-sm text-slate-500 p-4">Correlação indisponível.</p>';
+      }}
+
+      var macro = D.macro || {{}};
+      var mk = Object.keys(macro);
+      if (mk.length) {{
+        var traces = mk.slice(0, 5).map(function(k) {{
+          return {{ x: dates, y: zscore(macro[k] || []), name: k, line: {{ width: 1.4 }} }};
+        }});
+        Plotly.newPlot('an_macro', traces, {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fafafa',
+          title: 'Macro (z-score por série)',
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+          margin: {{ t: 48, l: 48, r: 28, b: 48 }},
+          yaxis: {{ title: 'z' }}, legend: {{ orientation: 'h', y: -0.22 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_macro_wrap').style.display = 'none';
+      }}
+    }})();
+    """
+    return html_frag, script
+
+
 def _build_appendix_html(
     horizontes: list[int],
     por_horizonte: dict[int, dict[str, Any]],
     full_period_train: bool,
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
 ) -> tuple[str, str]:
     parts: list[str] = []
     scripts: list[str] = []
+    intro_meth = _methodology_appendix_block(
+        horizontes,
+        por_horizonte,
+        best_params_preview,
+        full_period_train,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
+    )
     for h in horizontes:
         ph = por_horizonte[h]
         hq, sq = _appendix_for_horizon_target(
@@ -3217,29 +3957,22 @@ def _build_appendix_html(
             full_period_train,
         )
         parts.append(
-            f'<div class="mb-4"><h3 class="text-xl font-black text-slate-800 mb-3">Horizonte {h} dias</h3>{hq}{hv}</div>'
+            f'<div class="mb-4"><h3 class="text-xl font-black text-slate-800 mb-3">Horizonte {h} dias — benchmark</h3>{hq}{hv}</div>'
         )
         if sq:
             scripts.append(sq)
         if sv:
             scripts.append(sv)
-    intro = f"""
+    bench_intro = """
     <div class="glass-card p-6 mb-8 border-l-4 border-indigo-500">
-      <h2 class="text-xl font-black text-slate-900 mb-3">Apêndice técnico — benchmark de modelos</h2>
+      <h2 class="text-xl font-black text-slate-900 mb-3">Benchmark de candidatos</h2>
       <p class="text-sm text-slate-600 leading-relaxed">
-        Todas as pipelines numéricas usam <b>MinMaxScaler (0, 1) com <code>clip=True</code></b>:
-        na inferência, valores acima/abaixo do min–max do treino são <b>recortados</b> para o intervalo,
-        evitando extrapolação absurda em modelos lineares (Ridge/ElasticNet) no holdout.
-        A escolha do modelo operacional é feita pelo <b>menor MAE na validação temporal interna</b> (~últimos 8% antes do teste),
-        incluindo <b>ensembles por média</b> e <b>ponderação inversa do MAE</b>, sem reutilizar o conjunto de teste nessa escolha.
-        Os indicadores <b>acurácia, precisão, recall, F1 e ROC-AUC</b> referem-se a uma <b>tarefa binária auxiliar</b>:
-        “alto” vs “baixo” relativamente à <b>mediana de <code>y</code> calculada apenas no treino</b> do benchmark
-        (sem leakage do teste no limiar). O score da ROC é o valor predito contínuo da regressão.
-        Gráficos de ROC e barras de MAE são calculados no mesmo período de <b>teste</b> indicado nas tabelas.
+        Tabelas de regressão e classificação auxiliar; ROC e barras de MAE no período de teste indicado.
+        MinMaxScaler com <code>clip=True</code> em todas as pipelines.
       </p>
     </div>
     """
-    return intro + "\n".join(parts), "\n".join(scripts)
+    return intro_meth + bench_intro + "\n".join(parts), "\n".join(scripts)
 
 
 def render_dashboard(
@@ -3251,6 +3984,9 @@ def render_dashboard(
     best_params_preview: dict[int, dict[str, dict[str, Any]]],
     out_path: str | None = None,
     full_period_train: bool = False,
+    daily_pack: dict[str, Any] | None = None,
+    blend_top_k: int = 6,
+    random_seed: int = 42,
 ) -> str:
     """
     por_horizonte[h]['qtd'|'valor']: dict com keys:
@@ -3271,30 +4007,30 @@ def render_dashboard(
         "Treino em 100% do histórico · última fatia (~8%) só para ranquear o ensemble · "
         "previsão = próximos H dias a partir da última data nos ficheiros."
         if full_period_train
-        else "Split 80%/20%: métricas e gráficos no holdout final (20%); "
+        else "Split 70%/30%: métricas e gráficos no holdout final (30%); "
         "pipeline operacional reajustado em 100% do histórico · Optuna (TSS, trials adaptativos) + ensemble."
     )
-    lbl_mae_grande = "MAE in-sample (100%)" if full_period_train else "MAE teste (20%)"
-    lbl_r2_grande = "R² in-sample (100%)" if full_period_train else "R² teste (20%)"
+    lbl_mae_grande = "MAE in-sample (100%)" if full_period_train else "MAE teste (30%)"
+    lbl_r2_grande = "R² in-sample (100%)" if full_period_train else "R² teste (30%)"
     lbl_val_box = (
         "Seleção ensemble (~8% final do histórico)"
         if full_period_train
-        else "Seleção ensemble (~8% do bloco de treino 80%)"
+        else "Seleção ensemble (~8% do bloco de treino 70%)"
     )
     lbl_graf_series = (
         "Real vs modelo — treino (~92%) | validação (~8%) · linha vertical na separação"
         if full_period_train
-        else "Real vs modelo — treino (80%) | teste (20%) · linha vertical na separação"
+        else "Real vs modelo — treino (70%) | teste (30%) · linha vertical na separação"
     )
-    lbl_chart_treino = "Treino (~92%)" if full_period_train else "Treino (80%)"
-    lbl_chart_hold = "Validação (~8%)" if full_period_train else "Teste (20%)"
+    lbl_chart_treino = "Treino (~92%)" if full_period_train else "Treino (70%)"
+    lbl_chart_hold = "Validação (~8%)" if full_period_train else "Teste (30%)"
     lbl_tr_js = json.dumps(lbl_chart_treino, ensure_ascii=False)
     lbl_te_js = json.dumps(lbl_chart_hold, ensure_ascii=False)
-    lbl_scatter = "Dispersão VGV (in-sample)" if full_period_train else "Dispersão VGV (holdout 20%)"
+    lbl_scatter = "Dispersão VGV (in-sample)" if full_period_train else "Dispersão VGV (holdout 30%)"
     lbl_modelo_esc = (
         "Modelo escolhido (MAE na fatia final — seleção de ensemble)"
         if full_period_train
-        else "Modelo escolhido (MAE na validação interna do treino 80%)"
+        else "Modelo escolhido (MAE na validação interna do treino 70%)"
     )
 
     tabs_html = ""
@@ -3487,11 +4223,22 @@ def render_dashboard(
             </div>
         """
 
+    dp = daily_pack if daily_pack is not None else {}
+    n_rows = int(dp.get("n_rows") or 0)
+    n_features = int(dp.get("n_features") or 0)
     appendix_html, appendix_scripts = _build_appendix_html(
-        horizontes, por_horizonte, full_period_train
+        horizontes,
+        por_horizonte,
+        full_period_train,
+        best_params_preview,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
     )
+    analises_html, analises_scripts = _build_analises_pane_html(dp)
     tech_blurb = (
-        " · Features MinMax (0–1) · benchmark multi-modelo/ensembles (escolha por MAE na validação interna)"
+        " · Validação temporal · MinMax (0–1) · benchmark e ensemble (MAE na validação interna)"
     )
 
     html = f"""<!DOCTYPE html>
@@ -3539,12 +4286,18 @@ def render_dashboard(
 
     <div class="flex flex-wrap gap-2 mb-6 justify-center">
       <button type="button" class="sec-main-btn active px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide"
-        data-sec="previsoes" onclick="openSection('previsoes', this)">Previsões</button>
+        data-sec="analises" onclick="openSection('analises', this)">Análises</button>
       <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
-        data-sec="apendice" onclick="openSection('apendice', this)">Apêndice técnico</button>
+        data-sec="previsoes" onclick="openSection('previsoes', this)">Previsão</button>
+      <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
+        data-sec="apendice" onclick="openSection('apendice', this)">Apêndice</button>
     </div>
 
-    <div id="sec-previsoes" class="section-pane active">
+    <div id="sec-analises" class="section-pane active">
+    {analises_html}
+    </div>
+
+    <div id="sec-previsoes" class="section-pane">
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
       <div class="glass-card p-5 border-t-4 border-slate-800">
         <p class="text-xs font-bold text-slate-400 uppercase">Leads</p>
@@ -3595,12 +4348,13 @@ def render_dashboard(
         b.classList.toggle('text-slate-600', !on);
       }});
       window.dispatchEvent(new Event('resize'));
-      if (secId === 'apendice' && typeof Plotly !== 'undefined') {{
+      if (typeof Plotly !== 'undefined') {{
         setTimeout(function() {{
-          document.querySelectorAll('#sec-apendice .js-plotly-plot').forEach(function(gd) {{
+          var sel = secId === 'apendice' ? '#sec-apendice' : (secId === 'analises' ? '#sec-analises' : '#sec-previsoes');
+          document.querySelectorAll(sel + ' .js-plotly-plot').forEach(function(gd) {{
             try {{ Plotly.Plots.resize(gd); }} catch (e) {{}}
           }});
-        }}, 100);
+        }}, 120);
       }}
     }}
     function openTab(tabId, el) {{
@@ -3624,6 +4378,7 @@ def render_dashboard(
       font: {{ family: 'Plus Jakarta Sans', color: '#475569' }},
       margin: {{ l: 120, r: 20, t: 10, b: 10 }}
     }}, {{ responsive: true }});
+    {analises_scripts}
     {appendix_scripts}
   </script>
 </body>
@@ -3679,7 +4434,9 @@ OPTUNA_TRIALS_AUTO = 0
 # Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
 BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
-# Holdout 20% nas métricas do relatório (mais fiável que 100% in-sample).
+# Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
+TRAIN_FRAC_FIXO = 0.7
+# Holdout final nas métricas do relatório (mais fiável que 100% in-sample).
 FULL_PERIOD_TRAIN_FIXO = False
 # tqdm no terminal pouco útil no Cloud — desativado.
 SHOW_ML_PROGRESS = False
@@ -4120,13 +4877,13 @@ def _data_source_config() -> tuple[dict[str, str], dict[str, list[str]]]:
 
 @st.cache_data(ttl=180, show_spinner=False)
 def _load_one_role_cached(
-    use_sa: bool,
+    sa_fp: str,
     spreadsheet_id: str,
     role_key: str,
     hints_tuple: tuple[str, ...],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-
-    gc = gspread_client_from_streamlit() if use_sa else None
+    # Sempre tenta API se as credenciais existirem (não depender de use_sa calculado fora do cache).
+    gc = gspread_client_from_streamlit()
     return load_role_dataframe(
         gc,
         spreadsheet_id,
@@ -4140,6 +4897,11 @@ def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, An
     ids, hints = _data_source_config()
     gc = gspread_client_from_streamlit()
     use_sa = gc is not None
+    sa_fp = _sa_fingerprint_for_cache()
+    json_ok = (
+        service_account_info_from_streamlit_secrets() is not None
+        or _service_account_info_from_env() is not None
+    )
 
     out: dict[str, pd.DataFrame] = {}
     metas: dict[str, dict[str, Any]] = {}
@@ -4156,27 +4918,224 @@ def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, An
         sid = ids[cfg_key]
         htuple = tuple(hints.get(cfg_key, []))
         try:
-            df, meta = _load_one_role_cached(use_sa, sid, cfg_key, htuple)
+            df, meta = _load_one_role_cached(sa_fp, sid, cfg_key, htuple)
             out[key] = df
             metas[cfg_key] = meta
         except Exception as e:
             errors.append(f"**{human}** (`{sid[:12]}…`): {e}")
     if errors:
-        modo = (
-            "**Conta de serviço:** confirme partilha com o e-mail `client_email` do JSON."
-            if use_sa
-            else "**Modo público:** partilhe as planilhas por ligação (Leitor) ou configure credenciais em "
-            "`GOOGLE_SERVICE_ACCOUNT_JSON` (raiz) ou `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON`."
-        )
+        if json_ok and not use_sa:
+            modo = (
+                "**Conta de serviço:** o JSON foi reconhecido nas secrets, mas o cliente **gspread não iniciou** "
+                "(chave privada inválida, JSON truncado ou formato incorreto). Valide o ficheiro no Google Cloud Console.\n\n"
+                "Se o cliente iniciar mas a leitura falhar: ative as APIs **Google Sheets** e **Google Drive** no projeto, "
+                "e partilhe **cada** planilha com o e-mail `client_email` do JSON como **Leitor**."
+            )
+        elif use_sa:
+            modo = (
+                "**Conta de serviço ativa:** confirme partilha **Leitor** com o e-mail `client_email` em **todas** as planilhas "
+                "e que o ID na configuração corresponde ao livro correto."
+            )
+        else:
+            modo = (
+                "**Sem API:** configure `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz das secrets **ou** dentro de `[google_sheets]` "
+                "(string com o JSON completo da conta de serviço). O export CSV anónimo costuma **falhar em servidores na nuvem** "
+                "(respostas HTTP 403 ou HTML); a API é o método suportado em produção."
+            )
         st.error("Não foi possível carregar todas as fontes.\n\n" + modo + "\n\n" + "\n\n".join(errors))
         st.stop()
     return out, metas, use_sa
 
 
+def _parse_previsao_int_list(s: str, *, max_val: int = 10_000) -> list[int]:
+    """Lista de inteiros positivos a partir de texto (vírgula, ponto e vírgula ou espaços)."""
+    out: list[int] = []
+    for part in re.split(r"[,;\s]+", (s or "").strip()):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+            if 0 < v <= max_val:
+                out.append(v)
+        except ValueError:
+            continue
+    return sorted(set(out))
+
+
+def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
+    """
+    Agregados para o dossiê ML: descritivas, outliers (IQR), correlação, VIF, balanceamento.
+    Evita guardar a matriz completa no session_state.
+    """
+    if df_master is None or len(df_master) < 5:
+        return {"erro": "Série insuficiente para o dossiê estatístico."}
+    dm = df_master
+    idx = pd.DatetimeIndex(pd.to_datetime(dm.index).normalize())
+
+    core = [
+        c
+        for c in (
+            "vol_leads",
+            "vol_agend",
+            "vol_visit",
+            "vol_pastas",
+            "target_qtd",
+            "target_valor",
+        )
+        if c in dm.columns
+    ]
+    num = dm.select_dtypes(include=[np.number])
+    cols_extra = [c for c in num.columns if c not in core][:30]
+    focus_cols = core + cols_extra
+
+    rows_stats: list[dict[str, Any]] = []
+    outliers_iqr: list[dict[str, Any]] = []
+    for c in focus_cols:
+        s = pd.to_numeric(dm[c], errors="coerce").dropna()
+        if len(s) < 5:
+            continue
+        q1_f = float(s.quantile(0.25))
+        q3_f = float(s.quantile(0.75))
+        iqr = q3_f - q1_f
+        lo, hi = q1_f - 1.5 * iqr, q3_f + 1.5 * iqr
+        n_out = int(((s < lo) | (s > hi)).sum())
+        mode_v = s.mode()
+        mode_f = float(mode_v.iloc[0]) if len(mode_v) else float("nan")
+        rows_stats.append(
+            {
+                "variavel": c,
+                "n": int(len(s)),
+                "media": float(s.mean()),
+                "mediana": float(s.median()),
+                "moda": mode_f,
+                "desvio_padrao": float(s.std()),
+                "variancia": float(s.var()),
+                "min": float(s.min()),
+                "p01": float(s.quantile(0.01)),
+                "p05": float(s.quantile(0.05)),
+                "q1": q1_f,
+                "q2": float(s.quantile(0.50)),
+                "q3": q3_f,
+                "p95": float(s.quantile(0.95)),
+                "p99": float(s.quantile(0.99)),
+                "max": float(s.max()),
+                "assimetria": float(s.skew()),
+                "curtose_excesso": float(s.kurtosis()),
+            }
+        )
+        outliers_iqr.append(
+            {
+                "variavel": c,
+                "n_outliers_iqr": n_out,
+                "pct_outliers": float(100.0 * n_out / len(s)),
+            }
+        )
+
+    sub = dm[focus_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    corr_labels: list[str] = []
+    corr_z: list[list[float]] = []
+    pares_mc: list[dict[str, Any]] = []
+    if len(sub) > 2 and sub.shape[1] >= 2:
+        cm = sub.corr().fillna(0.0)
+        corr_labels = [str(x) for x in cm.columns]
+        corr_z = [
+            [float(cm.iloc[i, j]) for j in range(len(corr_labels))]
+            for i in range(len(corr_labels))
+        ]
+        for i in range(len(cm.columns)):
+            for j in range(i + 1, len(cm.columns)):
+                v = float(cm.iloc[i, j])
+                if abs(v) >= 0.85:
+                    pares_mc.append(
+                        {
+                            "a": str(cm.columns[i]),
+                            "b": str(cm.columns[j]),
+                            "r_pearson": v,
+                        }
+                    )
+        pares_mc.sort(key=lambda x: -abs(float(x["r_pearson"])))
+
+    vif_rows: list[dict[str, Any]] = []
+    try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from statsmodels.tools.tools import add_constant
+
+        vif_cols = focus_cols[: min(16, len(focus_cols))]
+        Xv = dm[vif_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        Xv = Xv.loc[:, Xv.std() > 1e-12]
+        if Xv.shape[1] >= 2 and len(Xv) > Xv.shape[1] + 2:
+            Xc = add_constant(Xv.values, has_constant="add")
+            for i in range(1, Xc.shape[1]):
+                try:
+                    vi = float(variance_inflation_factor(Xc, i))
+                except Exception:
+                    vi = float("nan")
+                vif_rows.append({"variavel": str(Xv.columns[i - 1]), "vif": vi})
+    except Exception:
+        pass
+
+    balance: dict[str, Any] = {}
+    hist_qtd: dict[str, Any] = {}
+    hist_vgv: dict[str, Any] = {}
+    if "target_qtd" in dm.columns:
+        tq = pd.to_numeric(dm["target_qtd"], errors="coerce").fillna(0.0)
+        med = float(tq.median())
+        above = int((tq > med).sum())
+        below = int((tq <= med).sum())
+        balance = {
+            "mediana_referencia": med,
+            "dias_acima_mediana": above,
+            "dias_abaixo_igual_mediana": below,
+            "proporcao_classe_minoritaria": float(min(above, below) / max(len(tq), 1)),
+        }
+        counts, edges = np.histogram(tq.to_numpy(dtype=float), bins=min(32, max(8, len(tq) // 5)))
+        hist_qtd = {
+            "counts": [int(x) for x in counts],
+            "edges": [float(x) for x in edges],
+        }
+    if "target_valor" in dm.columns:
+        tv = pd.to_numeric(dm["target_valor"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if len(tv) > 5 and np.nanmax(tv) > 0:
+            counts, edges = np.histogram(tv, bins=min(28, max(8, len(tv) // 6)))
+            hist_vgv = {
+                "counts": [int(x) for x in counts],
+                "edges": [float(x) for x in edges],
+            }
+
+    return {
+        "descritivas": rows_stats,
+        "outliers_iqr": outliers_iqr,
+        "correlation_labels": corr_labels,
+        "correlation_matrix": corr_z,
+        "pares_multicolinearidade": pares_mc[:45],
+        "vif": vif_rows,
+        "balanceamento_qtd": balance,
+        "hist_target_qtd": hist_qtd,
+        "hist_target_valor": hist_vgv,
+        "n_linhas": int(len(dm)),
+        "n_colunas": int(dm.shape[1]),
+        "primeira_data": idx.min().strftime("%Y-%m-%d"),
+        "ultima_data": idx.max().strftime("%Y-%m-%d"),
+    }
+
+
 def run_training_pipeline(
     dfs: dict[str, pd.DataFrame],
-) -> tuple[dict[str, float], float, float, dict[int, dict[str, Any]], dict[int, dict[str, Any]], str]:
+    custom_previsao: dict[str, Any] | None = None,
+) -> tuple[
+    dict[str, float],
+    float,
+    float,
+    dict[Any, dict[str, Any]],
+    dict[Any, dict[str, dict[str, Any]]],
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
     df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
+    dossie_ml = _build_ml_dossie_pack(df_master)
 
     stats_base = {
         "leads": float(df_master["vol_leads"].sum()),
@@ -4190,11 +5149,36 @@ def run_training_pipeline(
     conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
 
     horizontes = [3, 7, 30]
-    por_horizonte: dict[int, dict[str, Any]] = {}
-    best_params_preview: dict[int, dict[str, dict[str, Any]]] = {}
+    por_horizonte: dict[Any, dict[str, Any]] = {}
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
 
+    def pack(r: Any, pred_last: float) -> dict[str, Any]:
+        return {
+            "metrics_val": r.metrics_val,
+            "metrics_test": r.metrics_test,
+            "importance_names": r.importance.index.tolist() if len(r.importance) else [],
+            "importance_vals": r.importance.values.tolist() if len(r.importance) else [],
+            "y_test": r.y_test.tolist(),
+            "pred_test": r.y_test_pred.tolist(),
+            "dates_test": [d.strftime("%Y-%m-%d") for d in r.dates_test],
+            "pred_ultimo_dia": pred_last,
+            "model_label": r.model_label,
+            "full_period_train": r.full_period_train,
+            "chart_dates": r.chart_dates,
+            "chart_y_real": r.chart_y_real,
+            "chart_y_pred": r.chart_y_pred,
+            "chart_split_index": r.chart_split_index,
+            "benchmark_appendix": r.benchmark_appendix,
+        }
+
+    cvals = (
+        list(custom_previsao.get("values") or [])
+        if isinstance(custom_previsao, dict)
+        else []
+    )
+    extra_custom = 2 if cvals else 0
     progress = st.progress(0, text="A preparar modelos…")
-    total_steps = len(horizontes) * 2
+    total_steps = len(horizontes) * 2 + extra_custom
     step = 0
 
     for h in horizontes:
@@ -4216,6 +5200,7 @@ def run_training_pipeline(
             blend_top_k=BLEND_TOP_K_FIXO,
             show_progress=SHOW_ML_PROGRESS,
             full_period_train=FULL_PERIOD_TRAIN_FIXO,
+            train_frac=TRAIN_FRAC_FIXO,
         )
         step += 1
         progress.progress(step / total_steps, text=f"VGV — {h} dias…")
@@ -4231,34 +5216,91 @@ def run_training_pipeline(
             blend_top_k=BLEND_TOP_K_FIXO,
             show_progress=SHOW_ML_PROGRESS,
             full_period_train=FULL_PERIOD_TRAIN_FIXO,
+            train_frac=TRAIN_FRAC_FIXO,
         )
         step += 1
 
         pred_q = predict_last_row(df_master, rq.pipeline, h)
         pred_v = predict_last_row(df_master, rv.pipeline, h)
 
-        def pack(r: Any, pred_last: float) -> dict[str, Any]:
-            return {
-                "metrics_val": r.metrics_val,
-                "metrics_test": r.metrics_test,
-                "importance_names": r.importance.index.tolist() if len(r.importance) else [],
-                "importance_vals": r.importance.values.tolist() if len(r.importance) else [],
-                "y_test": r.y_test.tolist(),
-                "pred_test": r.y_test_pred.tolist(),
-                "dates_test": [d.strftime("%Y-%m-%d") for d in r.dates_test],
-                "pred_ultimo_dia": pred_last,
-                "model_label": r.model_label,
-                "full_period_train": r.full_period_train,
-                "chart_dates": r.chart_dates,
-                "chart_y_real": r.chart_y_real,
-                "chart_y_pred": r.chart_y_pred,
-                "chart_split_index": r.chart_split_index,
-                "benchmark_appendix": r.benchmark_appendix,
-            }
-
         por_horizonte[h] = {"qtd": pack(rq, pred_q), "valor": pack(rv, pred_v)}
         best_params_preview[h] = {"qtd": rq.best_params, "valor": rv.best_params}
 
+    por_custom: dict[str, Any] | None = None
+    if cvals:
+        mode = str((custom_previsao or {}).get("mode") or "offsets")
+        vals = list(cvals)
+        if mode == "offsets":
+            hz_eff = max(vals)
+            Xqc, yqc = build_xy_custom_offsets(df_master, "target_qtd", vals)
+            Xvc, yvc = build_xy_custom_offsets(df_master, "target_valor", vals)
+            lbl = "Soma nas defasagens t+k (dias): " + ", ".join(str(v) for v in vals)
+        else:
+            hz_eff = 18
+            Xqc, yqc = build_xy_custom_dom(df_master, "target_qtd", vals)
+            Xvc, yvc = build_xy_custom_dom(df_master, "target_valor", vals)
+            lbl = "Soma nos dias do mês (estritamente após o dia corrente): " + ", ".join(
+                str(v) for v in vals
+            )
+
+        if len(Xqc) < 22 or len(Xvc) < 22:
+            dossie_ml["aviso_previsao_custom"] = (
+                "Cenário personalizado ignorado: menos de 22 observações válidas após alinhar o alvo."
+            )
+        else:
+            progress.progress(
+                max(0.01, (step + 0.5) / total_steps),
+                text="Cenário personalizado — volume (Optuna + benchmark)…",
+            )
+            rqc = train_one_target(
+                Xqc,
+                yqc,
+                horizon=hz_eff,
+                target_name="qtd",
+                n_trials=OPTUNA_TRIALS_AUTO,
+                random_state=RANDOM_SEED,
+                optuna_seed=RANDOM_SEED + 7,
+                blend_top_k=BLEND_TOP_K_FIXO,
+                show_progress=SHOW_ML_PROGRESS,
+                full_period_train=FULL_PERIOD_TRAIN_FIXO,
+                train_frac=TRAIN_FRAC_FIXO,
+            )
+            step += 1
+            progress.progress(step / total_steps, text="Cenário personalizado — VGV…")
+            rvc = train_one_target(
+                Xvc,
+                yvc,
+                horizon=hz_eff,
+                target_name="valor",
+                n_trials=OPTUNA_TRIALS_AUTO,
+                random_state=RANDOM_SEED,
+                optuna_seed=RANDOM_SEED + 8,
+                blend_top_k=BLEND_TOP_K_FIXO,
+                show_progress=SHOW_ML_PROGRESS,
+                full_period_train=FULL_PERIOD_TRAIN_FIXO,
+                train_frac=TRAIN_FRAC_FIXO,
+            )
+            step += 1
+            if mode == "offsets":
+                pqc = predict_last_row_custom_offsets(df_master, rqc.pipeline, vals)
+                pvc = predict_last_row_custom_offsets(df_master, rvc.pipeline, vals)
+            else:
+                pqc = predict_last_row_custom_dom(df_master, rqc.pipeline, vals)
+                pvc = predict_last_row_custom_dom(df_master, rvc.pipeline, vals)
+            por_custom = {
+                "label": lbl,
+                "mode": mode,
+                "values": vals,
+                "horizon_effective": hz_eff,
+                "qtd": pack(rqc, pqc),
+                "valor": pack(rvc, pvc),
+            }
+            best_params_preview["custom"] = {
+                "qtd": rqc.best_params,
+                "valor": rvc.best_params,
+            }
+
+    daily_pack = _daily_pack_from_master(df_master)
     progress.progress(1.0, text="A gerar relatório…")
     html_out = render_dashboard(
         stats_base,
@@ -4269,8 +5311,620 @@ def run_training_pipeline(
         best_params_preview,
         out_path=None,
         full_period_train=FULL_PERIOD_TRAIN_FIXO,
+        daily_pack=daily_pack,
+        blend_top_k=BLEND_TOP_K_FIXO,
+        random_seed=RANDOM_SEED,
     )
-    return stats_base, ticket, conv, por_horizonte, best_params_preview, html_out
+    return (
+        stats_base,
+        ticket,
+        conv,
+        por_horizonte,
+        best_params_preview,
+        html_out,
+        daily_pack,
+        dossie_ml,
+        por_custom,
+    )
+
+
+def _render_streamlit_tab_analises(
+    daily: dict[str, Any],
+    stats_base: dict[str, float],
+    ticket: float,
+    conv: float,
+    por_h: dict[int, dict[str, Any]],
+) -> None:
+    import plotly.graph_objects as go
+
+    st.markdown("#### Indicadores consolidados (histórico diário)")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Leads", f"{stats_base['leads']:,.0f}")
+    with k2:
+        st.metric("Agendamentos", f"{stats_base['agend']:,.0f}")
+    with k3:
+        st.metric("Visitas", f"{stats_base['visit']:,.0f}")
+    with k4:
+        st.metric("Pastas", f"{stats_base['pastas']:,.0f}")
+    with k5:
+        st.metric("Vendas (qtd)", f"{stats_base['vendas']:,.0f}")
+
+    k6, k7, k8 = st.columns(3)
+    with k6:
+        st.metric("VGV acumulado", f"R$ {stats_base['vgv']/1e6:.2f} M")
+    with k7:
+        st.metric("Ticket médio", f"R$ {ticket/1e3:,.0f} k")
+    with k8:
+        st.metric("Conversão leads → vendas", f"{conv:.2f} %")
+
+    st.caption(
+        f"Matriz diária: **{daily.get('n_rows', 0):,}** dias · **{daily.get('n_features', 0)}** colunas após engenharia de features."
+    )
+
+    dates = daily.get("dates") or []
+    if not dates:
+        st.warning("Sem série temporal para gráficos.")
+        return
+
+    fig_f = go.Figure()
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_leads"],
+            name="Leads",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(15,23,42,0.35)",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_agend"],
+            name="Agend.",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(59,130,246,0.4)",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_visit"],
+            name="Visitas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(99,102,241,0.4)",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_pastas"],
+            name="Pastas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(139,92,246,0.45)",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["target_qtd"],
+            name="Vendas (qtd)",
+            yaxis="y2",
+            mode="lines",
+            line=dict(color="#059669", width=2.5),
+        )
+    )
+    vgv_mi = [float(v) / 1e6 for v in daily["target_valor"]]
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=vgv_mi,
+            name="VGV (mi R$)",
+            yaxis="y3",
+            mode="lines",
+            line=dict(color="#ea580c", width=2, dash="dot"),
+        )
+    )
+    fig_f.update_layout(
+        title="Funil diário (empilhado) e alvos",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#fafafa",
+        margin=dict(t=48, l=52, r=56, b=72),
+        xaxis=dict(title="Data", gridcolor="#e5e7eb"),
+        yaxis=dict(title="Funil (empilhado)", gridcolor="#e5e7eb"),
+        yaxis2=dict(overlaying="y", side="right", title="Qtd vendas", showgrid=False),
+        yaxis3=dict(
+            anchor="free",
+            overlaying="y",
+            side="right",
+            position=0.98,
+            title="VGV (mi R$)",
+            showgrid=False,
+        ),
+        legend=dict(orientation="h", y=-0.25),
+        height=480,
+    )
+    st.plotly_chart(fig_f, use_container_width=True)
+
+    tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
+    roll7 = tq.rolling(7, min_periods=1).mean()
+    fig_roll = go.Figure()
+    fig_roll.add_trace(
+        go.Scatter(x=dates, y=tq.tolist(), name="Vendas/dia", line=dict(color="#94a3b8", width=1))
+    )
+    fig_roll.add_trace(
+        go.Scatter(
+            x=dates,
+            y=roll7.tolist(),
+            name="Média móvel 7d",
+            line=dict(color="#059669", width=2.5),
+        )
+    )
+    fig_roll.update_layout(
+        title="Vendas diárias e suavização (7 dias)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#fafafa",
+        height=360,
+        xaxis=dict(title="Data"),
+        yaxis=dict(title="Quantidade"),
+        legend=dict(orientation="h", y=-0.2),
+    )
+    st.plotly_chart(fig_roll, use_container_width=True)
+
+    fig_sc = go.Figure()
+    fig_sc.add_trace(
+        go.Scatter(
+            x=daily["vol_leads"],
+            y=daily["target_qtd"],
+            mode="markers",
+            marker=dict(size=6, opacity=0.45, color="#334155"),
+            name="Leads × vendas (mesmo dia)",
+        )
+    )
+    fig_sc.update_layout(
+        title="Dispersão: leads vs vendas (mesmo dia)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#fafafa",
+        height=380,
+        xaxis=dict(title="Leads"),
+        yaxis=dict(title="Vendas (qtd)"),
+    )
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+    dl = daily.get("dow_labels") or []
+    fig_d = go.Figure()
+    fig_d.add_trace(
+        go.Bar(x=dl, y=daily.get("dow_mean_qtd") or [], name="Qtd média", marker_color="#334155")
+    )
+    fig_d.add_trace(
+        go.Bar(
+            x=dl,
+            y=[float(v) / 1e6 for v in (daily.get("dow_mean_valor") or [])],
+            name="VGV médio (mi R$)",
+            marker_color="#0d9488",
+            yaxis="y2",
+        )
+    )
+    fig_d.update_layout(
+        title="Perfil por dia da semana (média histórica)",
+        barmode="group",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#fafafa",
+        height=400,
+        yaxis=dict(title="Qtd média"),
+        yaxis2=dict(overlaying="y", side="right", title="VGV médio (mi R$)", showgrid=False),
+        legend=dict(orientation="h", y=-0.2),
+    )
+    st.plotly_chart(fig_d, use_container_width=True)
+
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=cz,
+                x=cl,
+                y=cl,
+                colorscale="RdBu",
+                zmid=0,
+                zmin=-1,
+                zmax=1,
+            )
+        )
+        fig_h.update_layout(
+            title="Correlação (Pearson) — variáveis-chave",
+            height=max(320, 28 * len(cl)),
+            margin=dict(l=120, r=40, t=48, b=120),
+        )
+        st.plotly_chart(fig_h, use_container_width=True)
+    else:
+        st.info("Correlação entre variáveis numéricas indisponível (poucas colunas ou dados).")
+
+    macro = daily.get("macro") or {}
+    if macro:
+        fig_m = go.Figure()
+        for name, series in macro.items():
+            s = pd.to_numeric(pd.Series(series), errors="coerce").fillna(0.0)
+            if s.std() and float(s.std()) > 0:
+                z = ((s - s.mean()) / s.std()).tolist()
+            else:
+                z = [0.0] * len(s)
+            fig_m.add_trace(go.Scatter(x=dates, y=z, name=str(name), mode="lines", line=dict(width=1.8)))
+        fig_m.update_layout(
+            title="Indicadores macro (z-score por série)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="#fafafa",
+            height=380,
+            xaxis=dict(title="Data"),
+            yaxis=dict(title="Desvios σ"),
+            legend=dict(orientation="h", y=-0.35),
+        )
+        st.plotly_chart(fig_m, use_container_width=True)
+
+    st.markdown("#### Importância de features (modelo operacional por horizonte)")
+    for h in (3, 7, 30):
+        sub = por_h.get(h) or {}
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption(f"**H={h}d** — volume (quantidade)")
+            names = sub.get("qtd", {}).get("importance_names") or []
+            vals = sub.get("qtd", {}).get("importance_vals") or []
+            if names and vals:
+                top_n = min(18, len(names))
+                fig_i = go.Figure(
+                    go.Bar(
+                        x=vals[:top_n][::-1],
+                        y=names[:top_n][::-1],
+                        orientation="h",
+                        marker_color="#1e3a5f",
+                    )
+                )
+                fig_i.update_layout(
+                    height=28 * top_n + 80,
+                    margin=dict(l=200, r=24, t=32, b=40),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="#fafafa",
+                    xaxis=dict(title="Importância"),
+                )
+                st.plotly_chart(fig_i, use_container_width=True)
+            else:
+                st.caption("—")
+        with c2:
+            st.caption(f"**H={h}d** — VGV")
+            names = sub.get("valor", {}).get("importance_names") or []
+            vals = sub.get("valor", {}).get("importance_vals") or []
+            if names and vals:
+                top_n = min(18, len(names))
+                fig_iv = go.Figure(
+                    go.Bar(
+                        x=vals[:top_n][::-1],
+                        y=names[:top_n][::-1],
+                        orientation="h",
+                        marker_color="#0f766e",
+                    )
+                )
+                fig_iv.update_layout(
+                    height=28 * top_n + 80,
+                    margin=dict(l=200, r=24, t=32, b=40),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="#fafafa",
+                    xaxis=dict(title="Importância"),
+                )
+                st.plotly_chart(fig_iv, use_container_width=True)
+            else:
+                st.caption("—")
+
+
+def _render_streamlit_tab_apendice(
+    por_h: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    daily: dict[str, Any],
+) -> None:
+    hz_txt = ", ".join(str(x) for x in (3, 7, 30))
+    modo = (
+        "O modelo final é reajustado em **100%** da série; uma fatia final (~8%) serve apenas para ranquear candidatos do ensemble."
+        if full_period_train
+        else "Divisão **70% treino / 30% teste** cronológicos; dentro do treino, ~8% no fim para validação interna na escolha do ensemble. "
+        "As métricas principais (MAE, RMSE, R², etc.) referem-se ao **bloco de teste (30%)**."
+    )
+    st.markdown(
+        f"""
+### Metodologia (resumo executivo)
+
+- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem).
+- **Dados:** **{daily.get("n_rows", 0):,}** observações diárias na matriz consolidada; **{daily.get("n_features", 0)}** colunas após engenharia.
+- **Validação:** {modo}
+- **Otimização:** LightGBM via **Optuna** (TPE + **MedianPruner**) com **TimeSeriesSplit**; espaço de busca **encolhe** com poucos dados; o objetivo penaliza **instabilidade entre folds** (MAE + variância + dispersão), favorecendo soluções que generalizam no tempo. Semente **{random_seed}**.
+- **Seleção:** vários algoritmos competem (Ridge, ElasticNet, **SVM (SVR)**, **k-NN**, florestas, boosting LightGBM/XGBoost/CatBoost, NGBoost no VGV, baselines, *stacks* leves). O ranking usa MAE na validação interna; os **{blend_top_k}** melhores entram num **super-ensemble** com pesos proporcionais a exp(−(MAE−MAE_min)/τ). Se o blend não ganhar de forma clara, mantém-se o melhor modelo isolado. **Balanceamento** de regimes de volume: *sample weights* temporais nos modelos que suportam (mais peso a observações recentes e caudas).
+- **Pré-processamento:** **MinMaxScaler (0,1)** com *clip* nas entradas numéricas dos *pipelines*.
+- **Métricas binárias** nas tabelas do HTML são **auxiliares** (predição vs mediana histórica de *y* no treino do benchmark).
+
+O relatório HTML descarregável na aba **Previsão** contém curvas de teste, ROC auxiliar, tabelas completas de benchmark e o mesmo texto técnico com formatação rica.
+"""
+    )
+
+    st.markdown("### Modelo operacional e hiperparâmetros (LightGBM) por horizonte")
+    for h in (3, 7, 30):
+        sub = por_h.get(h) or {}
+        qd = sub.get("qtd", {})
+        vl = sub.get("valor", {})
+        with st.expander(f"Horizonte **{h} dias** — {qd.get('model_label', '—')} · {vl.get('model_label', '—')}", expanded=(h == 3)):
+            st.markdown("**Volume (quantidade)** — etiqueta do pipeline vencedor:")
+            st.code(str(qd.get("model_label", "—")), language=None)
+            st.markdown("**VGV** — etiqueta do pipeline vencedor:")
+            st.code(str(vl.get("model_label", "—")), language=None)
+            bp = best_params_preview.get(h, {})
+            st.markdown("**Hiperparâmetros LightGBM (volume)**")
+            st.json(bp.get("qtd") or {})
+            st.markdown("**Hiperparâmetros LightGBM (VGV)**")
+            st.json(bp.get("valor") or {})
+
+    bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
+    if bpc:
+        with st.expander("Cenário **personalizado** — hiperparâmetros LightGBM (referência Optuna)", expanded=False):
+            st.json({"volume (qtd)": bpc.get("qtd") or {}, "vgv": bpc.get("valor") or {}})
+
+
+def _render_streamlit_dossie_ml(
+    dossie: dict[str, Any],
+    por_h: dict[Any, dict[str, Any]],
+    daily_pack: dict[str, Any],
+    por_custom: dict[str, Any] | None,
+) -> None:
+    import plotly.graph_objects as go
+
+    st.markdown("### Dossiê analítico e de modelagem")
+    st.markdown(
+        "Documento técnico com **estatísticas descritivas**, **deteção de outliers** (regra IQR), "
+        "**correlações**, indicadores de **multicolinearidade (VIF)**, **balanceamento** do volume diário, "
+        "distribuições e notas sobre **tratamento de dados** e **mitigação de overfitting**."
+    )
+
+    if dossie.get("erro"):
+        st.error(str(dossie["erro"]))
+        return
+
+    if dossie.get("aviso_previsao_custom"):
+        st.warning(str(dossie["aviso_previsao_custom"]))
+
+    with st.expander("1 · Tratamento de dados e preparação para modelos", expanded=True):
+        st.markdown(
+            """
+**Limpeza e integridade**
+- Índice diário **deduplicado** (mantém-se a última ocorrência por data).
+- **Alvos** (`target_qtd`, `target_valor`): remoção apenas de linhas com alvo em falta; valores não finitos tratados antes da agregação.
+- **Features**: `inf`/`-inf` substituídos; **valores em falta preenchidos com 0** após engenharia (lags e indicadores já usam apenas informação passada), evitando perder séries inteiras por uma coluna esparsa.
+- **Normalização:** `MinMaxScaler(0,1)` com `clip=True` em todas as *pipelines* (estabiliza SVM, k-NN, redes lineares sob deriva da distribuição).
+- **Outliers no alvo:** não são removidos automaticamente (são eventos reais de negócio); a robustez vem da validação temporal, *ensemble*, regularização e **limite (*cap*)** nas previsões calibrado no treino.
+
+**Anti-overfitting**
+- Split **70% / 30%** cronológico; Optuna com **TimeSeriesSplit** e **MedianPruner**.
+- Objetivo de tuning penaliza **variância entre folds** (além do MAE).
+- Modelos lineares e **SVR** com regularização moderada; **k-NN** com *k* alto e pesos por distância.
+"""
+        )
+        st.metric("Observações na matriz diária", f"{dossie.get('n_linhas', 0):,}")
+        st.caption(
+            f"Período: **{dossie.get('primeira_data', '—')}** → **{dossie.get('ultima_data', '—')}** · "
+            f"**{dossie.get('n_colunas', 0)}** colunas após engenharia."
+        )
+
+    desc = dossie.get("descritivas") or []
+    if desc:
+        with st.expander("2 · Estatísticas descritivas (média, mediana, moda, dispersão, quartis e percentis)", expanded=False):
+            st.caption(
+                "**Curtose** em pandas = *excesso* de curtose (0 ≈ normal). **Moda**: primeiro valor modal da série."
+            )
+            st.dataframe(pd.DataFrame(desc), use_container_width=True, hide_index=True)
+
+    oi = dossie.get("outliers_iqr") or []
+    if oi:
+        with st.expander("3 · Outliers (regra IQR — 1,5×IQR)", expanded=False):
+            st.dataframe(pd.DataFrame(oi), use_container_width=True, hide_index=True)
+
+    cl = dossie.get("correlation_labels") or []
+    cz = dossie.get("correlation_matrix") or []
+    if len(cl) >= 2 and cz:
+        with st.expander("4 · Matriz de correlação (Pearson)", expanded=False):
+            fig_h = go.Figure(
+                data=go.Heatmap(
+                    z=cz,
+                    x=cl,
+                    y=cl,
+                    colorscale="RdBu",
+                    zmid=0,
+                    zmin=-1,
+                    zmax=1,
+                )
+            )
+            fig_h.update_layout(
+                title="Correlação entre variáveis numéricas-chave e *features* amostradas",
+                height=max(380, 26 * len(cl)),
+                margin=dict(l=120, r=40, t=48, b=120),
+            )
+            st.plotly_chart(fig_h, use_container_width=True)
+
+    pares = dossie.get("pares_multicolinearidade") or []
+    if pares:
+        with st.expander("5 · Pares com |r| ≥ 0,85 (alerta de multicolinearidade)", expanded=False):
+            st.dataframe(pd.DataFrame(pares), use_container_width=True, hide_index=True)
+
+    vifs = dossie.get("vif") or []
+    if vifs:
+        with st.expander("6 · VIF (Variance Inflation Factor) — subconjunto de *features*", expanded=False):
+            st.caption("VIF elevado (> 5–10) sugere redundância; os *tree-based* toleram melhor do que SVM/k-NN lineares em escala.")
+            st.dataframe(pd.DataFrame(vifs), use_container_width=True, hide_index=True)
+
+    bal = dossie.get("balanceamento_qtd") or {}
+    if bal:
+        with st.expander("7 · Balanceamento do volume diário (vs mediana)", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Dias acima da mediana", f"{bal.get('dias_acima_mediana', 0):,}")
+            with c2:
+                st.metric("Dias ≤ mediana", f"{bal.get('dias_abaixo_igual_mediana', 0):,}")
+            with c3:
+                st.metric("Proporção classe minoritária", f"{bal.get('proporcao_classe_minoritaria', 0)*100:.1f}%")
+            fig_p = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=["Acima da mediana", "Abaixo ou igual"],
+                        values=[
+                            bal.get("dias_acima_mediana", 0),
+                            bal.get("dias_abaixo_igual_mediana", 0),
+                        ],
+                        hole=0.35,
+                        marker=dict(colors=["#1e3a5f", "#94a3b8"]),
+                    )
+                ]
+            )
+            fig_p.update_layout(title="Partilha de dias por regime de volume", height=400)
+            st.plotly_chart(fig_p, use_container_width=True)
+
+    hq = dossie.get("hist_target_qtd") or {}
+    if hq.get("counts") and hq.get("edges"):
+        with st.expander("8 · Distribuição — histograma de vendas diárias (quantidade)", expanded=False):
+            edges = hq["edges"]
+            cnt = hq["counts"]
+            xs = [(edges[i] + edges[i + 1]) / 2 for i in range(len(cnt))]
+            fig = go.Figure(go.Bar(x=xs, y=cnt, marker_color="#1e3a5f"))
+            fig.update_layout(
+                title="Histograma — target_qtd",
+                xaxis_title="Volume (qtd)",
+                yaxis_title="Frequência",
+                height=400,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    hv = dossie.get("hist_target_valor") or {}
+    if hv.get("counts") and hv.get("edges"):
+        with st.expander("9 · Distribuição — histograma de VGV diário", expanded=False):
+            edges = hv["edges"]
+            cnt = hv["counts"]
+            xs = [((edges[i] + edges[i + 1]) / 2) / 1e6 for i in range(len(cnt))]
+            fig = go.Figure(go.Bar(x=xs, y=cnt, marker_color="#0f766e"))
+            fig.update_layout(
+                title="Histograma — target_valor",
+                xaxis_title="VGV (mi R$)",
+                yaxis_title="Frequência",
+                height=400,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    dates = daily_pack.get("dates") or []
+    vl = daily_pack.get("vol_leads") or []
+    tq = daily_pack.get("target_qtd") or []
+    if len(dates) == len(vl) == len(tq) and len(dates) > 5:
+        with st.expander("10 · Dispersão (série diária): leads × vendas", expanded=False):
+            fig_s = go.Figure(
+                go.Scatter(
+                    x=vl,
+                    y=tq,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.35, color="#334155"),
+                )
+            )
+            fig_s.update_layout(
+                title="Scatter — leads vs vendas (mesmo dia)",
+                xaxis_title="Leads",
+                yaxis_title="Vendas (qtd)",
+                height=420,
+            )
+            st.plotly_chart(fig_s, use_container_width=True)
+
+    dow_lbl = daily_pack.get("dow_labels") or []
+    dow_q = daily_pack.get("dow_mean_qtd") or []
+    if dow_lbl and dow_q:
+        with st.expander("11 · Média de volume por dia da semana (barras)", expanded=False):
+            fig_b = go.Figure(go.Bar(x=dow_lbl, y=dow_q, marker_color="#334155"))
+            fig_b.update_layout(
+                title="Quantidade média por dia da semana",
+                yaxis_title="Qtd média",
+                height=400,
+            )
+            st.plotly_chart(fig_b, use_container_width=True)
+
+    with st.expander("12 · Métricas dos modelos (holdout) e acurácia direcional", expanded=False):
+        st.markdown(
+            "**Acurácia dir. (mediana)** = fração de dias de teste em que o modelo acerta se o alvo está "
+            "acima ou abaixo da mediana do **conjunto de treino** (métrica auxiliar; o negócio continua a ser regressão — MAE/RMSE/R²)."
+        )
+        rows_m = []
+        for h in (3, 7, 30):
+            sub = por_h.get(h) or {}
+            for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
+                m = (sub.get(alvo) or {}).get("metrics_test") or {}
+                rows_m.append(
+                    {
+                        "Horizonte": f"{h}d",
+                        "Alvo": nome,
+                        "MAE": m.get("MAE"),
+                        "RMSE": m.get("RMSE"),
+                        "R²": m.get("R2"),
+                        "Acurácia dir.": m.get("Acc_dir_mediana"),
+                    }
+                )
+        if por_custom:
+            for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
+                m = (por_custom.get(alvo) or {}).get("metrics_test") or {}
+                rows_m.append(
+                    {
+                        "Horizonte": "Personalizado",
+                        "Alvo": nome,
+                        "MAE": m.get("MAE"),
+                        "RMSE": m.get("RMSE"),
+                        "R²": m.get("R2"),
+                        "Acurácia dir.": m.get("Acc_dir_mediana"),
+                    }
+                )
+        st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+        low_acc: list[dict[str, Any]] = []
+        for r in rows_m:
+            ad = r.get("Acurácia dir.")
+            if ad is None:
+                continue
+            try:
+                adf = float(ad)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(adf) and adf < 0.8:
+                low_acc.append(r)
+        if low_acc:
+            st.warning(
+                "Em pelo menos um horizonte/alvo, a **acurácia direcional** ficou abaixo de **80%**. "
+                "Revise *features*, horizonte ou volume de dados; evite aumentar complexidade sem validação temporal."
+            )
+        elif rows_m:
+            st.success("Acurácia direcional ≥ 80% em todos os horizontes reportados acima (onde a métrica foi calculada).")
+
+    if por_custom:
+        with st.expander("13 · Cenário de previsão personalizado", expanded=True):
+            st.markdown(f"**Definição:** {por_custom.get('label', '—')}")
+            qc = por_custom.get("qtd") or {}
+            vc = por_custom.get("valor") or {}
+            st.markdown(
+                f"- **Qtd prevista (último dia):** {float(qc.get('pred_ultimo_dia', 0)):,.2f} · "
+                f"MAE teste: {float((qc.get('metrics_test') or {}).get('MAE', 0)):.3f} · "
+                f"Acurácia dir.: {float((qc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%\n"
+                f"- **VGV previsto:** R$ {float(vc.get('pred_ultimo_dia', 0)):,.0f} · "
+                f"MAE teste: {float((vc.get('metrics_test') or {}).get('MAE', 0))/1e6:.3f} mi · "
+                f"Acurácia dir.: {float((vc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%"
+            )
+            st.caption(
+                "As *features* `fwd_*` incluem contagem de fins de semana e **feriados BR** exatamente nos dias que entram na soma, "
+                "para o modelo condicionar em calendário conhecido."
+            )
 
 
 def main() -> None:
@@ -4278,7 +5932,7 @@ def main() -> None:
     st.set_page_config(
         page_title="Previsão de vendas | Direcional",
         page_icon=str(fav) if fav else "📊",
-        layout="centered",
+        layout="wide",
         initial_sidebar_state="collapsed",
     )
     inject_css()
@@ -4304,153 +5958,287 @@ def main() -> None:
             '<div class="pv-status-pill pv-status-ok">Conta de serviço Google ativa · API com varredura de abas</div>',
             unsafe_allow_html=True,
         )
-    else:
-        st.markdown(
-            '<div class="pv-status-pill pv-status-warn">Modo CSV público · Configure '
-            "<code>GOOGLE_SERVICE_ACCOUNT_JSON</code> na raiz das secrets ou dentro de "
-            "<code>[google_sheets]</code> para leitura via API</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.caption(
-        f"Configuração automática: Optuna com trials adaptados ao histórico, ensemble até **{BLEND_TOP_K_FIXO}** candidatos, "
-        f"holdout **20%** nas métricas, semente **{RANDOM_SEED}**."
-    )
-
-    _, col_btn, _ = st.columns([1, 2, 1])
-    with col_btn:
-        run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
-
-    with st.expander("Suporte e manutenção"):
-        st.markdown(
-            "• **Secrets:** `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz **ou** `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON` "
-            "(string multilinha com o JSON; também `SERVICE_ACCOUNT_JSON`). Alternativa: secção `google_service_account` "
-            "com as chaves do ficheiro Google Cloud. Opcionais: `spreadsheet_ids`, `sheets`, `csv_gid_hints`.\n\n"
-            "• **Logo:** coloque `502.57_LOGO DIRECIONAL_V2F-01.png` na raiz do repositório ou defina `branding.LOGO_URL`.\n\n"
-            "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz."
-        )
-        if st.button("Limpar cache das planilhas", key="pv_clear_cache"):
-            _load_one_role_cached.clear()
-            st.success("Cache limpo. Volte a clicar em **Gerar previsões**.")
 
     if "resultado" not in st.session_state:
         st.session_state.resultado = None
 
-    if run_btn:
-        with st.spinner("A carregar e analisar as planilhas…"):
-            dfs, sheet_metas, used_sa = build_data_bundle()
-        st.session_state["sheet_metas"] = sheet_metas
-        st.session_state["used_service_account"] = used_sa
-        try:
-            with st.spinner(
-                "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
-            ):
-                stats_base, ticket, conv, por_h, _bpp, html_out = run_training_pipeline(dfs)
-            st.session_state.resultado = {
-                "stats_base": stats_base,
-                "ticket": ticket,
-                "conv": conv,
-                "por_h": por_h,
-                "html": html_out,
-                "full_train": FULL_PERIOD_TRAIN_FIXO,
-                "sheet_metas": sheet_metas,
-                "used_sa": used_sa,
-            }
-            st.success("Previsões geradas com sucesso.")
-        except Exception as e:
-            st.error(f"Erro na execução: {e}")
-            st.exception(e)
+    tab_analises, tab_previsao, tab_dossie, tab_apendice = st.tabs(
+        ["Análises", "Previsão", "Dossiê ML", "Apêndice"]
+    )
 
-    res = st.session_state.resultado
-    if res is None:
-        st.info(
-            "Clique em **Gerar previsões** para sincronizar as bases Google, treinar os modelos e obter o relatório. "
-            "Recomenda-se conta de serviço com acesso de leitura a todas as planilhas."
-        )
-        st.markdown(
-            '<p class="pv-foot">Direcional Engenharia · ferramenta interna de apoio à decisão</p>',
-            unsafe_allow_html=True,
-        )
-        return
+    with tab_previsao:
+        with st.expander("Previsão em dias combinados (opcional)", expanded=False):
+            st.markdown(
+                "Além dos horizontes **3, 7 e 30 dias**, pode treinar um alvo extra que **soma** vendas em dias à sua escolha. "
+                "Os **feriados** e fins de semana desses dias entram como *features* (`fwd_*`), pois são conhecidos no calendário."
+            )
+            use_custom = st.checkbox("Ativar cenário personalizado", value=False, key="pv_use_custom")
+            mode_custom = st.radio(
+                "Modo",
+                [
+                    "Deslocamento fixo: soma em t+ k dias (ex.: 7, 14, 15)",
+                    "Dias do mês: soma nos dias D do mesmo mês após a data de referência (ex.: 7, 14, 15)",
+                ],
+                key="pv_custom_mode",
+            )
+            txt_custom = st.text_input(
+                "Valores separados por vírgula ou espaço",
+                placeholder="Ex.: 4, 11, 12  ou  7, 14, 15",
+                key="pv_custom_vals",
+            )
+            st.caption(
+                "Exemplo: último dia da série = **dia 3** e pretende os dias **7, 14 e 15** do mesmo mês → use o segundo modo com `7, 14, 15`. "
+                "Para somar exatamente **t+7, t+14 e t+15**, use o primeiro modo com `7, 14, 15`."
+            )
 
-    stats_base = res["stats_base"]
-    ticket = res["ticket"]
-    conv = res["conv"]
-    por_h = res["por_h"]
-    html_out = res["html"]
-    full_train = res["full_train"]
-    sheet_metas = res.get("sheet_metas") or st.session_state.get("sheet_metas")
+        _, col_btn, _ = st.columns([1, 2, 1])
+        with col_btn:
+            run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
 
-    if sheet_metas:
-        with st.expander("Folhas selecionadas automaticamente (auditoria)", expanded=False):
-            rows_m = []
-            for k, m in sheet_metas.items():
-                rows_m.append(
+        with st.expander("Suporte e manutenção"):
+            st.markdown(
+                "• **Secrets:** `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz **ou** `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON` "
+                "(string multilinha com o JSON; também `SERVICE_ACCOUNT_JSON`). Alternativa: secção `google_service_account` "
+                "com as chaves do ficheiro Google Cloud. Opcionais: `spreadsheet_ids`, `sheets`, `csv_gid_hints`.\n\n"
+                "• **Logo:** coloque `502.57_LOGO DIRECIONAL_V2F-01.png` na raiz do repositório ou defina `branding.LOGO_URL`.\n\n"
+                "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz."
+            )
+            if st.button("Limpar cache das planilhas", key="pv_clear_cache"):
+                _load_one_role_cached.clear()
+                st.success("Cache limpo. Volte a clicar em **Gerar previsões**.")
+
+        if run_btn:
+            with st.spinner("A carregar e analisar as planilhas…"):
+                dfs, sheet_metas, used_sa = build_data_bundle()
+            st.session_state["sheet_metas"] = sheet_metas
+            st.session_state["used_service_account"] = used_sa
+            try:
+                custom_previsao = None
+                if use_custom and (txt_custom or "").strip():
+                    if mode_custom.startswith("Deslocamento"):
+                        vals_c = _parse_previsao_int_list(txt_custom, max_val=400)
+                        if vals_c:
+                            custom_previsao = {"mode": "offsets", "values": vals_c}
+                    else:
+                        vals_c = [v for v in _parse_previsao_int_list(txt_custom, max_val=31) if v <= 31]
+                        if vals_c:
+                            custom_previsao = {"mode": "dom", "values": vals_c}
+                with st.spinner(
+                    "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
+                ):
+                    (
+                        stats_base,
+                        ticket,
+                        conv,
+                        por_h,
+                        bpp,
+                        html_out,
+                        daily_pack,
+                        dossie_ml,
+                        por_custom,
+                    ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
+                st.session_state.resultado = {
+                    "stats_base": stats_base,
+                    "ticket": ticket,
+                    "conv": conv,
+                    "por_h": por_h,
+                    "best_params_preview": bpp,
+                    "html": html_out,
+                    "daily_pack": daily_pack,
+                    "dossie_ml": dossie_ml,
+                    "por_custom": por_custom,
+                    "full_train": FULL_PERIOD_TRAIN_FIXO,
+                    "sheet_metas": sheet_metas,
+                    "used_sa": used_sa,
+                }
+                st.success("Previsões geradas com sucesso.")
+            except Exception as e:
+                st.error(f"Erro na execução: {e}")
+                st.exception(e)
+
+        res = st.session_state.resultado
+        if res is None:
+            st.info(
+                "Clique em **Gerar previsões** para sincronizar as bases, treinar os modelos e carregar indicadores nas outras abas. "
+                "Recomenda-se conta de serviço com acesso de leitura a todas as planilhas."
+            )
+        else:
+            stats_base = res["stats_base"]
+            ticket = res["ticket"]
+            conv = res["conv"]
+            por_h = res["por_h"]
+            html_out = res["html"]
+            full_train = res["full_train"]
+            sheet_metas = res.get("sheet_metas") or st.session_state.get("sheet_metas")
+
+            if sheet_metas:
+                with st.expander("Folhas selecionadas automaticamente (auditoria)", expanded=False):
+                    rows_m = []
+                    for k, m in sheet_metas.items():
+                        rows_m.append(
+                            {
+                                "Base": k,
+                                "Método": m.get("method", "—"),
+                                "Livro": m.get("spreadsheet_title") or "—",
+                                "Aba": m.get("worksheet_title") or "—",
+                                "gid": m.get("gid", "—"),
+                                "Cabeçalho (linha)": m.get("header_row_index", "—"),
+                                "Pontuação": m.get("score", "—"),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+
+            c1, c2 = st.columns(2)
+            c3, c4 = st.columns(2)
+            with c1:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Vendas (histórico)</h4><div class="val">{stats_base["vendas"]:,.0f}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f'<div class="metric-card"><h4>VGV acumulado</h4><div class="val">R$ {stats_base["vgv"]/1e6:.2f} M</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Ticket médio</h4><div class="val">R$ {ticket/1e3:,.0f} k</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Conversão leads → vendas</h4><div class="val">{conv:.2f} %</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.subheader("Previsões (último dia da série)")
+            rows = []
+            lbl = "In-sample" if full_train else "Holdout 30%"
+            for h in (3, 7, 30):
+                q = por_h[h]["qtd"]
+                v = por_h[h]["valor"]
+                acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
+                acc_v = v.get("metrics_test", {}).get("Acc_dir_mediana")
+                rows.append(
                     {
-                        "Base": k,
-                        "Método": m.get("method", "—"),
-                        "Livro": m.get("spreadsheet_title") or "—",
-                        "Aba": m.get("worksheet_title") or "—",
-                        "gid": m.get("gid", "—"),
-                        "Cabeçalho (linha)": m.get("header_row_index", "—"),
-                        "Pontuação": m.get("score", "—"),
+                        "Horizonte (dias)": h,
+                        "Qtd prevista": f"{float(q['pred_ultimo_dia']):,.1f}",
+                        "VGV previsto (R$)": f"{float(v['pred_ultimo_dia']):,.0f}",
+                        f"MAE Qtd ({lbl})": f"{q['metrics_test']['MAE']:.2f}",
+                        f"MAE VGV ({lbl})": f"{v['metrics_test']['MAE']/1e6:.2f} mi",
+                        "Acurácia dir. Qtd": f"{acc_q*100:.1f}%"
+                        if acc_q is not None and np.isfinite(acc_q)
+                        else "—",
+                        "Acurácia dir. VGV": f"{acc_v*100:.1f}%"
+                        if acc_v is not None and np.isfinite(acc_v)
+                        else "—",
+                        "Modelo Qtd": q["model_label"],
+                        "Modelo VGV": v["model_label"],
                     }
                 )
-            st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+            pc = res.get("por_custom")
+            if pc:
+                qc = pc.get("qtd") or {}
+                vc = pc.get("valor") or {}
+                aq = (qc.get("metrics_test") or {}).get("Acc_dir_mediana")
+                av = (vc.get("metrics_test") or {}).get("Acc_dir_mediana")
+                rows.append(
+                    {
+                        "Horizonte (dias)": f"Personalizado: {(pc.get('label') or '')[:52]}",
+                        "Qtd prevista": f"{float(qc.get('pred_ultimo_dia', 0)):,.1f}",
+                        "VGV previsto (R$)": f"{float(vc.get('pred_ultimo_dia', 0)):,.0f}",
+                        f"MAE Qtd ({lbl})": f"{float((qc.get('metrics_test') or {}).get('MAE', 0)):.2f}",
+                        f"MAE VGV ({lbl})": f"{float((vc.get('metrics_test') or {}).get('MAE', 0))/1e6:.2f} mi",
+                        "Acurácia dir. Qtd": f"{aq*100:.1f}%"
+                        if aq is not None and np.isfinite(aq)
+                        else "—",
+                        "Acurácia dir. VGV": f"{av*100:.1f}%"
+                        if av is not None and np.isfinite(av)
+                        else "—",
+                        "Modelo Qtd": qc.get("model_label", "—"),
+                        "Modelo VGV": vc.get("model_label", "—"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            acc_warn = False
+            for h in (3, 7, 30):
+                for part in ("qtd", "valor"):
+                    m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
+                    a = m.get("Acc_dir_mediana")
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                        acc_warn = True
+            if pc:
+                for part in ("qtd", "valor"):
+                    m = (pc.get(part) or {}).get("metrics_test") or {}
+                    a = m.get("Acc_dir_mediana")
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                        acc_warn = True
+            if acc_warn:
+                st.warning(
+                    "Pelo menos uma **acurácia direcional** (vs mediana do treino) está abaixo de **80%**. "
+                    "Considere mais histórico, revisão de *features* ou horizonte; não aumente a complexidade sem ganho na validação temporal."
+                )
 
-    c1, c2 = st.columns(2)
-    c3, c4 = st.columns(2)
-    with c1:
-        st.markdown(
-            f'<div class="metric-card"><h4>Vendas (histórico)</h4><div class="val">{stats_base["vendas"]:,.0f}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            f'<div class="metric-card"><h4>VGV acumulado</h4><div class="val">R$ {stats_base["vgv"]/1e6:.2f} M</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f'<div class="metric-card"><h4>Ticket médio</h4><div class="val">R$ {ticket/1e3:,.0f} k</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            f'<div class="metric-card"><h4>Conversão leads → vendas</h4><div class="val">{conv:.2f} %</div></div>',
-            unsafe_allow_html=True,
-        )
+            st.download_button(
+                label="Descarregar relatório HTML (gráficos e apêndice técnico)",
+                data=html_out.encode("utf-8"),
+                file_name="dashboard_previsao_vendas.html",
+                mime="text/html; charset=utf-8",
+                use_container_width=True,
+            )
 
-    st.subheader("Previsões (último dia da série)")
-    rows = []
-    for h in (3, 7, 30):
-        q = por_h[h]["qtd"]
-        v = por_h[h]["valor"]
-        lbl = "In-sample" if full_train else "Holdout 20%"
-        rows.append(
-            {
-                "Horizonte (dias)": h,
-                "Qtd prevista": f"{float(q['pred_ultimo_dia']):,.1f}",
-                "VGV previsto (R$)": f"{float(v['pred_ultimo_dia']):,.0f}",
-                f"MAE Qtd ({lbl})": f"{q['metrics_test']['MAE']:.2f}",
-                f"MAE VGV ({lbl})": f"{v['metrics_test']['MAE']/1e6:.2f} mi",
-                "Modelo Qtd": q["model_label"],
-                "Modelo VGV": v["model_label"],
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "As métricas de erro seguem o esquema temporal do pipeline (ver Apêndice). O HTML inclui benchmark completo e curvas ROC da tarefa binária auxiliar."
+            )
 
-    st.download_button(
-        label="Descarregar relatório HTML (gráficos e apêndice técnico)",
-        data=html_out.encode("utf-8"),
-        file_name="dashboard_previsao_vendas.html",
-        mime="text/html; charset=utf-8",
-        use_container_width=True,
-    )
+    with tab_analises:
+        res_a = st.session_state.resultado
+        if res_a is None:
+            st.info("Gere as previsões na aba **Previsão** para carregar gráficos e indicadores com os seus dados.")
+        elif "daily_pack" not in res_a:
+            st.warning("Execute novamente **Gerar previsões** para atualizar a aba Análises.")
+        else:
+            _render_streamlit_tab_analises(
+                res_a["daily_pack"],
+                res_a["stats_base"],
+                res_a["ticket"],
+                res_a["conv"],
+                res_a["por_h"],
+            )
 
-    st.caption(
-        "As métricas de erro referem-se ao holdout temporal definido no pipeline. O HTML inclui benchmark de modelos e curvas ROC (tarefa auxiliar)."
-    )
+    with tab_dossie:
+        res_d = st.session_state.resultado
+        if res_d is None:
+            st.info("Gere as previsões na aba **Previsão** para carregar o **Dossiê ML** completo.")
+        elif "dossie_ml" not in res_d or "daily_pack" not in res_d:
+            st.warning("Execute novamente **Gerar previsões** para atualizar o dossiê.")
+        else:
+            _render_streamlit_dossie_ml(
+                res_d["dossie_ml"],
+                res_d["por_h"],
+                res_d["daily_pack"],
+                res_d.get("por_custom"),
+            )
+
+    with tab_apendice:
+        res_ap = st.session_state.resultado
+        if res_ap is None:
+            st.info(
+                "Após **Gerar previsões**, esta aba mostra a metodologia, a lógica de escolha do modelo e os hiperparâmetros finais por horizonte."
+            )
+        elif "daily_pack" not in res_ap:
+            st.warning("Execute novamente **Gerar previsões** para carregar o Apêndice atualizado.")
+        else:
+            bpp = res_ap.get("best_params_preview") or {}
+            _render_streamlit_tab_apendice(
+                res_ap["por_h"],
+                bpp,
+                res_ap["full_train"],
+                BLEND_TOP_K_FIXO,
+                RANDOM_SEED,
+                res_ap["daily_pack"],
+            )
+
     st.markdown(
         '<p class="pv-foot">Direcional Engenharia · Previsão de vendas</p>',
         unsafe_allow_html=True,
