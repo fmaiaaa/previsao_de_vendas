@@ -8724,7 +8724,7 @@ def _render_streamlit_tab_analises(
                     line=dict(width=2),
                 )
             )
-        _lo_m = _plotly_layout_direcional(
+        _lo_m_base = _plotly_layout_direcional(
             title="Indicadores macro (z-score por série)",
             height=400,
             xaxis_title="Eixo X — data",
@@ -8734,7 +8734,9 @@ def _render_streamlit_tab_analises(
         )
         _xr_m = _plotly_xaxis_range_from_dates(dates)
         if _xr_m:
-            _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
+            _lo_m = {**_lo_m_base, "xaxis": {**_lo_m_base["xaxis"], "range": _xr_m}}
+        else:
+            _lo_m = _lo_m_base
         fig_m.update_layout(**_lo_m)
         st.plotly_chart(fig_m, width="stretch", config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
