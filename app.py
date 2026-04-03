@@ -1,5 +1,10 @@
+# -*- coding: utf-8 -*-
 """
-Previsão de vendas — Streamlit (Direcional). Ficheiro único para deploy (ex.: Streamlit Cloud).
+Previsão de vendas — Direcional (Streamlit).
+
+Arquivo único para deploy (ex.: Streamlit Cloud): leitura Google Sheets/CSV, pipeline de ML,
+relatório HTML e identidade visual alinhada à ficha Vendas RJ. Dependências: ver
+`requirements.txt` / `requirements-previsao.txt`.
 """
 
 from __future__ import annotations
@@ -2607,6 +2612,108 @@ def _best_df_from_values(rows: list[list[Any]], role: str) -> tuple[pd.DataFrame
     return best
 
 
+_PEM_END_MARKERS = (
+    "-----END PRIVATE KEY-----",
+    "-----END RSA PRIVATE KEY-----",
+    "-----END ENCRYPTED PRIVATE KEY-----",
+)
+
+_SERVICE_ACCOUNT_JSON_KEYS = frozenset(
+    {
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+        "universe_domain",
+    },
+)
+
+
+def _reparar_private_key_json_com_quebras_literais(s: str) -> str:
+    """Se o PEM foi colado com quebras reais dentro da string JSON, reescape para json.loads."""
+    k = s.find('"private_key"')
+    if k == -1:
+        k = s.find("'private_key'")
+    if k == -1:
+        return s
+    colon = s.find(":", k)
+    if colon == -1:
+        return s
+    q_open = s.find('"', colon)
+    if q_open == -1:
+        return s
+    val_start = q_open + 1
+    rest = s[val_start:]
+    end_pem = -1
+    for mark in _PEM_END_MARKERS:
+        p = rest.find(mark)
+        if p != -1:
+            end_pem = p + len(mark)
+            break
+    if end_pem == -1:
+        return s
+    pem = rest[:end_pem]
+    after = rest[end_pem:]
+    i = 0
+    while i < len(after) and after[i] in " \t\r\n":
+        i += 1
+    if i >= len(after) or after[i] != '"':
+        return s
+    tail = after[i + 1 :]
+    inner_esc = json.dumps(pem)[1:-1]
+    return s[:val_start] + inner_esc + '"' + tail
+
+
+def _parse_service_account_json_string(raw: str) -> dict[str, Any] | None:
+    """Parse do JSON da conta de serviço (string única ou multilinha TOML)."""
+    s = (raw or "").strip().lstrip("\ufeff")
+    if not s:
+        return None
+    candidates = (s, _reparar_private_key_json_com_quebras_literais(s))
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            parsed = json.loads(cand)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _service_account_credenciais_preenchidas(info: dict[str, Any]) -> bool:
+    """Ignora template com campos vazios (ex.: secrets de exemplo)."""
+    ce = str(info.get("client_email") or "").strip()
+    pk = str(info.get("private_key") or "").strip()
+    return bool(ce and pk and "BEGIN" in pk)
+
+
+def _dict_google_sheets_sem_json_bruto(gs: dict[str, Any]) -> dict[str, Any]:
+    """Só chaves do JSON Google; exclui strings JSON embutidas e ruído."""
+    skip = frozenset(
+        {
+            "GOOGLE_SERVICE_ACCOUNT_JSON",
+            "google_service_account_json",
+            "SERVICE_ACCOUNT_JSON",
+            "service_account_json",
+        }
+    )
+    return {
+        str(k): gs[k]
+        for k in gs
+        if str(k) not in skip and k in _SERVICE_ACCOUNT_JSON_KEYS
+    }
+
+
 def try_gspread_client() -> Any | None:
     """Instancia cliente gspread a partir de credenciais no ambiente (sem Streamlit)."""
     try:
@@ -2627,16 +2734,16 @@ def _service_account_info_from_env() -> dict[str, Any] | None:
     import os
 
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return None
+    if not raw or not str(raw).strip():
+        return None
+    info = _parse_service_account_json_string(str(raw))
+    if info and _service_account_credenciais_preenchidas(info):
+        return info
     return None
 
 
 def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
-    """Lê JSON completo ou secção TOML gerada a partir das chaves do service account."""
+    """Lê JSON completo (raiz ou [google_sheets]) ou secção TOML tipo ficheiro Google Cloud."""
     try:
         import streamlit as st
     except ImportError:
@@ -2645,14 +2752,43 @@ def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
         if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
             raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
             if isinstance(raw, str) and raw.strip():
-                return json.loads(raw.strip())
+                info = _parse_service_account_json_string(raw)
+                if info and _service_account_credenciais_preenchidas(info):
+                    return info
+
+        gs = st.secrets.get("google_sheets")
+        if isinstance(gs, dict):
+            for jkey in (
+                "GOOGLE_SERVICE_ACCOUNT_JSON",
+                "google_service_account_json",
+                "SERVICE_ACCOUNT_JSON",
+                "service_account_json",
+            ):
+                raw = gs.get(jkey)
+                if isinstance(raw, str) and raw.strip():
+                    info = _parse_service_account_json_string(raw)
+                    if info and _service_account_credenciais_preenchidas(info):
+                        return info
+            flat = _dict_google_sheets_sem_json_bruto(gs)
+            if flat.get("type") == "service_account" or (
+                str(flat.get("client_email") or "").strip()
+                and str(flat.get("private_key") or "").strip()
+            ):
+                if _service_account_credenciais_preenchidas(flat):
+                    return flat
+
         for key in ("google_service_account", "gcp_service_account", "service_account"):
             if key in st.secrets:
                 sec = st.secrets[key]
-                if isinstance(sec, str) and sec.strip().startswith("{"):
-                    return json.loads(sec.strip())
+                if isinstance(sec, str) and sec.strip():
+                    if sec.strip().startswith("{"):
+                        info = _parse_service_account_json_string(sec)
+                        if info and _service_account_credenciais_preenchidas(info):
+                            return info
                 if hasattr(sec, "keys"):
-                    return {str(k): sec[k] for k in sec.keys()}
+                    info = {str(k): sec[k] for k in sec.keys()}
+                    if _service_account_credenciais_preenchidas(info):
+                        return info
     except Exception as e:
         logger.warning("Secrets Streamlit (service account): %s", e)
     return None
@@ -3505,13 +3641,14 @@ import base64
 import html
 import streamlit as st
 
-# --- Identidade visual (alinhado à ficha Vendas RJ) ---
+# --- Identidade visual (paridade com ficha de credenciamento Vendas RJ — aplicar_estilo) ---
 COR_AZUL_ESC = "#04428f"
 COR_VERMELHO = "#cb0935"
-COR_VERMELHO_ESCURO = "#9e0828"
 COR_BORDA = "#eef2f6"
 COR_INPUT_BG = "#f0f2f6"
 COR_TEXTO_MUTED = "#64748b"
+COR_TEXTO_LABEL = "#1e293b"
+COR_VERMELHO_ESCURO = "#9e0828"
 
 LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
 FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
@@ -3526,9 +3663,10 @@ BG_HERO_URL = (
 
 
 def _hex_rgb_triplet(hex_color: str) -> str:
+    """Converte #RRGGBB em 'r, g, b' para uso em rgba(...)."""
     x = (hex_color or "").strip().lstrip("#")
     if len(x) != 6:
-        return "4, 66, 143"
+        return "0, 0, 0"
     return f"{int(x[0:2], 16)}, {int(x[2:4], 16)}, {int(x[4:6], 16)}"
 
 
@@ -3612,144 +3750,201 @@ def _exibir_logo_topo() -> None:
 
 
 def inject_css() -> None:
+    """CSS alinhado à ficha Vendas RJ (`aplicar_estilo`): gradiente global, cartão vidro, tipografia Montserrat+Inter."""
     st.markdown(
         f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
-@keyframes pvFadeIn {{
-  from {{ opacity: 0; transform: translateY(14px); }}
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
+@keyframes fichaFadeIn {{
+  from {{ opacity: 0; transform: translateY(18px); }}
   to {{ opacity: 1; transform: translateY(0); }}
 }}
-@keyframes pvShimmer {{
+@keyframes fichaShimmer {{
   0% {{ background-position: 0% 50%; }}
   100% {{ background-position: 200% 50%; }}
 }}
-html, body, [class*="css"] {{
-  font-family: 'Inter', system-ui, sans-serif;
-  color: #1e293b;
-}}
-.stApp, [data-testid="stApp"] {{
-  background:
-    linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.85) 0%, rgba(30, 58, 95, 0.55) 42%, rgba({RGB_VERMELHO_CSS}, 0.18) 72%, rgba(15, 23, 42, 0.48) 100%),
-    url("{BG_HERO_URL}") center / cover no-repeat !important;
-}}
-[data-testid="stAppViewContainer"] {{ background: transparent !important; }}
-/* Faixa central legível: fundo claro sólido sobre o gradiente/imagem */
-[data-testid="stMain"] {{
-  background: rgba(255, 255, 255, 0.96) !important;
-  background-color: #f8fafc !important;
-  border-radius: 20px !important;
-  margin: 0.5rem 0.75rem 1.25rem 0.75rem !important;
-  padding: 0.5rem 0 1rem 0 !important;
-  box-shadow: 0 4px 24px rgba(15, 23, 42, 0.12) !important;
-  box-sizing: border-box !important;
-}}
-[data-testid="stHeader"], [data-testid="stDecoration"] {{
+html, body {{
+  font-family: 'Inter', sans-serif;
+  color: {COR_TEXTO_LABEL};
   background: transparent !important;
+  background-color: transparent !important;
+}}
+.stApp,
+[data-testid="stApp"] {{
+  background:
+    linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
+    url("{BG_HERO_URL}") center / cover no-repeat !important;
+  background-attachment: scroll !important;
+  background-color: transparent !important;
+}}
+[data-testid="stAppViewContainer"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+header[data-testid="stHeader"],
+[data-testid="stHeader"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
   border: none !important;
   box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}}
+[data-testid="stHeader"] > div,
+[data-testid="stHeader"] header {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}}
+[data-testid="stDecoration"] {{
+  background: transparent !important;
+  background-color: transparent !important;
 }}
 [data-testid="stSidebar"] {{ display: none !important; }}
 [data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
 [data-testid="stToolbar"] {{
-  background: rgba(255, 255, 255, 0.92) !important;
-  backdrop-filter: blur(8px);
-  border-radius: 12px !important;
-  color: #0f172a !important;
-  padding: 4px 8px !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  color: rgba(255, 255, 255, 0.92) !important;
 }}
-[data-testid="stToolbar"] button {{ color: #0f172a !important; }}
-.main .block-container {{
-  max-width: 1040px !important;
+[data-testid="stToolbar"] button,
+[data-testid="stToolbar"] a {{
+  color: rgba(255, 255, 255, 0.92) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stHeader"] button {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stToolbar"] svg {{
+  fill: currentColor !important;
+  color: inherit !important;
+}}
+[data-testid="stToolbar"] svg path[stroke] {{
+  stroke: currentColor !important;
+}}
+[data-testid="stToolbar"] button:hover,
+[data-testid="stToolbar"] a:hover,
+[data-testid="stHeader"] button:hover {{
+  background: rgba(255, 255, 255, 0.12) !important;
+}}
+[data-testid="stMain"] {{
+  padding-left: clamp(14px, 5vw, 56px) !important;
+  padding-right: clamp(14px, 5vw, 56px) !important;
+  padding-top: clamp(12px, 3.5vh, 40px) !important;
+  padding-bottom: clamp(14px, 4vh, 44px) !important;
+  box-sizing: border-box !important;
+  background: transparent !important;
+}}
+section.main > div {{
+  padding-top: 0.25rem !important;
+  padding-bottom: 0.35rem !important;
+}}
+.block-container {{
+  max-width: 920px !important;
   margin-left: auto !important;
   margin-right: auto !important;
-  padding: 1.5rem 1.75rem 2rem 1.75rem !important;
-  background: #ffffff !important;
-  backdrop-filter: none;
-  border-radius: 18px !important;
-  border: 1px solid #e2e8f0 !important;
+  margin-top: clamp(4px, 1vh, 14px) !important;
+  margin-bottom: clamp(4px, 1vh, 14px) !important;
+  padding: 1.45rem 2.25rem 1.55rem 2.25rem !important;
+  background: rgba(255, 255, 255, 0.97) !important;
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border-radius: 24px !important;
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
   box-shadow:
-    0 1px 3px rgba({RGB_AZUL_CSS}, 0.06),
-    0 12px 32px -8px rgba(15, 23, 42, 0.08) !important;
-  animation: pvFadeIn 0.65s ease both;
+    0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
+    0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
 }}
-/* Texto nativo Streamlit sempre escuro sobre o cartão branco */
+h1, h2, h3 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+}}
 [data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] li,
-[data-testid="stMarkdownContainer"] span {{
-  color: #1e293b !important;
+[data-testid="stMarkdownContainer"] li {{
+  color: #334155 !important;
+  line-height: 1.55;
 }}
-[data-testid="stCaptionContainer"] {{
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] * {{
   color: #475569 !important;
 }}
+[data-testid="stWidgetLabel"] label,
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextArea"] label,
+div[data-testid="stSelectbox"] label,
+div[data-testid="stMultiSelect"] label,
+div[data-testid="stCheckbox"] label {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
 div[data-testid="stExpander"] {{
-  background: #ffffff !important;
+  background: rgba(255, 255, 255, 0.98) !important;
   border: 1px solid #e2e8f0 !important;
-  border-radius: 12px !important;
+  border-radius: 16px !important;
 }}
 div[data-testid="stExpander"] summary {{
   color: #0f172a !important;
 }}
 div[data-testid="stAlert"] {{
+  border-radius: 14px !important;
+  border: 2px solid {COR_AZUL_ESC} !important;
   background: #ffffff !important;
-  border: 1px solid #cbd5e1 !important;
-  color: #0f172a !important;
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1) !important;
 }}
-div[data-testid="stAlert"] p, div[data-testid="stAlert"] div {{
-  color: #1e293b !important;
+div[data-testid="stAlert"] p,
+div[data-testid="stAlert"] span,
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"],
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] * {{
+  color: {COR_AZUL_ESC} !important;
 }}
-[data-testid="stDataFrame"], [data-testid="stDataFrame"] > div {{
+div[data-testid="stAlert"] svg {{
+  fill: {COR_AZUL_ESC} !important;
+  color: {COR_AZUL_ESC} !important;
+}}
+[data-testid="stVerticalBlockBorderWrapper"] {{
+  border-radius: 16px !important;
+}}
+[data-testid="stDataFrame"],
+[data-testid="stDataFrame"] > div {{
   background: #ffffff !important;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid {COR_BORDA};
 }}
-.pv-logo-wrap {{
-  text-align: center;
-  padding: 0.15rem 0 0.5rem 0;
+div[data-baseweb="input"] {{
+  border-radius: 10px !important;
+  border: 1px solid #e2e8f0 !important;
+  background-color: {COR_INPUT_BG} !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }}
-.pv-logo-wrap img {{
-  max-height: 64px;
-  width: auto;
-  max-width: min(260px, 88vw);
-  object-fit: contain;
+div[data-baseweb="input"]:focus-within {{
+  border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
+  box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
 }}
-.pv-hero-title {{
-  font-family: 'Montserrat', sans-serif;
-  font-size: clamp(1.28rem, 3.2vw, 1.62rem);
-  font-weight: 900;
-  color: {COR_AZUL_ESC};
-  text-align: center;
-  margin: 0 0 0.4rem 0;
-  letter-spacing: -0.02em;
-  line-height: 1.2;
+.stButton > button {{
+  border-radius: 12px !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease !important;
 }}
-.pv-hero-sub {{
-  text-align: center;
-  color: #475569;
-  font-size: 0.94rem;
-  line-height: 1.55;
-  margin: 0 0 0.75rem 0;
+.stButton > button:hover {{
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
 }}
-.pv-bar-wrap {{ margin: 0.75rem 0 1rem 0; }}
-.pv-bar {{
-  height: 4px;
-  width: 100%;
-  border-radius: 999px;
-  background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
-  background-size: 200% 100%;
-  animation: pvShimmer 4s ease-in-out infinite alternate;
-}}
-.pv-status-pill {{
-  display: inline-block;
-  padding: 0.35rem 0.75rem;
-  border-radius: 999px;
-  font-size: 0.78rem;
-  font-weight: 600;
-  margin-bottom: 0.85rem;
-}}
-.pv-status-ok {{ background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }}
-.pv-status-warn {{ background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }}
 .stButton > button[kind="primary"] {{
   background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
-  color: #fff !important;
+  color: #ffffff !important;
   border: none !important;
   font-weight: 700 !important;
   font-family: 'Montserrat', sans-serif !important;
@@ -3762,23 +3957,113 @@ div[data-testid="stAlert"] p, div[data-testid="stAlert"] div {{
 .stButton > button[kind="primary"]:hover {{
   box-shadow: 0 8px 22px -6px rgba({RGB_VERMELHO_CSS}, 0.45) !important;
 }}
-div.metric-card {{
-  background: linear-gradient(180deg, #fff 0%, #fafbfc 100%);
+a[href*="whatsapp.com"],
+a[href*="wa.me"] {{
+  background-color: #25D366 !important;
+  color: #ffffff !important;
+  border: 1px solid #1ebe57 !important;
+  border-radius: 12px !important;
+  font-weight: 600 !important;
+}}
+.ficha-alert {{
   border-radius: 14px;
-  padding: 0.95rem 1.1rem;
-  border: 1px solid {COR_BORDA};
-  box-shadow: 0 2px 10px rgba({RGB_AZUL_CSS}, 0.06);
+  padding: 14px 16px;
+  margin: 0 0 12px 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  box-sizing: border-box;
+}}
+.ficha-alert--azul {{
+  border: 2px solid {COR_AZUL_ESC};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1);
+}}
+.ficha-alert--vermelho {{
+  border: 2px solid {COR_VERMELHO};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
+}}
+.pv-logo-wrap, .ficha-logo-wrap {{
+  text-align: center;
+  padding: 0.1rem 0 0.45rem 0;
+}}
+.pv-logo-wrap img, .ficha-logo-wrap img {{
+  max-height: 72px;
+  width: auto;
+  max-width: min(280px, 85vw);
+  height: auto;
+  object-fit: contain;
+  display: inline-block;
+  vertical-align: middle;
+}}
+.pv-hero-title, .ficha-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-size: clamp(1.35rem, 3.5vw, 1.75rem);
+  font-weight: 900;
+  color: {COR_AZUL_ESC};
+  text-align: center;
+  margin: 0;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}}
+.pv-hero-sub, .ficha-sub {{
+  text-align: center;
+  color: #475569;
+  font-size: 0.95rem;
+  margin: 0.45rem 0 0 0;
+  line-height: 1.45;
+}}
+.pv-bar-wrap, .ficha-hero-bar-wrap {{
+  width: 100%;
+  max-width: 100%;
+  margin: clamp(0.85rem, 2.4vw, 1.2rem) 0;
+  padding: 0;
+  box-sizing: border-box;
+}}
+.pv-bar, .ficha-hero-bar {{
+  height: 4px;
+  width: 100%;
+  margin: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
+  background-size: 200% 100%;
+  animation: fichaShimmer 4s ease-in-out infinite alternate;
+}}
+.pv-status-pill {{
+  display: inline-block;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.85rem;
+}}
+.pv-status-ok {{ background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }}
+.pv-status-warn {{ background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }}
+div.metric-card {{
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+  border-radius: 16px;
+  padding: 1.1rem 1.35rem 1rem 1.35rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.06);
   border-left: 3px solid {COR_AZUL_ESC};
-  margin-bottom: 0.5rem;
+  transition: box-shadow 0.35s ease, transform 0.35s ease;
+  animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+div.metric-card:hover {{
+  box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
+  transform: translateY(-1px);
 }}
 div.metric-card h4 {{
-  color: {COR_TEXTO_MUTED};
-  font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  margin: 0 0 0.3rem 0;
-  font-weight: 700;
   font-family: 'Montserrat', sans-serif;
+  color: {COR_TEXTO_MUTED};
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 800;
+  margin: 0 0 0.35rem 0;
 }}
 div.metric-card .val {{
   color: #0f172a;
@@ -3786,20 +4071,18 @@ div.metric-card .val {{
   font-weight: 800;
   font-family: 'Montserrat', sans-serif;
 }}
-h2, h3 {{ font-family: 'Montserrat', sans-serif !important; color: {COR_AZUL_ESC} !important; }}
-[data-testid="stDataFrame"] {{ border-radius: 12px; overflow: hidden; border: 1px solid {COR_BORDA}; }}
 .stDownloadButton > button {{
   border-radius: 12px !important;
   border: 2px solid {COR_AZUL_ESC} !important;
   color: {COR_AZUL_ESC} !important;
   font-weight: 600 !important;
 }}
-.pv-foot {{
+.pv-foot, .footer {{
   text-align: center;
-  font-size: 0.78rem;
+  padding: 0.85rem 0 0.35rem 0;
   color: {COR_TEXTO_MUTED};
-  margin-top: 1.25rem;
-  padding-top: 0.75rem;
+  font-size: 0.82rem;
+  margin-top: 1rem;
   border-top: 1px solid {COR_BORDA};
 }}
 </style>
@@ -3882,7 +4165,8 @@ def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, An
         modo = (
             "**Conta de serviço:** confirme partilha com o e-mail `client_email` do JSON."
             if use_sa
-            else "**Modo público:** partilhe as planilhas por ligação (Leitor) ou configure `GOOGLE_SERVICE_ACCOUNT_JSON`."
+            else "**Modo público:** partilhe as planilhas por ligação (Leitor) ou configure credenciais em "
+            "`GOOGLE_SERVICE_ACCOUNT_JSON` (raiz) ou `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON`."
         )
         st.error("Não foi possível carregar todas as fontes.\n\n" + modo + "\n\n" + "\n\n".join(errors))
         st.stop()
@@ -4022,8 +4306,9 @@ def main() -> None:
         )
     else:
         st.markdown(
-            '<div class="pv-status-pill pv-status-warn">Modo CSV público · Configure GOOGLE_SERVICE_ACCOUNT_JSON nas secrets '
-            "para leitura privada via API</div>",
+            '<div class="pv-status-pill pv-status-warn">Modo CSV público · Configure '
+            "<code>GOOGLE_SERVICE_ACCOUNT_JSON</code> na raiz das secrets ou dentro de "
+            "<code>[google_sheets]</code> para leitura via API</div>",
             unsafe_allow_html=True,
         )
 
@@ -4038,8 +4323,9 @@ def main() -> None:
 
     with st.expander("Suporte e manutenção"):
         st.markdown(
-            "• **Secrets:** `GOOGLE_SERVICE_ACCOUNT_JSON` (JSON completo) ou secção `google_service_account` · "
-            "`spreadsheet_ids` / `sheets` / `csv_gid_hints` opcionais.\n\n"
+            "• **Secrets:** `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz **ou** `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON` "
+            "(string multilinha com o JSON; também `SERVICE_ACCOUNT_JSON`). Alternativa: secção `google_service_account` "
+            "com as chaves do ficheiro Google Cloud. Opcionais: `spreadsheet_ids`, `sheets`, `csv_gid_hints`.\n\n"
             "• **Logo:** coloque `502.57_LOGO DIRECIONAL_V2F-01.png` na raiz do repositório ou defina `branding.LOGO_URL`.\n\n"
             "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz."
         )
