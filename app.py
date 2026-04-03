@@ -8431,11 +8431,11 @@ def _render_streamlit_tab_analises(
     _xr_f = _plotly_xaxis_range_from_dates(dates)
     if _xr_f:
         _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
-    fig_f.update_layout(
+    _lo_f = {
         **_lo_f,
-        xaxis_title="Eixo X — data",
-        yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
-        yaxis2=dict(
+        "xaxis_title": "Eixo X — data",
+        "yaxis_title": "Eixo Y₁ — contagens do funil (empilhadas, / dia)",
+        "yaxis2": dict(
             overlaying="y",
             side="right",
             title=dict(
@@ -8445,7 +8445,7 @@ def _render_streamlit_tab_analises(
             showgrid=False,
             tickfont=dict(size=11),
         ),
-        yaxis3=dict(
+        "yaxis3": dict(
             anchor="free",
             overlaying="y",
             side="right",
@@ -8457,7 +8457,8 @@ def _render_streamlit_tab_analises(
             showgrid=False,
             tickfont=dict(size=11),
         ),
-    )
+    }
+    fig_f.update_layout(_lo_f)
     st.plotly_chart(fig_f, width="stretch", config=_pc)
     _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
@@ -8491,7 +8492,7 @@ def _render_streamlit_tab_analises(
     _xr_roll = _plotly_xaxis_range_from_dates(dates)
     if _xr_roll:
         _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
-    fig_roll.update_layout(**_lo_roll)
+    fig_roll.update_layout(_lo_roll)
     st.plotly_chart(fig_roll, width="stretch", config=_pc)
     _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
 
@@ -8676,15 +8677,14 @@ def _render_streamlit_tab_analises(
                             hovertemplate=htempl,
                         )
                     )
-                    fig_pair.update_layout(
-                        **_plotly_layout_direcional(
-                            title=f"Dispersão: {xlab} × {ylab}",
-                            height=440,
-                            xaxis_title=f"Eixo X — {xlab}",
-                            yaxis_title=f"Eixo Y — {ylab}",
-                            margin=dict(t=56, l=56, r=48, b=100),
-                        ),
+                    _lo_pair = _plotly_layout_direcional(
+                        title=f"Dispersão: {xlab} × {ylab}",
+                        height=440,
+                        xaxis_title=f"Eixo X — {xlab}",
+                        yaxis_title=f"Eixo Y — {ylab}",
+                        margin=dict(t=56, l=56, r=48, b=100),
                     )
+                    fig_pair.update_layout(_lo_pair)
                     st.plotly_chart(fig_pair, width="stretch", config=_pc)
                     _txt_r = (
                         f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
@@ -8734,7 +8734,7 @@ def _render_streamlit_tab_analises(
         )
         _xr_m = _plotly_xaxis_range_from_dates(dates)
         _xax_m = {**_lo_m_base["xaxis"], **({"range": _xr_m} if _xr_m else {})}
-        fig_m.update_layout(**{**_lo_m_base, "xaxis": _xax_m})
+        fig_m.update_layout({**_lo_m_base, "xaxis": _xax_m})
         st.plotly_chart(fig_m, width="stretch", config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
