@@ -2490,6 +2490,122 @@ def forward_calendar_features_dom(
     )
 
 
+def forward_sum_calendar_date_range(
+    series: pd.Series, d_start: pd.Timestamp, d_end: pd.Timestamp
+) -> pd.Series:
+    """
+    Para cada dia t: soma do alvo nos dias d da série com t < d e d_start <= d <= d_end (inclusive).
+    Linhas sem dias futuros no intervalo ficam com NaN (excluídas do treino).
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(series.index).normalize())
+    d_lo = pd.Timestamp(d_start).normalize()
+    d_hi = pd.Timestamp(d_end).normalize()
+    if d_hi < d_lo:
+        d_lo, d_hi = d_hi, d_lo
+    arr = series.fillna(0).to_numpy(dtype=float)
+    n = len(arr)
+    y = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        ts = idx[i]
+        total = 0.0
+        hits = 0
+        for j in range(n):
+            d_j = idx[j]
+            if d_j <= ts or d_j < d_lo or d_j > d_hi:
+                continue
+            total += arr[j]
+            hits += 1
+        if hits == 0:
+            y[i] = np.nan
+        else:
+            y[i] = total
+    return pd.Series(y, index=series.index)
+
+
+def forward_calendar_features_date_range(
+    index: pd.DatetimeIndex, d_start: pd.Timestamp, d_end: pd.Timestamp
+) -> pd.DataFrame:
+    """Fins de semana e feriados BR nos dias da série que entram no intervalo (após t)."""
+    from datetime import timedelta
+
+    d_lo = pd.Timestamp(d_start).normalize()
+    d_hi = pd.Timestamp(d_end).normalize()
+    if d_hi < d_lo:
+        d_lo, d_hi = d_hi, d_lo
+    H = _br_holiday_dates_for_index(index)
+
+    def _ponte(d) -> bool:
+        if d not in H:
+            return False
+        return d.weekday() in (0, 4, 5, 6)
+
+    n = len(index)
+    idx_norm = pd.DatetimeIndex(pd.to_datetime(index).normalize())
+    fwd_wknd = np.zeros(n, dtype=float)
+    fwd_bday = np.zeros(n, dtype=float)
+    fwd_fer = np.zeros(n, dtype=float)
+    fwd_ves = np.zeros(n, dtype=float)
+    fwd_pos = np.zeros(n, dtype=float)
+    fwd_pont = np.zeros(n, dtype=float)
+    n_days = np.zeros(n, dtype=float)
+
+    for i in range(n):
+        ts = idx_norm[i]
+        for j in range(n):
+            d_j = idx_norm[j]
+            if d_j <= ts or d_j < d_lo or d_j > d_hi:
+                continue
+            n_days[i] += 1.0
+            dow = int(d_j.dayofweek)
+            if dow >= 5:
+                fwd_wknd[i] += 1.0
+            else:
+                fwd_bday[i] += 1.0
+            d = d_j.date()
+            if H and d in H:
+                fwd_fer[i] += 1.0
+                if _ponte(d):
+                    fwd_pont[i] += 1.0
+            if H and (d + timedelta(days=1)) in H:
+                fwd_ves[i] += 1.0
+            if H and (d - timedelta(days=1)) in H:
+                fwd_pos[i] += 1.0
+
+    h = np.maximum(n_days, 1.0)
+    return pd.DataFrame(
+        {
+            "fwd_h_range": n_days,
+            "fwd_wknd_range": fwd_wknd,
+            "fwd_bday_range": fwd_bday,
+            "fwd_wknd_ratio_range": fwd_wknd / (h + 1e-9),
+            "fwd_feriados_range": fwd_fer,
+            "fwd_vesperas_range": fwd_ves,
+            "fwd_pos_feriado_range": fwd_pos,
+            "fwd_feriado_ponte_range": fwd_pont,
+        },
+        index=index,
+    )
+
+
+def build_xy_custom_date_range(
+    df_master: pd.DataFrame,
+    target_daily_col: str,
+    d_start: pd.Timestamp,
+    d_end: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.Series]:
+    y = forward_sum_calendar_date_range(df_master[target_daily_col], d_start, d_end)
+    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    X = df_master[feature_cols].copy()
+    cal = forward_calendar_features_date_range(df_master.index, d_start, d_end)
+    X = pd.concat([X, cal], axis=1)
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X = X.fillna(0.0)
+    return X, y
+
+
 def build_xy_custom_offsets(
     df_master: pd.DataFrame,
     target_daily_col: str,
@@ -2544,6 +2660,22 @@ def predict_last_row_custom_dom(
 ) -> float:
     Xb = build_feature_matrix(df_master)
     cal = forward_calendar_features_dom(df_master.index, doms)
+    X = pd.concat([Xb, cal], axis=1)
+    X_last = X.iloc[[-1]]
+    p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
+    if not np.isfinite(p):
+        p = 0.0
+    return max(0.0, p)
+
+
+def predict_last_row_custom_date_range(
+    df_master: pd.DataFrame,
+    pipeline: Any,
+    d_start: pd.Timestamp,
+    d_end: pd.Timestamp,
+) -> float:
+    Xb = build_feature_matrix(df_master)
+    cal = forward_calendar_features_date_range(df_master.index, d_start, d_end)
     X = pd.concat([Xb, cal], axis=1)
     X_last = X.iloc[[-1]]
     p = float(np.asarray(pipeline.predict(X_last)).ravel()[0])
@@ -4459,6 +4591,7 @@ _ROOT = Path(__file__).resolve().parent
 
 import base64
 import html
+import os
 import streamlit as st
 
 # --- Identidade visual (paridade com ficha de credenciamento Vendas RJ — aplicar_estilo) ---
@@ -4493,6 +4626,73 @@ def _hex_rgb_triplet(hex_color: str) -> str:
 RGB_AZUL_CSS = _hex_rgb_triplet(COR_AZUL_ESC)
 RGB_VERMELHO_CSS = _hex_rgb_triplet(COR_VERMELHO)
 
+# Cores secundárias para gráficos Plotly (identidade Direcional)
+PLOT_AZUL = COR_AZUL_ESC
+PLOT_VERMELHO = COR_VERMELHO
+PLOT_ACCENT = "#0e7490"
+PLOT_MUTED = "#64748b"
+PLOT_GRID = "#e2e8f0"
+
+
+def _plotly_layout_direcional(
+    title: str | None = None,
+    height: int | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Layout base Plotly: paleta e tipografia alinhadas à marca."""
+    lo: dict[str, Any] = {
+        "template": "plotly_white",
+        "paper_bgcolor": "rgba(0,0,0,0)",
+        "plot_bgcolor": "#f8fafc",
+        "font": dict(
+            family="Montserrat, Inter, sans-serif",
+            size=12,
+            color="#1e293b",
+        ),
+        "xaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "yaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "hoverlabel": dict(
+            bgcolor="#ffffff",
+            font_size=12,
+            font_family="Montserrat, Inter, sans-serif",
+            bordercolor=PLOT_GRID,
+        ),
+        "hovermode": "x unified",
+        "legend": dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.28,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+        "margin": dict(t=56, l=56, r=52, b=88),
+    }
+    if title:
+        lo["title"] = dict(
+            text=title,
+            font=dict(size=17, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+            x=0.5,
+            xanchor="center",
+        )
+    if height is not None:
+        lo["height"] = height
+    lo.update(extra)
+    return lo
+
+
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
@@ -4503,8 +4703,12 @@ RANDOM_SEED = 42
 TRAIN_FRAC_FIXO = 0.7
 # Holdout final nas métricas do relatório (mais fiável que 100% in-sample).
 FULL_PERIOD_TRAIN_FIXO = False
-# tqdm no terminal pouco útil no Cloud — desativado.
-SHOW_ML_PROGRESS = False
+# tqdm nas etapas longas (build master, STL, Optuna). Desative com PREVISAO_HIDE_TQDM=1.
+SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in (
+    "1",
+    "true",
+    "yes",
+)
 
 DEFAULT_SPREADSHEET_IDS: dict[str, str] = {
     "formulario_previsao": "1lBliB3AjR5vJyRy9SoDi6DQOA9x5LC5wYfNNo5cz0bE",
@@ -4690,6 +4894,50 @@ section.main > div {{
 h1, h2, h3 {{
   font-family: 'Montserrat', sans-serif !important;
   color: {COR_AZUL_ESC} !important;
+  text-align: center;
+}}
+h4, h5, h6 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+}}
+.pv-section-title {{
+  text-align: center;
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 800;
+  color: {COR_AZUL_ESC};
+  font-size: 1.05rem;
+  margin: 0.85rem 0 0.5rem 0;
+}}
+div[data-testid="stTabs"] {{
+  margin-top: 0.4rem;
+  margin-bottom: 0.65rem;
+}}
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+  gap: 8px;
+  background: transparent;
+  border-bottom: 2px solid #e2e8f0;
+  padding-bottom: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+}}
+div[data-testid="stTabs"] button[data-baseweb="tab"] {{
+  border-radius: 12px 12px 0 0 !important;
+  font-family: 'Montserrat', sans-serif !important;
+  font-weight: 600 !important;
+  font-size: 0.9rem !important;
+  color: {COR_TEXTO_MUTED} !important;
+  background: #f1f5f9 !important;
+  border: 1px solid #e2e8f0 !important;
+  padding: 0.45rem 0.85rem !important;
+}}
+div[data-testid="stTabs"] [aria-selected="true"] {{
+  color: #ffffff !important;
+  background: linear-gradient(180deg, {COR_AZUL_ESC} 0%, #063572 100%) !important;
+  border-color: rgba({RGB_AZUL_CSS}, 0.45) !important;
+}}
+[data-testid="stDialog"] {{
+  border-radius: 20px !important;
+  border: 2px solid rgba({RGB_AZUL_CSS}, 0.2) !important;
 }}
 [data-testid="stMarkdownContainer"] p,
 [data-testid="stMarkdownContainer"] li {{
@@ -5276,12 +5524,18 @@ def run_training_pipeline(
             "benchmark_appendix": r.benchmark_appendix,
         }
 
-    cvals = (
-        list(custom_previsao.get("values") or [])
-        if isinstance(custom_previsao, dict)
-        else []
+    cvals: list[Any] = []
+    if isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) != "range":
+        cvals = list(custom_previsao.get("values") or [])
+    range_mode = (
+        isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) == "range"
     )
-    extra_custom = 2 if cvals else 0
+    ds_raw = (custom_previsao or {}).get("date_start") if range_mode else None
+    de_raw = (custom_previsao or {}).get("date_end") if range_mode else None
+    range_ok = range_mode and bool(ds_raw) and bool(de_raw)
+    vals_ok = isinstance(custom_previsao, dict) and not range_mode and bool(cvals)
+    have_custom = range_ok or vals_ok
+    extra_custom = 2 if have_custom else 0
     progress = st.progress(0, text="A preparar modelos…")
     total_steps = len(horizontes) * 2 + extra_custom
     step = 0
@@ -5332,21 +5586,37 @@ def run_training_pipeline(
         best_params_preview[h] = {"qtd": rq.best_params, "valor": rv.best_params}
 
     por_custom: dict[str, Any] | None = None
-    if cvals:
-        mode = str((custom_previsao or {}).get("mode") or "offsets")
-        vals = list(cvals)
-        if mode == "offsets":
-            hz_eff = max(vals)
-            Xqc, yqc = build_xy_custom_offsets(df_master, "target_qtd", vals)
-            Xvc, yvc = build_xy_custom_offsets(df_master, "target_valor", vals)
-            lbl = "Soma nas defasagens t+k (dias): " + ", ".join(str(v) for v in vals)
-        else:
-            hz_eff = 18
-            Xqc, yqc = build_xy_custom_dom(df_master, "target_qtd", vals)
-            Xvc, yvc = build_xy_custom_dom(df_master, "target_valor", vals)
-            lbl = "Soma nos dias do mês (estritamente após o dia corrente): " + ", ".join(
-                str(v) for v in vals
+    if have_custom:
+        if range_ok:
+            d_lo = pd.Timestamp(ds_raw).normalize()
+            d_hi = pd.Timestamp(de_raw).normalize()
+            if d_hi < d_lo:
+                d_lo, d_hi = d_hi, d_lo
+            span = int((d_hi - d_lo).days) + 1
+            hz_eff = max(14, min(120, span * 2))
+            lbl = (
+                f"Soma no intervalo [{d_lo.date()} → {d_hi.date()}] "
+                "(dias da série estritamente após t)"
             )
+            Xqc, yqc = build_xy_custom_date_range(df_master, "target_qtd", d_lo, d_hi)
+            Xvc, yvc = build_xy_custom_date_range(df_master, "target_valor", d_lo, d_hi)
+            mode = "range"
+            vals: list[Any] = []
+        else:
+            mode = str((custom_previsao or {}).get("mode") or "offsets")
+            vals = list(cvals)
+            if mode == "offsets":
+                hz_eff = max(vals)
+                Xqc, yqc = build_xy_custom_offsets(df_master, "target_qtd", vals)
+                Xvc, yvc = build_xy_custom_offsets(df_master, "target_valor", vals)
+                lbl = "Soma nas defasagens t+k (dias): " + ", ".join(str(v) for v in vals)
+            else:
+                hz_eff = 18
+                Xqc, yqc = build_xy_custom_dom(df_master, "target_qtd", vals)
+                Xvc, yvc = build_xy_custom_dom(df_master, "target_valor", vals)
+                lbl = "Soma nos dias do mês (estritamente após o dia corrente): " + ", ".join(
+                    str(v) for v in vals
+                )
 
         if len(Xqc) < 22 or len(Xvc) < 22:
             dossie_ml["aviso_previsao_custom"] = (
@@ -5386,7 +5656,14 @@ def run_training_pipeline(
                 train_frac=TRAIN_FRAC_FIXO,
             )
             step += 1
-            if mode == "offsets":
+            if mode == "range":
+                pqc = predict_last_row_custom_date_range(
+                    df_master, rqc.pipeline, d_lo, d_hi
+                )
+                pvc = predict_last_row_custom_date_range(
+                    df_master, rvc.pipeline, d_lo, d_hi
+                )
+            elif mode == "offsets":
                 pqc = predict_last_row_custom_offsets(df_master, rqc.pipeline, vals)
                 pvc = predict_last_row_custom_offsets(df_master, rvc.pipeline, vals)
             else:
@@ -5400,6 +5677,9 @@ def run_training_pipeline(
                 "qtd": pack(rqc, pqc),
                 "valor": pack(rvc, pvc),
             }
+            if mode == "range":
+                por_custom["date_start"] = str(d_lo.date())
+                por_custom["date_end"] = str(d_hi.date())
             best_params_preview["custom"] = {
                 "qtd": rqc.best_params,
                 "valor": rvc.best_params,
@@ -5442,7 +5722,10 @@ def _render_streamlit_tab_analises(
 ) -> None:
     import plotly.graph_objects as go
 
-    st.markdown("#### Indicadores consolidados (histórico diário)")
+    st.markdown(
+        '<p class="pv-section-title">Indicadores consolidados (histórico diário)</p>',
+        unsafe_allow_html=True,
+    )
     k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
         st.metric("Leads", f"{stats_base['leads']:,.0f}")
@@ -5472,6 +5755,7 @@ def _render_streamlit_tab_analises(
         st.warning("Sem série temporal para gráficos.")
         return
 
+    _pc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
     fig_f = go.Figure()
     fig_f.add_trace(
         go.Scatter(
@@ -5481,7 +5765,8 @@ def _render_streamlit_tab_analises(
             stackgroup="one",
             mode="lines",
             line=dict(width=0),
-            fillcolor="rgba(15,23,42,0.35)",
+            fillcolor="rgba(4, 66, 143, 0.42)",
+            hovertemplate="<b>Leads</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
         )
     )
     fig_f.add_trace(
@@ -5492,7 +5777,8 @@ def _render_streamlit_tab_analises(
             stackgroup="one",
             mode="lines",
             line=dict(width=0),
-            fillcolor="rgba(59,130,246,0.4)",
+            fillcolor="rgba(203, 9, 53, 0.32)",
+            hovertemplate="<b>Agend.</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
         )
     )
     fig_f.add_trace(
@@ -5503,7 +5789,8 @@ def _render_streamlit_tab_analises(
             stackgroup="one",
             mode="lines",
             line=dict(width=0),
-            fillcolor="rgba(99,102,241,0.4)",
+            fillcolor="rgba(14, 116, 144, 0.38)",
+            hovertemplate="<b>Visitas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
         )
     )
     fig_f.add_trace(
@@ -5514,7 +5801,8 @@ def _render_streamlit_tab_analises(
             stackgroup="one",
             mode="lines",
             line=dict(width=0),
-            fillcolor="rgba(139,92,246,0.45)",
+            fillcolor="rgba(4, 66, 143, 0.22)",
+            hovertemplate="<b>Pastas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
         )
     )
     fig_f.add_trace(
@@ -5524,7 +5812,8 @@ def _render_streamlit_tab_analises(
             name="Vendas (qtd)",
             yaxis="y2",
             mode="lines",
-            line=dict(color="#059669", width=2.5),
+            line=dict(color=PLOT_AZUL, width=2.8),
+            hovertemplate="%{x}<br>Vendas: %{y:,.0f}<extra></extra>",
         )
     )
     vgv_mi = [float(v) / 1e6 for v in daily["target_valor"]]
@@ -5535,54 +5824,58 @@ def _render_streamlit_tab_analises(
             name="VGV (mi R$)",
             yaxis="y3",
             mode="lines",
-            line=dict(color="#ea580c", width=2, dash="dot"),
+            line=dict(color=PLOT_VERMELHO, width=2.2, dash="dot"),
+            hovertemplate="%{x}<br>VGV: %{y:.3f} mi R$<extra></extra>",
         )
     )
     fig_f.update_layout(
-        title="Funil diário (empilhado) e alvos",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#fafafa",
-        margin=dict(t=48, l=52, r=56, b=72),
-        xaxis=dict(title="Data", gridcolor="#e5e7eb"),
-        yaxis=dict(title="Funil (empilhado)", gridcolor="#e5e7eb"),
-        yaxis2=dict(overlaying="y", side="right", title="Qtd vendas", showgrid=False),
+        **_plotly_layout_direcional(title="Funil diário (empilhado) e alvos", height=500),
+        xaxis_title="Data",
+        yaxis_title="Funil (empilhado)",
+        yaxis2=dict(
+            overlaying="y",
+            side="right",
+            title=dict(text="Qtd vendas", font=dict(size=12, color=PLOT_AZUL)),
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
         yaxis3=dict(
             anchor="free",
             overlaying="y",
             side="right",
-            position=0.98,
-            title="VGV (mi R$)",
+            position=0.97,
+            title=dict(text="VGV (mi R$)", font=dict(size=12, color=PLOT_VERMELHO)),
             showgrid=False,
+            tickfont=dict(size=11),
         ),
-        legend=dict(orientation="h", y=-0.25),
-        height=480,
     )
-    st.plotly_chart(fig_f, use_container_width=True)
+    st.plotly_chart(fig_f, use_container_width=True, config=_pc)
 
     tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
     roll7 = tq.rolling(7, min_periods=1).mean()
     fig_roll = go.Figure()
     fig_roll.add_trace(
-        go.Scatter(x=dates, y=tq.tolist(), name="Vendas/dia", line=dict(color="#94a3b8", width=1))
+        go.Scatter(
+            x=dates,
+            y=tq.tolist(),
+            name="Vendas/dia",
+            line=dict(color=PLOT_MUTED, width=1.2),
+        )
     )
     fig_roll.add_trace(
         go.Scatter(
             x=dates,
             y=roll7.tolist(),
             name="Média móvel 7d",
-            line=dict(color="#059669", width=2.5),
+            line=dict(color=PLOT_AZUL, width=2.8),
         )
     )
     fig_roll.update_layout(
-        title="Vendas diárias e suavização (7 dias)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#fafafa",
-        height=360,
-        xaxis=dict(title="Data"),
-        yaxis=dict(title="Quantidade"),
-        legend=dict(orientation="h", y=-0.2),
+        **_plotly_layout_direcional(
+            title="Vendas diárias e suavização (7 dias)", height=380, xaxis_title="Data", yaxis_title="Quantidade"
+        ),
     )
-    st.plotly_chart(fig_roll, use_container_width=True)
+    st.plotly_chart(fig_roll, use_container_width=True, config=_pc)
 
     fig_sc = go.Figure()
     fig_sc.add_trace(
@@ -5590,45 +5883,54 @@ def _render_streamlit_tab_analises(
             x=daily["vol_leads"],
             y=daily["target_qtd"],
             mode="markers",
-            marker=dict(size=6, opacity=0.45, color="#334155"),
+            marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
             name="Leads × vendas (mesmo dia)",
         )
     )
     fig_sc.update_layout(
-        title="Dispersão: leads vs vendas (mesmo dia)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#fafafa",
-        height=380,
-        xaxis=dict(title="Leads"),
-        yaxis=dict(title="Vendas (qtd)"),
+        **_plotly_layout_direcional(
+            title="Dispersão: leads vs vendas (mesmo dia)",
+            height=400,
+            xaxis_title="Leads",
+            yaxis_title="Vendas (qtd)",
+        ),
     )
-    st.plotly_chart(fig_sc, use_container_width=True)
+    st.plotly_chart(fig_sc, use_container_width=True, config=_pc)
 
     dl = daily.get("dow_labels") or []
     fig_d = go.Figure()
     fig_d.add_trace(
-        go.Bar(x=dl, y=daily.get("dow_mean_qtd") or [], name="Qtd média", marker_color="#334155")
+        go.Bar(
+            x=dl,
+            y=daily.get("dow_mean_qtd") or [],
+            name="Qtd média",
+            marker_color=PLOT_AZUL,
+            marker_line=dict(width=0),
+        )
     )
     fig_d.add_trace(
         go.Bar(
             x=dl,
             y=[float(v) / 1e6 for v in (daily.get("dow_mean_valor") or [])],
             name="VGV médio (mi R$)",
-            marker_color="#0d9488",
+            marker_color=PLOT_VERMELHO,
+            marker_line=dict(width=0),
             yaxis="y2",
         )
     )
     fig_d.update_layout(
-        title="Perfil por dia da semana (média histórica)",
+        **_plotly_layout_direcional(title="Perfil por dia da semana (média histórica)", height=420),
         barmode="group",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#fafafa",
-        height=400,
-        yaxis=dict(title="Qtd média"),
-        yaxis2=dict(overlaying="y", side="right", title="VGV médio (mi R$)", showgrid=False),
-        legend=dict(orientation="h", y=-0.2),
+        yaxis_title="Qtd média",
+        yaxis2=dict(
+            overlaying="y",
+            side="right",
+            title="VGV médio (mi R$)",
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
     )
-    st.plotly_chart(fig_d, use_container_width=True)
+    st.plotly_chart(fig_d, use_container_width=True, config=_pc)
 
     cl = daily.get("corr_labels") or []
     cz = daily.get("corr_z") or []
@@ -5638,18 +5940,25 @@ def _render_streamlit_tab_analises(
                 z=cz,
                 x=cl,
                 y=cl,
-                colorscale="RdBu",
+                colorscale=[
+                    [0.0, PLOT_VERMELHO],
+                    [0.5, "#f1f5f9"],
+                    [1.0, PLOT_AZUL],
+                ],
                 zmid=0,
                 zmin=-1,
                 zmax=1,
+                hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
             )
         )
         fig_h.update_layout(
-            title="Correlação (Pearson) — variáveis-chave",
-            height=max(320, 28 * len(cl)),
-            margin=dict(l=120, r=40, t=48, b=120),
+            **_plotly_layout_direcional(
+                title="Correlação (Pearson) — variáveis-chave",
+                height=max(340, 30 * len(cl)),
+                margin=dict(l=130, r=48, t=56, b=130),
+            ),
         )
-        st.plotly_chart(fig_h, use_container_width=True)
+        st.plotly_chart(fig_h, use_container_width=True, config=_pc)
     else:
         st.info("Correlação entre variáveis numéricas indisponível (poucas colunas ou dados).")
 
@@ -5662,19 +5971,30 @@ def _render_streamlit_tab_analises(
                 z = ((s - s.mean()) / s.std()).tolist()
             else:
                 z = [0.0] * len(s)
-            fig_m.add_trace(go.Scatter(x=dates, y=z, name=str(name), mode="lines", line=dict(width=1.8)))
+            fig_m.add_trace(
+                go.Scatter(
+                    x=dates,
+                    y=z,
+                    name=str(name),
+                    mode="lines",
+                    line=dict(width=2),
+                )
+            )
         fig_m.update_layout(
-            title="Indicadores macro (z-score por série)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="#fafafa",
-            height=380,
-            xaxis=dict(title="Data"),
-            yaxis=dict(title="Desvios σ"),
-            legend=dict(orientation="h", y=-0.35),
+            **_plotly_layout_direcional(
+                title="Indicadores macro (z-score por série)",
+                height=400,
+                xaxis_title="Data",
+                yaxis_title="Desvios σ",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.42, x=0.5, xanchor="center"),
+            ),
         )
-        st.plotly_chart(fig_m, use_container_width=True)
+        st.plotly_chart(fig_m, use_container_width=True, config=_pc)
 
-    st.markdown("#### Importância de features (modelo operacional por horizonte)")
+    st.markdown(
+        '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
+        unsafe_allow_html=True,
+    )
     for h in (3, 7, 30):
         sub = por_h.get(h) or {}
         c1, c2 = st.columns(2)
@@ -5689,17 +6009,19 @@ def _render_streamlit_tab_analises(
                         x=vals[:top_n][::-1],
                         y=names[:top_n][::-1],
                         orientation="h",
-                        marker_color="#1e3a5f",
+                        marker_color=PLOT_AZUL,
+                        marker_line=dict(width=0),
                     )
                 )
                 fig_i.update_layout(
-                    height=28 * top_n + 80,
-                    margin=dict(l=200, r=24, t=32, b=40),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="#fafafa",
-                    xaxis=dict(title="Importância"),
+                    **_plotly_layout_direcional(
+                        height=28 * top_n + 88,
+                        margin=dict(l=220, r=40, t=40, b=48),
+                        xaxis_title="Importância",
+                        showlegend=False,
+                    ),
                 )
-                st.plotly_chart(fig_i, use_container_width=True)
+                st.plotly_chart(fig_i, use_container_width=True, config=_pc)
             else:
                 st.caption("—")
         with c2:
@@ -5713,24 +6035,26 @@ def _render_streamlit_tab_analises(
                         x=vals[:top_n][::-1],
                         y=names[:top_n][::-1],
                         orientation="h",
-                        marker_color="#0f766e",
+                        marker_color=PLOT_VERMELHO,
+                        marker_line=dict(width=0),
                     )
                 )
                 fig_iv.update_layout(
-                    height=28 * top_n + 80,
-                    margin=dict(l=200, r=24, t=32, b=40),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="#fafafa",
-                    xaxis=dict(title="Importância"),
+                    **_plotly_layout_direcional(
+                        height=28 * top_n + 88,
+                        margin=dict(l=220, r=40, t=40, b=48),
+                        xaxis_title="Importância",
+                        showlegend=False,
+                    ),
                 )
-                st.plotly_chart(fig_iv, use_container_width=True)
+                st.plotly_chart(fig_iv, use_container_width=True, config=_pc)
             else:
                 st.caption("—")
 
 
 def _render_streamlit_tab_apendice(
     por_h: dict[int, dict[str, Any]],
-    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]],
     full_period_train: bool,
     blend_top_k: int,
     random_seed: int,
@@ -5744,10 +6068,18 @@ def _render_streamlit_tab_apendice(
         "As métricas principais (MAE, RMSE, R², etc.) referem-se ao **bloco de teste (30%)**."
     )
     st.markdown(
-        f"""
-### Metodologia (resumo executivo)
+        '<p class="pv-section-title">Apêndice técnico</p>',
+        unsafe_allow_html=True,
+    )
+    tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
+        ["Metodologia", "H = 3 dias", "H = 7 dias", "H = 30 dias", "Personalizado"]
+    )
+    with tab_met:
+        st.markdown(
+            f"""
+#### Resumo executivo
 
-- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem).
+- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem). Pode ainda definir-se um **intervalo de calendário** ou **dias combinados** na aba Previsão.
 - **Dados:** **{daily.get("n_rows", 0):,}** observações diárias na matriz consolidada; **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Otimização:** LightGBM via **Optuna** (TPE + **MedianPruner**) com **TimeSeriesSplit**; espaço de busca **encolhe** com poucos dados; o objetivo penaliza **instabilidade entre folds** (MAE + variância + dispersão), favorecendo soluções que generalizam no tempo. Semente **{random_seed}**.
@@ -5757,28 +6089,47 @@ def _render_streamlit_tab_apendice(
 
 O relatório HTML descarregável na aba **Previsão** contém curvas de teste, ROC auxiliar, tabelas completas de benchmark e o mesmo texto técnico com formatação rica.
 """
-    )
+        )
 
-    st.markdown("### Modelo operacional e hiperparâmetros (LightGBM) por horizonte")
-    for h in (3, 7, 30):
+    def _ap_horizon_block(h: int) -> None:
         sub = por_h.get(h) or {}
         qd = sub.get("qtd", {})
         vl = sub.get("valor", {})
-        with st.expander(f"Horizonte **{h} dias** — {qd.get('model_label', '—')} · {vl.get('model_label', '—')}", expanded=(h == 3)):
-            st.markdown("**Volume (quantidade)** — etiqueta do pipeline vencedor:")
-            st.code(str(qd.get("model_label", "—")), language=None)
-            st.markdown("**VGV** — etiqueta do pipeline vencedor:")
-            st.code(str(vl.get("model_label", "—")), language=None)
-            bp = best_params_preview.get(h, {})
-            st.markdown("**Hiperparâmetros LightGBM (volume)**")
-            st.json(bp.get("qtd") or {})
-            st.markdown("**Hiperparâmetros LightGBM (VGV)**")
-            st.json(bp.get("valor") or {})
+        st.markdown(
+            f'<p class="pv-section-title">Horizonte {h} dias</p>'
+            f"<p style='text-align:center;color:#64748b;font-size:0.9rem;margin-top:-0.25rem'>"
+            f"{qd.get('model_label', '—')} · {vl.get('model_label', '—')}</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("**Volume (quantidade)** — pipeline vencedor")
+        st.code(str(qd.get("model_label", "—")), language=None)
+        st.markdown("**VGV** — pipeline vencedor")
+        st.code(str(vl.get("model_label", "—")), language=None)
+        bp = best_params_preview.get(h, {}) if isinstance(best_params_preview, dict) else {}
+        st.markdown("**Hiperparâmetros LightGBM (volume)**")
+        st.json(bp.get("qtd") or {})
+        st.markdown("**Hiperparâmetros LightGBM (VGV)**")
+        st.json(bp.get("valor") or {})
 
-    bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
-    if bpc:
-        with st.expander("Cenário **personalizado** — hiperparâmetros LightGBM (referência Optuna)", expanded=False):
+    with tab3:
+        _ap_horizon_block(3)
+    with tab7:
+        _ap_horizon_block(7)
+    with tab30:
+        _ap_horizon_block(30)
+
+    with tab_cust:
+        bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
+        if bpc:
+            st.markdown(
+                '<p class="pv-section-title">Cenário personalizado (referência Optuna)</p>',
+                unsafe_allow_html=True,
+            )
             st.json({"volume (qtd)": bpc.get("qtd") or {}, "vgv": bpc.get("valor") or {}})
+        else:
+            st.info(
+                "Não há cenário personalizado nesta execução. Use **Intervalo de previsão** na aba Previsão para treinar com intervalo de calendário ou dias combinados."
+            )
 
 
 def _render_streamlit_dossie_ml(
@@ -5789,11 +6140,18 @@ def _render_streamlit_dossie_ml(
 ) -> None:
     import plotly.graph_objects as go
 
-    st.markdown("### Dossiê analítico e de modelagem")
+    _dpc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
+
     st.markdown(
-        "Documento técnico com **estatísticas descritivas**, **deteção de outliers** (regra IQR), "
-        "**correlações**, indicadores de **multicolinearidade (VIF)**, **balanceamento** do volume diário, "
-        "distribuições e notas sobre **tratamento de dados** e **mitigação de overfitting**."
+        '<p class="pv-section-title">Dossiê analítico e de modelagem</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='text-align:center;max-width:720px;margin:0 auto 1rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
+        "Documento técnico com <strong>estatísticas descritivas</strong>, <strong>outliers</strong> (IQR), "
+        "<strong>correlações</strong>, <strong>VIF</strong>, <strong>balanceamento</strong>, distribuições e notas sobre "
+        "<strong>tratamento de dados</strong> e <strong>mitigação de overfitting</strong>.</div>",
+        unsafe_allow_html=True,
     )
 
     if dossie.get("erro"):
@@ -5803,7 +6161,17 @@ def _render_streamlit_dossie_ml(
     if dossie.get("aviso_previsao_custom"):
         st.warning(str(dossie["aviso_previsao_custom"]))
 
-    with st.expander("1 · Tratamento de dados e preparação para modelos", expanded=True):
+    td1, td2, td3, td4, td5 = st.tabs(
+        [
+            "Dados e tratamento",
+            "Descritivas e outliers",
+            "Correlação e VIF",
+            "Distribuições e perfil",
+            "Modelos e personalizado",
+        ]
+    )
+
+    with td1:
         st.markdown(
             """
 **Limpeza e integridade**
@@ -5819,68 +6187,100 @@ def _render_streamlit_dossie_ml(
 - Modelos lineares e **SVR** com regularização moderada; **k-NN** com *k* alto e pesos por distância.
 """
         )
-        st.metric("Observações na matriz diária", f"{dossie.get('n_linhas', 0):,}")
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Observações na matriz diária", f"{dossie.get('n_linhas', 0):,}")
+        with m2:
+            st.metric("Colunas após engenharia", f"{dossie.get('n_colunas', 0):,}")
         st.caption(
-            f"Período: **{dossie.get('primeira_data', '—')}** → **{dossie.get('ultima_data', '—')}** · "
-            f"**{dossie.get('n_colunas', 0)}** colunas após engenharia."
+            f"Período: **{dossie.get('primeira_data', '—')}** → **{dossie.get('ultima_data', '—')}**"
         )
 
     desc = dossie.get("descritivas") or []
-    if desc:
-        with st.expander("2 · Estatísticas descritivas (média, mediana, moda, dispersão, quartis e percentis)", expanded=False):
+    oi = dossie.get("outliers_iqr") or []
+    with td2:
+        if desc:
+            st.markdown("##### Estatísticas descritivas")
             st.caption(
                 "**Curtose** em pandas = *excesso* de curtose (0 ≈ normal). **Moda**: primeiro valor modal da série."
             )
             st.dataframe(pd.DataFrame(desc), use_container_width=True, hide_index=True)
-
-    oi = dossie.get("outliers_iqr") or []
-    if oi:
-        with st.expander("3 · Outliers (regra IQR — 1,5×IQR)", expanded=False):
+        else:
+            st.caption("Sem tabela descritiva disponível.")
+        st.divider()
+        if oi:
+            st.markdown("##### Outliers (regra IQR — 1,5×IQR)")
             st.dataframe(pd.DataFrame(oi), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Sem resumo de outliers.")
 
     cl = dossie.get("correlation_labels") or []
     cz = dossie.get("correlation_matrix") or []
-    if len(cl) >= 2 and cz:
-        with st.expander("4 · Matriz de correlação (Pearson)", expanded=False):
+    pares = dossie.get("pares_multicolinearidade") or []
+    vifs = dossie.get("vif") or []
+    with td3:
+        if len(cl) >= 2 and cz:
+            st.markdown("##### Matriz de correlação (Pearson)")
             fig_h = go.Figure(
                 data=go.Heatmap(
                     z=cz,
                     x=cl,
                     y=cl,
-                    colorscale="RdBu",
+                    colorscale=[
+                        [0.0, PLOT_VERMELHO],
+                        [0.5, "#f1f5f9"],
+                        [1.0, PLOT_AZUL],
+                    ],
                     zmid=0,
                     zmin=-1,
                     zmax=1,
+                    hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
                 )
             )
             fig_h.update_layout(
-                title="Correlação entre variáveis numéricas-chave e *features* amostradas",
-                height=max(380, 26 * len(cl)),
-                margin=dict(l=120, r=40, t=48, b=120),
+                **_plotly_layout_direcional(
+                    title="Correlação entre variáveis-chave",
+                    height=max(360, 28 * len(cl)),
+                    margin=dict(l=130, r=48, t=56, b=130),
+                ),
             )
-            st.plotly_chart(fig_h, use_container_width=True)
-
-    pares = dossie.get("pares_multicolinearidade") or []
-    if pares:
-        with st.expander("5 · Pares com |r| ≥ 0,85 (alerta de multicolinearidade)", expanded=False):
+            st.plotly_chart(fig_h, use_container_width=True, config=_dpc)
+        else:
+            st.info("Matriz de correlação indisponível (poucas variáveis ou dados).")
+        st.divider()
+        if pares:
+            st.markdown("##### Pares com |r| ≥ 0,85")
             st.dataframe(pd.DataFrame(pares), use_container_width=True, hide_index=True)
-
-    vifs = dossie.get("vif") or []
-    if vifs:
-        with st.expander("6 · VIF (Variance Inflation Factor) — subconjunto de *features*", expanded=False):
-            st.caption("VIF elevado (> 5–10) sugere redundância; os *tree-based* toleram melhor do que SVM/k-NN lineares em escala.")
+        if vifs:
+            st.markdown("##### VIF (subconjunto de *features*)")
+            st.caption(
+                "VIF elevado (> 5–10) sugere redundância; *tree-based* toleram melhor do que SVM/k-NN em escala."
+            )
             st.dataframe(pd.DataFrame(vifs), use_container_width=True, hide_index=True)
+        if not pares and not vifs:
+            st.caption("Sem tabelas de multicolinearidade.")
 
     bal = dossie.get("balanceamento_qtd") or {}
-    if bal:
-        with st.expander("7 · Balanceamento do volume diário (vs mediana)", expanded=False):
+    hq = dossie.get("hist_target_qtd") or {}
+    hv = dossie.get("hist_target_valor") or {}
+    dates = daily_pack.get("dates") or []
+    vl = daily_pack.get("vol_leads") or []
+    tq = daily_pack.get("target_qtd") or []
+    dow_lbl = daily_pack.get("dow_labels") or []
+    dow_q = daily_pack.get("dow_mean_qtd") or []
+    with td4:
+        if bal:
+            st.markdown("##### Balanceamento do volume diário (vs mediana)")
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.metric("Dias acima da mediana", f"{bal.get('dias_acima_mediana', 0):,}")
             with c2:
                 st.metric("Dias ≤ mediana", f"{bal.get('dias_abaixo_igual_mediana', 0):,}")
             with c3:
-                st.metric("Proporção classe minoritária", f"{bal.get('proporcao_classe_minoritaria', 0)*100:.1f}%")
+                st.metric(
+                    "Proporção classe minoritária",
+                    f"{bal.get('proporcao_classe_minoritaria', 0)*100:.1f}%",
+                )
             fig_p = go.Figure(
                 data=[
                     go.Pie(
@@ -5889,78 +6289,103 @@ def _render_streamlit_dossie_ml(
                             bal.get("dias_acima_mediana", 0),
                             bal.get("dias_abaixo_igual_mediana", 0),
                         ],
-                        hole=0.35,
-                        marker=dict(colors=["#1e3a5f", "#94a3b8"]),
+                        hole=0.38,
+                        marker=dict(colors=[PLOT_AZUL, PLOT_MUTED], line=dict(color="#fff", width=2)),
+                        textinfo="percent+label",
                     )
                 ]
             )
-            fig_p.update_layout(title="Partilha de dias por regime de volume", height=400)
-            st.plotly_chart(fig_p, use_container_width=True)
-
-    hq = dossie.get("hist_target_qtd") or {}
-    if hq.get("counts") and hq.get("edges"):
-        with st.expander("8 · Distribuição — histograma de vendas diárias (quantidade)", expanded=False):
+            fig_p.update_layout(
+                **_plotly_layout_direcional(
+                    title="Partilha de dias por regime de volume", height=420, showlegend=False
+                ),
+            )
+            st.plotly_chart(fig_p, use_container_width=True, config=_dpc)
+        if hq.get("counts") and hq.get("edges"):
+            st.markdown("##### Histograma — vendas diárias (qtd)")
             edges = hq["edges"]
             cnt = hq["counts"]
             xs = [(edges[i] + edges[i + 1]) / 2 for i in range(len(cnt))]
-            fig = go.Figure(go.Bar(x=xs, y=cnt, marker_color="#1e3a5f"))
-            fig.update_layout(
-                title="Histograma — target_qtd",
-                xaxis_title="Volume (qtd)",
-                yaxis_title="Frequência",
-                height=400,
+            fig = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
             )
-            st.plotly_chart(fig, use_container_width=True)
-
-    hv = dossie.get("hist_target_valor") or {}
-    if hv.get("counts") and hv.get("edges"):
-        with st.expander("9 · Distribuição — histograma de VGV diário", expanded=False):
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="Volume (qtd)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(fig, use_container_width=True, config=_dpc)
+        if hv.get("counts") and hv.get("edges"):
+            st.markdown("##### Histograma — VGV diário")
             edges = hv["edges"]
             cnt = hv["counts"]
             xs = [((edges[i] + edges[i + 1]) / 2) / 1e6 for i in range(len(cnt))]
-            fig = go.Figure(go.Bar(x=xs, y=cnt, marker_color="#0f766e"))
-            fig.update_layout(
-                title="Histograma — target_valor",
-                xaxis_title="VGV (mi R$)",
-                yaxis_title="Frequência",
-                height=400,
+            figv = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_VERMELHO,
+                    marker_line=dict(width=0),
+                )
             )
-            st.plotly_chart(fig, use_container_width=True)
-
-    dates = daily_pack.get("dates") or []
-    vl = daily_pack.get("vol_leads") or []
-    tq = daily_pack.get("target_qtd") or []
-    if len(dates) == len(vl) == len(tq) and len(dates) > 5:
-        with st.expander("10 · Dispersão (série diária): leads × vendas", expanded=False):
+            figv.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="VGV (mi R$)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(figv, use_container_width=True, config=_dpc)
+        if len(dates) == len(vl) == len(tq) and len(dates) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
             fig_s = go.Figure(
                 go.Scatter(
                     x=vl,
                     y=tq,
                     mode="markers",
-                    marker=dict(size=7, opacity=0.35, color="#334155"),
+                    marker=dict(
+                        size=7,
+                        opacity=0.45,
+                        color=PLOT_AZUL,
+                        line=dict(width=0.5, color="#ffffff"),
+                    ),
                 )
             )
             fig_s.update_layout(
-                title="Scatter — leads vs vendas (mesmo dia)",
-                xaxis_title="Leads",
-                yaxis_title="Vendas (qtd)",
-                height=420,
+                **_plotly_layout_direcional(
+                    height=420,
+                    xaxis_title="Leads",
+                    yaxis_title="Vendas (qtd)",
+                ),
             )
-            st.plotly_chart(fig_s, use_container_width=True)
-
-    dow_lbl = daily_pack.get("dow_labels") or []
-    dow_q = daily_pack.get("dow_mean_qtd") or []
-    if dow_lbl and dow_q:
-        with st.expander("11 · Média de volume por dia da semana (barras)", expanded=False):
-            fig_b = go.Figure(go.Bar(x=dow_lbl, y=dow_q, marker_color="#334155"))
+            st.plotly_chart(fig_s, use_container_width=True, config=_dpc)
+        if dow_lbl and dow_q:
+            st.markdown("##### Média de volume por dia da semana")
+            fig_b = go.Figure(
+                go.Bar(
+                    x=dow_lbl,
+                    y=dow_q,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
+            )
             fig_b.update_layout(
-                title="Quantidade média por dia da semana",
-                yaxis_title="Qtd média",
-                height=400,
+                **_plotly_layout_direcional(
+                    height=400,
+                    yaxis_title="Qtd média",
+                ),
             )
-            st.plotly_chart(fig_b, use_container_width=True)
+            st.plotly_chart(fig_b, use_container_width=True, config=_dpc)
 
-    with st.expander("12 · Métricas dos modelos (holdout) e acurácia direcional", expanded=False):
+    with td5:
+        st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
         st.markdown(
             "**Acurácia dir. (mediana)** = fração de dias de teste em que o modelo acerta se o alvo está "
             "acima ou abaixo da mediana do **conjunto de treino** (métrica auxiliar; o negócio continua a ser regressão — MAE/RMSE/R²)."
@@ -6011,10 +6436,12 @@ def _render_streamlit_dossie_ml(
                 "Revise *features*, horizonte ou volume de dados; evite aumentar complexidade sem validação temporal."
             )
         elif rows_m:
-            st.success("Acurácia direcional ≥ 80% em todos os horizontes reportados acima (onde a métrica foi calculada).")
-
-    if por_custom:
-        with st.expander("13 · Cenário de previsão personalizado", expanded=True):
+            st.success(
+                "Acurácia direcional ≥ 80% em todos os horizontes reportados acima (onde a métrica foi calculada)."
+            )
+        st.divider()
+        if por_custom:
+            st.markdown("##### Cenário de previsão personalizado")
             st.markdown(f"**Definição:** {por_custom.get('label', '—')}")
             qc = por_custom.get("qtd") or {}
             vc = por_custom.get("valor") or {}
@@ -6027,9 +6454,71 @@ def _render_streamlit_dossie_ml(
                 f"Acurácia dir.: {float((vc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%"
             )
             st.caption(
-                "As *features* `fwd_*` incluem contagem de fins de semana e **feriados BR** exatamente nos dias que entram na soma, "
+                "As *features* `fwd_*` incluem fins de semana e **feriados BR** nos dias que entram na soma, "
                 "para o modelo condicionar em calendário conhecido."
             )
+        else:
+            st.caption("Sem cenário personalizado nesta execução.")
+
+
+@st.dialog("Intervalo e cenário de previsão", width="large")
+def _dialog_previsao_personalizada() -> None:
+    from datetime import date, timedelta
+
+    st.markdown(
+        "Defina um **intervalo no calendário** (soma das vendas nos dias da série dentro desse período, "
+        "estritamente após cada data de referência) ou use o modo **avançado** (dias t+k ou dias do mês)."
+    )
+    t_cal, t_adv = st.tabs(["Calendário", "Avançado"])
+    with t_cal:
+        today = date.today()
+        d1 = st.date_input("Data inicial do intervalo", value=today, key="pvdlg_d1")
+        d2 = st.date_input(
+            "Data final do intervalo",
+            value=today + timedelta(days=7),
+            key="pvdlg_d2",
+        )
+        if st.button("Aplicar intervalo", type="primary", key="pvdlg_apply_range"):
+            a, b = (d1, d2) if d1 <= d2 else (d2, d1)
+            st.session_state["pv_custom_cfg"] = {
+                "mode": "range",
+                "date_start": a.isoformat(),
+                "date_end": b.isoformat(),
+            }
+            st.rerun()
+    with t_adv:
+        mode_custom = st.radio(
+            "Tipo de soma",
+            [
+                "Deslocamento: soma em t + k dias",
+                "Dias do mês: mesmo mês, após o dia corrente",
+            ],
+            key="pvdlg_mode_adv",
+        )
+        txt = st.text_input(
+            "Valores separados por vírgula ou espaço",
+            placeholder="Ex.: 7, 14, 15",
+            key="pvdlg_vals_adv",
+        )
+        st.caption(
+            "Ex.: último dia = dia 3 e quer os dias 7, 14 e 15 **do mesmo mês** → segundo modo. "
+            "Para **t+7, t+14** → primeiro modo."
+        )
+        if st.button("Aplicar avançado", type="primary", key="pvdlg_apply_adv"):
+            vals_c: list[int] = []
+            if txt and txt.strip():
+                if mode_custom.startswith("Deslocamento"):
+                    vals_c = _parse_previsao_int_list(txt, max_val=400)
+                else:
+                    vals_c = [v for v in _parse_previsao_int_list(txt, max_val=31) if v <= 31]
+            if vals_c:
+                st.session_state["pv_custom_cfg"] = {
+                    "mode": "offsets" if mode_custom.startswith("Deslocamento") else "dom",
+                    "values": vals_c,
+                }
+                st.rerun()
+            else:
+                st.warning("Indique pelo menos um número válido.")
 
 
 def main() -> None:
@@ -6037,7 +6526,7 @@ def main() -> None:
     st.set_page_config(
         page_title="Previsão de vendas | Direcional",
         page_icon=str(fav) if fav else "📊",
-        layout="wide",
+        layout="centered",
         initial_sidebar_state="collapsed",
     )
     inject_css()
@@ -6066,41 +6555,62 @@ def main() -> None:
 
     if "resultado" not in st.session_state:
         st.session_state.resultado = None
+    if "pv_custom_cfg" not in st.session_state:
+        st.session_state.pv_custom_cfg = None
 
     tab_analises, tab_previsao, tab_dossie, tab_apendice = st.tabs(
         ["Análises", "Previsão", "Dossiê ML", "Apêndice"]
     )
 
     with tab_previsao:
-        with st.expander("Previsão em dias combinados (opcional)", expanded=False):
-            st.markdown(
-                "Além dos horizontes **3, 7 e 30 dias**, pode treinar um alvo extra que **soma** vendas em dias à sua escolha. "
-                "Os **feriados** e fins de semana desses dias entram como *features* (`fwd_*`), pois são conhecidos no calendário."
-            )
-            use_custom = st.checkbox("Ativar cenário personalizado", value=False, key="pv_use_custom")
-            mode_custom = st.radio(
-                "Modo",
-                [
-                    "Deslocamento fixo: soma em t+ k dias (ex.: 7, 14, 15)",
-                    "Dias do mês: soma nos dias D do mesmo mês após a data de referência (ex.: 7, 14, 15)",
-                ],
-                key="pv_custom_mode",
-            )
-            txt_custom = st.text_input(
-                "Valores separados por vírgula ou espaço",
-                placeholder="Ex.: 4, 11, 12  ou  7, 14, 15",
-                key="pv_custom_vals",
-            )
+        st.markdown(
+            '<p class="pv-section-title">Previsão e relatório</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='text-align:center;color:#64748b;font-size:0.92rem;max-width:640px;margin:0 auto 1rem auto'>"
+            "Sempre são treinados os horizontes <strong>3, 7 e 30 dias</strong>. Opcionalmente, abra o diálogo para um "
+            "<strong>intervalo de calendário</strong> ou <strong>dias combinados</strong> (t+k ou dias do mês).</div>",
+            unsafe_allow_html=True,
+        )
+        r1, r2, r3 = st.columns([1, 1, 1])
+        with r1:
+            if st.button(
+                "Intervalo de previsão",
+                use_container_width=True,
+                key="pv_open_dlg",
+            ):
+                _dialog_previsao_personalizada()
+        with r2:
+            if st.button(
+                "Limpar cenário opcional",
+                use_container_width=True,
+                key="pv_clear_cfg",
+            ):
+                st.session_state["pv_custom_cfg"] = None
+                st.rerun()
+
+        cfg = st.session_state.get("pv_custom_cfg")
+        if isinstance(cfg, dict) and cfg.get("mode"):
+            if str(cfg.get("mode")) == "range" and cfg.get("date_start") and cfg.get("date_end"):
+                st.success(
+                    f"Cenário ativo: **intervalo** {cfg.get('date_start')} → {cfg.get('date_end')}"
+                )
+            elif cfg.get("values"):
+                st.info(
+                    f"Cenário ativo: **{cfg.get('mode')}** — {', '.join(str(x) for x in cfg['values'])}"
+                )
+        else:
             st.caption(
-                "Exemplo: último dia da série = **dia 3** e pretende os dias **7, 14 e 15** do mesmo mês → use o segundo modo com `7, 14, 15`. "
-                "Para somar exatamente **t+7, t+14 e t+15**, use o primeiro modo com `7, 14, 15`."
+                "Sem cenário opcional: apenas horizontes fixos 3 / 7 / 30 dias. Use **Intervalo de previsão** para acrescentar."
             )
 
         _, col_btn, _ = st.columns([1, 2, 1])
         with col_btn:
             run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
 
-        with st.expander("Suporte e manutenção"):
+        with st.container(border=True):
+            st.markdown("##### Suporte e manutenção")
             st.markdown(
                 "• **Secrets (Google):** prioridade **`[google_sheets]`** como na Ficha Vendas RJ — `SERVICE_ACCOUNT_JSON` "
                 "(dict TOML ou string JSON; aliases `GOOGLE_SERVICE_ACCOUNT_JSON` / `service_account_json`). "
@@ -6109,7 +6619,8 @@ def main() -> None:
                 "IDs de planilhas: `[spreadsheet_ids]` na raiz **ou** chaves `vendas`/`leads`/… **dentro** de `[google_sheets]`, "
                 "ou `[google_sheets.spreadsheet_ids]`. Opcional: `csv_gid_hints`.\n\n"
                 "• **Logo:** coloque `502.57_LOGO DIRECIONAL_V2F-01.png` na raiz do repositório ou defina `branding.LOGO_URL`.\n\n"
-                "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz."
+                "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz.\n\n"
+                "• **Barra de progresso ML:** tqdm ativo por omissão; defina **`PREVISAO_HIDE_TQDM=1`** no ambiente para desativar."
             )
             if st.button("Limpar cache das planilhas", key="pv_clear_cache"):
                 _load_one_role_cached.clear()
@@ -6122,15 +6633,19 @@ def main() -> None:
             st.session_state["used_service_account"] = used_sa
             try:
                 custom_previsao = None
-                if use_custom and (txt_custom or "").strip():
-                    if mode_custom.startswith("Deslocamento"):
-                        vals_c = _parse_previsao_int_list(txt_custom, max_val=400)
-                        if vals_c:
-                            custom_previsao = {"mode": "offsets", "values": vals_c}
-                    else:
-                        vals_c = [v for v in _parse_previsao_int_list(txt_custom, max_val=31) if v <= 31]
-                        if vals_c:
-                            custom_previsao = {"mode": "dom", "values": vals_c}
+                cfg_run = st.session_state.get("pv_custom_cfg")
+                if isinstance(cfg_run, dict):
+                    m = str(cfg_run.get("mode") or "")
+                    if m == "range":
+                        ds0, de0 = cfg_run.get("date_start"), cfg_run.get("date_end")
+                        if ds0 and de0:
+                            custom_previsao = {
+                                "mode": "range",
+                                "date_start": str(ds0),
+                                "date_end": str(de0),
+                            }
+                    elif m in ("offsets", "dom") and cfg_run.get("values"):
+                        custom_previsao = {"mode": m, "values": list(cfg_run["values"])}
                 with st.spinner(
                     "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
                 ):
@@ -6180,21 +6695,24 @@ def main() -> None:
             sheet_metas = res.get("sheet_metas") or st.session_state.get("sheet_metas")
 
             if sheet_metas:
-                with st.expander("Folhas selecionadas automaticamente (auditoria)", expanded=False):
-                    rows_m = []
-                    for k, m in sheet_metas.items():
-                        rows_m.append(
-                            {
-                                "Base": k,
-                                "Método": m.get("method", "—"),
-                                "Livro": m.get("spreadsheet_title") or "—",
-                                "Aba": m.get("worksheet_title") or "—",
-                                "gid": m.get("gid", "—"),
-                                "Cabeçalho (linha)": m.get("header_row_index", "—"),
-                                "Pontuação": m.get("score", "—"),
-                            }
-                        )
-                    st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+                st.markdown(
+                    '<p class="pv-section-title">Folhas selecionadas (auditoria)</p>',
+                    unsafe_allow_html=True,
+                )
+                rows_m = []
+                for k, m in sheet_metas.items():
+                    rows_m.append(
+                        {
+                            "Base": k,
+                            "Método": m.get("method", "—"),
+                            "Livro": m.get("spreadsheet_title") or "—",
+                            "Aba": m.get("worksheet_title") or "—",
+                            "gid": m.get("gid", "—"),
+                            "Cabeçalho (linha)": m.get("header_row_index", "—"),
+                            "Pontuação": m.get("score", "—"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
 
             c1, c2 = st.columns(2)
             c3, c4 = st.columns(2)
@@ -6219,7 +6737,10 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
-            st.subheader("Previsões (último dia da série)")
+            st.markdown(
+                '<p class="pv-section-title">Previsões (último dia da série)</p>',
+                unsafe_allow_html=True,
+            )
             rows = []
             lbl = "In-sample" if full_train else "Holdout 30%"
             for h in (3, 7, 30):
