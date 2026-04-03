@@ -1688,12 +1688,13 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
-    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
+    """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
-    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
+    # Menos trials que a escala antiga (~−35 %), mantendo teto alto para séries grandes.
+    base = int(max(40, min(96, int(18 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(178, base + 28)
+        base = min(110, base + 18)
     return base
 
 
@@ -1703,7 +1704,7 @@ def train_one_target(
     horizon: int,
     target_name: str,
     n_trials: int = 0,
-    n_splits_tss: int = 7,
+    n_splits_tss: int = 5,
     random_state: int = 42,
     optuna_seed: int = 42,
     blend_top_k: int = 5,
@@ -5556,6 +5557,109 @@ def _formulario_map_columns(fn: pd.DataFrame) -> dict[str, Any]:
     return m
 
 
+def _formulario_resolve_oito_metricas(fn: pd.DataFrame) -> dict[str, str | None]:
+    """
+    Oito colunas numéricas do Esboço (VGV e QTD, facilitadas/normais, previsto/real),
+    sem misturar com colunas genéricas de «vendas» ou «vgv» soltas.
+    """
+    used_v: set[str] = set()
+    used_q: set[str] = set()
+    out: dict[str, str | None] = {}
+    out["v_fac_p"] = _find_formulario_vgv_col(
+        fn,
+        [
+            ["vendas", "facilitadas", "previstas"],
+            ["vgv", "facilitadas", "previstas"],
+            ["valor", "facilitadas", "previstas"],
+            ["facilitadas", "previstas", "vgv"],
+            ["facilitadas", "previstas"],
+        ],
+        used=used_v,
+    )
+    out["v_norm_p"] = _find_formulario_vgv_col(
+        fn,
+        [
+            ["vendas", "normais", "previstas"],
+            ["vgv", "normais", "previstas"],
+            ["valor", "normais", "previstas"],
+            ["normais", "previstas", "vgv"],
+            ["normais", "previstas"],
+        ],
+        used=used_v,
+    )
+    out["v_fac_r"] = _find_formulario_vgv_col(
+        fn,
+        [
+            ["vendas", "facilitadas", "reais"],
+            ["vendas", "facilitadas", "real"],
+            ["vgv", "facilitadas", "reais"],
+            ["facilitadas", "reais", "vgv"],
+            ["facilitadas", "reais"],
+            ["facilitadas", "realizado"],
+            ["facilitadas", "realizada"],
+        ],
+        used=used_v,
+    )
+    out["v_norm_r"] = _find_formulario_vgv_col(
+        fn,
+        [
+            ["vendas", "normais", "reais"],
+            ["vendas", "normais", "real"],
+            ["vgv", "normais", "reais"],
+            ["normais", "reais", "vgv"],
+            ["normais", "reais"],
+            ["normais", "realizado"],
+            ["normais", "realizada"],
+        ],
+        used=used_v,
+    )
+    out["q_fac_p"] = _find_formulario_qtd_col(
+        fn,
+        [
+            ["qtd", "facilitadas", "previstas"],
+            ["qtd", "facilitada", "prevista"],
+            ["facilitadas", "previstas"],
+            ["facilitada", "prevista"],
+        ],
+        used=used_q,
+    )
+    out["q_norm_p"] = _find_formulario_qtd_col(
+        fn,
+        [
+            ["qtd", "normais", "previstas"],
+            ["qtd", "normal", "prevista"],
+            ["normais", "previstas"],
+            ["normal", "prevista"],
+        ],
+        used=used_q,
+    )
+    out["q_fac_r"] = _find_formulario_qtd_col(
+        fn,
+        [
+            ["qtd", "facilitadas", "reais"],
+            ["qtd", "facilitadas", "real"],
+            ["qtd", "facilitada", "real"],
+            ["facilitadas", "reais"],
+            ["facilitadas", "real"],
+            ["facilitada", "real"],
+        ],
+        used=used_q,
+    )
+    out["q_norm_r"] = _find_formulario_qtd_col(
+        fn,
+        [
+            ["qtd", "normais", "reais"],
+            ["qtd", "normais", "real"],
+            ["qtd", "normal", "real"],
+            ["normais", "reais"],
+            ["normais", "real"],
+            ["normal", "real"],
+        ],
+        used=used_q,
+    )
+    return out
+
+
 def _formulario_canon_canal(x: Any) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return "(vazio)"
@@ -5600,6 +5704,11 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
+# Folds em TimeSeriesSplit durante Optuna (5 ≈ bom equilíbrio rapidez vs. estabilidade temporal).
+OPTUNA_TSS_SPLITS = 5
+# Um horizonte por execução de «Gerar previsões» quando o UI não envia lista.
+HORIZONTE_TREINO_PADRAO = 7
+HORIZONTES_FIXOS_DISPONIVEIS: tuple[int, ...] = (3, 7, 30)
 # Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
 BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
@@ -6634,6 +6743,7 @@ def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
 def run_training_pipeline(
     dfs: dict[str, pd.DataFrame],
     custom_previsao: dict[str, Any] | None = None,
+    horizontes_fixos: list[int] | None = None,
 ) -> tuple[
     dict[str, float],
     float,
@@ -6644,6 +6754,7 @@ def run_training_pipeline(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any] | None,
+    list[int],
 ]:
     df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
     dossie_ml = _build_ml_dossie_pack(df_master)
@@ -6659,7 +6770,12 @@ def run_training_pipeline(
     ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
     conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
 
-    horizontes = [3, 7, 30]
+    if horizontes_fixos is None:
+        horizontes = [HORIZONTE_TREINO_PADRAO]
+    else:
+        horizontes = [int(h) for h in horizontes_fixos if int(h) in HORIZONTES_FIXOS_DISPONIVEIS]
+        if not horizontes:
+            horizontes = [HORIZONTE_TREINO_PADRAO]
     por_horizonte: dict[Any, dict[str, Any]] = {}
     best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
 
@@ -6712,6 +6828,7 @@ def run_training_pipeline(
             horizon=h,
             target_name="qtd",
             n_trials=OPTUNA_TRIALS_AUTO,
+            n_splits_tss=OPTUNA_TSS_SPLITS,
             random_state=RANDOM_SEED,
             optuna_seed=RANDOM_SEED,
             blend_top_k=BLEND_TOP_K_FIXO,
@@ -6728,6 +6845,7 @@ def run_training_pipeline(
             horizon=h,
             target_name="valor",
             n_trials=OPTUNA_TRIALS_AUTO,
+            n_splits_tss=OPTUNA_TSS_SPLITS,
             random_state=RANDOM_SEED,
             optuna_seed=RANDOM_SEED + 1,
             blend_top_k=BLEND_TOP_K_FIXO,
@@ -6791,6 +6909,7 @@ def run_training_pipeline(
                 horizon=hz_eff,
                 target_name="qtd",
                 n_trials=OPTUNA_TRIALS_AUTO,
+                n_splits_tss=OPTUNA_TSS_SPLITS,
                 random_state=RANDOM_SEED,
                 optuna_seed=RANDOM_SEED + 7,
                 blend_top_k=BLEND_TOP_K_FIXO,
@@ -6806,6 +6925,7 @@ def run_training_pipeline(
                 horizon=hz_eff,
                 target_name="valor",
                 n_trials=OPTUNA_TRIALS_AUTO,
+                n_splits_tss=OPTUNA_TSS_SPLITS,
                 random_state=RANDOM_SEED,
                 optuna_seed=RANDOM_SEED + 8,
                 blend_top_k=BLEND_TOP_K_FIXO,
@@ -6868,6 +6988,7 @@ def run_training_pipeline(
         daily_pack,
         dossie_ml,
         por_custom,
+        list(horizontes),
     )
 
 
@@ -6917,24 +7038,16 @@ def _streamlit_carregar_dados_exploratorios() -> None:
 
 def _render_tab_formulario_previsao_humano() -> None:
     """Painéis a partir da planilha de respostas ao formulário (previsão vs real, filtros)."""
-    import plotly.colors as plc
     import plotly.graph_objects as go
 
     st.markdown(
         '<p class="pv-section-title">Formulário — previsão humana</p>',
         unsafe_allow_html=True,
     )
-    st.markdown(
-        "<div style='text-align:justify;color:#64748b;font-size:0.92rem;margin:0 auto 1rem auto;max-width:100%'>"
-        "Respostas ao <strong>Esboço — formulário</strong>: quantidades e VGV previstos versus realizados, por "
-        "<em>empreendimento</em>, <em>canal</em>, <em>regional</em> e <em>data de referência</em> (sábado). "
-        "Utilize <strong>Análises → Carregar dados</strong> ou <strong>Previsões → Gerar previsões</strong>, "
-        "ou o botão abaixo para sincronizar as planilhas.</div>",
-        unsafe_allow_html=True,
-    )
     if st.button(
         "Sincronizar planilhas (inclui formulário)",
         key="pv_form_reload",
+        type="primary",
         width="stretch",
     ):
         with st.spinner("A ler Google Sheets…"):
@@ -6955,6 +7068,7 @@ def _render_tab_formulario_previsao_humano() -> None:
 
     fn = normalize_dataframe_columns(df_raw.copy())
     mc = _formulario_map_columns(fn)
+    om = _formulario_resolve_oito_metricas(fn)
 
     def _ref_series() -> pd.Series:
         if not mc.get("ref") or mc["ref"] not in fn.columns:
@@ -6968,6 +7082,9 @@ def _render_tab_formulario_previsao_humano() -> None:
     reg_c = mc.get("regional")
     canal_c = mc.get("canal")
     regiao_c = mc.get("regiao")
+    imob_c = mc.get("imobiliaria")
+    nf_prev_c = mc.get("nf_prev")
+    nf_real_c = mc.get("nf_real")
 
     st.markdown("##### Filtros")
     f1, f2, f3, f4 = st.columns(4)
@@ -6975,11 +7092,21 @@ def _render_tab_formulario_previsao_humano() -> None:
         emp_opts: list[str] = []
         if emp_c and emp_c in fn.columns:
             emp_opts = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
-        sel_emp = st.multiselect("Empreendimento", options=emp_opts, default=[], key="pv_ff_emp")
+        sel_emp = st.multiselect(
+            "Empreendimento (previsto para ter venda)",
+            options=emp_opts,
+            default=[],
+            key="pv_ff_emp",
+        )
     with f2:
         dlist = sorted({_ for _ in fn["_ref_d"].dropna().unique()})
         d_labels = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dlist]
-        sel_d = st.multiselect("Data de referência (sábado)", options=d_labels, default=[], key="pv_ff_dt")
+        sel_d = st.multiselect(
+            "Data de referência (sábado da semana)",
+            options=d_labels,
+            default=[],
+            key="pv_ff_dt",
+        )
     with f3:
         canal_opts: list[str] = []
         if canal_c and canal_c in fn.columns:
@@ -6991,6 +7118,38 @@ def _render_tab_formulario_previsao_humano() -> None:
             reg_opts = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
         sel_reg = st.multiselect("Regional ou IMOB", options=reg_opts, default=[], key="pv_ff_reg")
 
+    g1, g2, g3, g4 = st.columns(4)
+    with g1:
+        regiao_opts: list[str] = []
+        if regiao_c and regiao_c in fn.columns:
+            regiao_opts = sorted({str(x).strip() for x in fn[regiao_c].dropna().unique() if str(x).strip()})
+        sel_regiao = st.multiselect("Região", options=regiao_opts, default=[], key="pv_ff_regiao")
+    with g2:
+        imob_opts: list[str] = []
+        if imob_c and imob_c in fn.columns:
+            imob_opts = sorted({str(x).strip() for x in fn[imob_c].dropna().unique() if str(x).strip()})
+        sel_imob = st.multiselect("Imobiliária", options=imob_opts, default=[], key="pv_ff_imob")
+    with g3:
+        nf_p_opts: list[str] = []
+        if nf_prev_c and nf_prev_c in fn.columns:
+            nf_p_opts = sorted({str(x).strip() for x in fn[nf_prev_c].dropna().unique() if str(x).strip()})
+        sel_nf_p = st.multiselect(
+            "Normal ou Facilitada — previsto",
+            options=nf_p_opts,
+            default=[],
+            key="pv_ff_nf_p",
+        )
+    with g4:
+        nf_r_opts: list[str] = []
+        if nf_real_c and nf_real_c in fn.columns:
+            nf_r_opts = sorted({str(x).strip() for x in fn[nf_real_c].dropna().unique() if str(x).strip()})
+        sel_nf_r = st.multiselect(
+            "Normal ou Facilitada — real",
+            options=nf_r_opts,
+            default=[],
+            key="pv_ff_nf_r",
+        )
+
     dff = fn.copy()
     if sel_emp and emp_c and emp_c in dff.columns:
         dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
@@ -7001,472 +7160,245 @@ def _render_tab_formulario_previsao_humano() -> None:
         dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
     if sel_reg and reg_c and reg_c in dff.columns:
         dff = dff[dff[reg_c].astype(str).isin(sel_reg)]
+    if sel_regiao and regiao_c and regiao_c in dff.columns:
+        dff = dff[dff[regiao_c].astype(str).isin(sel_regiao)]
+    if sel_imob and imob_c and imob_c in dff.columns:
+        dff = dff[dff[imob_c].astype(str).isin(sel_imob)]
+    if sel_nf_p and nf_prev_c and nf_prev_c in dff.columns:
+        dff = dff[dff[nf_prev_c].astype(str).isin(sel_nf_p)]
+    if sel_nf_r and nf_real_c and nf_real_c in dff.columns:
+        dff = dff[dff[nf_real_c].astype(str).isin(sel_nf_r)]
 
     if dff.empty:
         st.warning("Sem linhas após aplicar os filtros.")
         return
 
-    st.caption(f"**{len(dff):,}** linhas (após filtros) · **{dff.shape[1]}** colunas na base bruta.")
+    st.caption(f"**{len(dff):,}** linhas (após filtros).")
 
-    qfp, qfr = mc.get("q_fac_p"), mc.get("q_fac_r")
-    qnp, qnr = mc.get("q_norm_p"), mc.get("q_norm_r")
-    vgp, vgr = mc.get("vgv_prev"), mc.get("vgv_real")
-    vprev, vreal = mc.get("vendas_prev"), mc.get("vendas_real")
-    nf_p = mc.get("nf_prev")
+    qfp, qfr = om.get("q_fac_p"), om.get("q_fac_r")
+    qnp, qnr = om.get("q_norm_p"), om.get("q_norm_r")
+    vfp, vfr = om.get("v_fac_p"), om.get("v_fac_r")
+    vnp, vnr = om.get("v_norm_p"), om.get("v_norm_r")
 
     s_qfp = _formulario_num_series(dff, qfp)
     s_qfr = _formulario_num_series(dff, qfr)
     s_qnp = _formulario_num_series(dff, qnp)
     s_qnr = _formulario_num_series(dff, qnr)
-    s_vgp = _formulario_num_series(dff, vgp)
-    s_vgr = _formulario_num_series(dff, vgr)
+    s_vfp = _formulario_num_series(dff, vfp)
+    s_vfr = _formulario_num_series(dff, vfr)
+    s_vnp = _formulario_num_series(dff, vnp)
+    s_vnr = _formulario_num_series(dff, vnr)
 
-    tot_fac_p = float(s_qfp.sum())
-    tot_fac_r = float(s_qfr.sum())
-    tot_norm_p = float(s_qnp.sum())
-    tot_norm_r = float(s_qnr.sum())
-    tot_vgv_p = float(s_vgp.sum())
-    tot_vgv_r = float(s_vgr.sum())
+    _om_labels = {
+        "q_fac_p": "QTD Vendas Facilitadas Previstas",
+        "q_fac_r": "QTD Vendas Facilitadas Reais",
+        "q_norm_p": "QTD Vendas Normais Previstas",
+        "q_norm_r": "QTD Vendas Normais Reais",
+        "v_fac_p": "Vendas Facilitadas Previstas",
+        "v_fac_r": "Vendas Facilitadas Reais",
+        "v_norm_p": "Vendas Normais Previstas",
+        "v_norm_r": "Vendas Normais Reais",
+    }
+    _missing = [f"{_om_labels[k]} (`{k}`)" for k in _om_labels if not om.get(k) or om[k] not in dff.columns]
+    if _missing:
+        st.warning("Não encontrei coluna na planilha para: " + " · ".join(_missing))
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    with m1:
-        st.metric("QTD facilitadas — previstas", f"{tot_fac_p:,.0f}")
-    with m2:
-        st.metric("QTD facilitadas — reais", f"{tot_fac_r:,.0f}")
-    with m3:
-        st.metric("QTD normais — previstas", f"{tot_norm_p:,.0f}")
-    with m4:
-        st.metric("QTD normais — reais", f"{tot_norm_r:,.0f}")
-    with m5:
-        st.metric("VGV previsto (soma)", f"R$ {tot_vgv_p/1e6:.2f} mi")
-    with m6:
-        st.metric("VGV real (soma)", f"R$ {tot_vgv_r/1e6:.2f} mi")
-
-    if mc.get("erro") and mc["erro"] in dff.columns:
-        err = pd.to_numeric(dff[mc["erro"]], errors="coerce").dropna()
-        if len(err):
-            e1, e2 = st.columns(2)
-            with e1:
-                st.metric("Erro de previsão — média |·|", f"{float(err.abs().mean()):,.2f}")
-            with e2:
-                st.metric("Erro de previsão — mediana", f"{float(err.median()):,.2f}")
+    r1a, r1b, r1c, r1d = st.columns(4)
+    with r1a:
+        st.metric(_om_labels["v_fac_p"], f"R$ {float(s_vfp.sum())/1e6:,.2f} mi")
+    with r1b:
+        st.metric(_om_labels["v_fac_r"], f"R$ {float(s_vfr.sum())/1e6:,.2f} mi")
+    with r1c:
+        st.metric(_om_labels["v_norm_p"], f"R$ {float(s_vnp.sum())/1e6:,.2f} mi")
+    with r1d:
+        st.metric(_om_labels["v_norm_r"], f"R$ {float(s_vnr.sum())/1e6:,.2f} mi")
+    r2a, r2b, r2c, r2d = st.columns(4)
+    with r2a:
+        st.metric(_om_labels["q_fac_p"], f"{float(s_qfp.sum()):,.0f}")
+    with r2b:
+        st.metric(_om_labels["q_fac_r"], f"{float(s_qfr.sum()):,.0f}")
+    with r2c:
+        st.metric(_om_labels["q_norm_p"], f"{float(s_qnp.sum()):,.0f}")
+    with r2d:
+        st.metric(_om_labels["q_norm_r"], f"{float(s_qnr.sum()):,.0f}")
 
     _ipc = {"displayModeBar": True, "displaylogo": False}
-    pal = plc.qualitative.Bold + plc.qualitative.Pastel1 + plc.qualitative.Dark24
-
-    def _stack_xy_color(
-        title: str,
-        xcol: str | None,
-        ccol: str | None,
-        yser: pd.Series,
-        *,
-        height: int = 400,
-    ) -> go.Figure | None:
-        if not xcol or xcol not in dff.columns or not ccol or ccol not in dff.columns:
-            return None
-        sub = pd.DataFrame({xcol: dff[xcol].astype(str), ccol: dff[ccol].astype(str), "_y": yser})
-        sub = sub.groupby([xcol, ccol], as_index=False)["_y"].sum()
-        sub = sub[sub["_y"] != 0]
-        if sub.empty:
-            return None
-        xcats = sorted(sub[xcol].unique().tolist())
-        colors = sorted(sub[ccol].unique().tolist())
-        fig = go.Figure()
-        for i, lab in enumerate(colors):
-            chunk = sub[sub[ccol] == lab]
-            yv = chunk.set_index(xcol)["_y"].reindex(xcats).fillna(0).values
-            fig.add_trace(
-                go.Bar(
-                    name=str(lab)[:46],
-                    x=xcats,
-                    y=yv,
-                    marker_color=pal[i % len(pal)],
-                    text=[f"{v:.0f}" if v > 0 else "" for v in yv],
-                    textposition="inside",
-                    insidetextfont=dict(color="white", size=10),
-                )
-            )
-        fig.update_layout(
-            **_plotly_layout_direcional(
-                title=title,
-                height=height,
-                barmode="stack",
-                legend=_plotly_legend_bottom(),
-                xaxis_tickangle=-34,
-                margin=dict(t=100, l=52, r=36, b=max(128, min(240, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
-            )
-        )
-        return fig
 
     def _group_prev_real(
         title: str,
-        xcol: str | None,
+        x_labels: pd.Series,
         s_pre: pd.Series,
         s_re: pd.Series,
         lab_p: str,
         lab_r: str,
         *,
-        height: int = 380,
+        height: int = 360,
+        money: bool = False,
+        sort_dates: bool = False,
+        max_cats: int = 32,
     ) -> go.Figure | None:
-        if not xcol or xcol not in dff.columns:
-            return None
-        sub = pd.DataFrame({xcol: dff[xcol].astype(str), "_p": s_pre, "_r": s_re})
-        g = sub.groupby(xcol, as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
+        sub = pd.DataFrame({"_x": x_labels.astype(str), "_p": s_pre.fillna(0), "_r": s_re.fillna(0)})
+        g = sub.groupby("_x", as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
         if g.empty:
             return None
-        g = g.sort_values("_p", ascending=False)
-        xcats = g[xcol].tolist()
+        if sort_dates:
+            g["_ord"] = pd.to_datetime(g["_x"], errors="coerce")
+            g = g.sort_values("_ord", na_position="last")
+        else:
+            g = g.sort_values("_p", ascending=False).head(max_cats)
+        xcats = g["_x"].tolist()
+        if money:
+
+            def _tx(v: float) -> str:
+                av = abs(float(v))
+                if av >= 1e6:
+                    return f"{v/1e6:.2f} mi"
+                if av >= 1e3:
+                    return f"{v/1e3:.0f} k"
+                return f"{v:.0f}"
+
+            tp = [_tx(float(v)) for v in g["_p"]]
+            tr = [_tx(float(v)) for v in g["_r"]]
+        else:
+            tp = [f"{float(v):.0f}" for v in g["_p"]]
+            tr = [f"{float(v):.0f}" for v in g["_r"]]
         fig = go.Figure()
         fig.add_trace(
             go.Bar(
-                name=lab_p,
+                name=lab_p[:56],
                 x=xcats,
                 y=g["_p"],
                 marker_color=PLOT_AZUL,
-                text=[f"{v:.0f}" for v in g["_p"]],
+                text=tp,
                 textposition="outside",
             )
         )
         fig.add_trace(
             go.Bar(
-                name=lab_r,
+                name=lab_r[:56],
                 x=xcats,
                 y=g["_r"],
                 marker_color=PLOT_ACCENT,
-                text=[f"{v:.0f}" for v in g["_r"]],
+                text=tr,
                 textposition="outside",
             )
         )
+        extra: dict[str, Any] = {}
+        if money:
+            extra["yaxis_title"] = "R$"
         fig.update_layout(
-            **_plotly_layout_direcional(
+            _plotly_layout_direcional(
                 title=title,
                 height=height,
                 barmode="group",
                 legend=_plotly_legend_bottom(),
                 xaxis_tickangle=-34,
-                margin=dict(t=100, l=52, r=36, b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+                margin=dict(
+                    t=100,
+                    l=52,
+                    r=36,
+                    b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0))),
+                ),
+                **extra,
             )
         )
         return fig
 
-    st.markdown("##### Previsão por regional — empilhado (QTD)")
-    st.caption("Cada cor é um **empreendimento**; o eixo X é **Regional ou IMOB**.")
-    ra, rb = st.columns(2)
-    with ra:
-        fg = _stack_xy_color(
-            "Previsão por produto — Vendas facilitadas (QTD previstas)",
-            reg_c,
-            emp_c,
-            s_qfp,
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
-    with rb:
-        fg = _stack_xy_color(
-            "Previsão por produto — Vendas normais (QTD previstas)",
-            reg_c,
-            emp_c,
-            s_qnp,
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
-
-    st.markdown("##### Previsão por produto — canal (QTD e VGV)")
-    st.caption("Eixo X: **empreendimento**; empilhamento por **canal** (DV / IMOB).")
-    if canal_c and emp_c:
-        sc = dff[canal_c].map(_formulario_canon_canal)
-        ca, cb = st.columns(2)
-        with ca:
-            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_qnp})
-            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
-            sub = sub[sub["_y"] != 0]
-            if not sub.empty:
-                xcats = sorted(sub[emp_c].unique().tolist())
-                fig = go.Figure()
-                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
-                    chunk = sub[sub["__canal__"] == lab]
-                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
-                    fig.add_trace(
-                        go.Bar(
-                            name=str(lab),
-                            x=xcats,
-                            y=yv,
-                            marker_color=pal[i % len(pal)],
-                            text=[f"{v:.0f}" if v > 0 else "" for v in yv],
-                            textposition="inside",
-                            insidetextfont=dict(color="white", size=10),
-                        )
-                    )
-                fig.update_layout(
-                    **_plotly_layout_direcional(
-                        title="Previsão por produto — Normais (QTD)",
-                        height=400,
-                        barmode="stack",
-                        legend=_plotly_legend_bottom(),
-                        xaxis_tickangle=-34,
-                        margin=dict(t=100, l=52, r=36, b=168),
-                    )
-                )
-                st.plotly_chart(fig, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-        with cb:
-            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_vgp})
-            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
-            sub = sub[sub["_y"] != 0]
-            if not sub.empty:
-                xcats = sorted(sub[emp_c].unique().tolist())
-                fig = go.Figure()
-                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
-                    chunk = sub[sub["__canal__"] == lab]
-                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
-                    lbl_txt = [f"{float(v)/1e3:.1f} mil" if v > 0 else "" for v in yv]
-                    fig.add_trace(
-                        go.Bar(
-                            name=str(lab),
-                            x=xcats,
-                            y=yv,
-                            marker_color=pal[i % len(pal)],
-                            text=lbl_txt,
-                            textposition="inside",
-                            insidetextfont=dict(color="white", size=9),
-                        )
-                    )
-                fig.update_layout(
-                    **_plotly_layout_direcional(
-                        title="Previsão por produto — VGV",
-                        height=400,
-                        barmode="stack",
-                        legend=_plotly_legend_bottom(),
-                        xaxis_tickangle=-34,
-                        yaxis_title="R$",
-                        margin=dict(t=100, l=52, r=36, b=168),
-                    )
-                )
-                st.plotly_chart(fig, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-    else:
-        st.caption("Colunas de empreendimento ou canal ausentes — gráficos por canal omitidos.")
-
-    st.markdown("##### Previsão por produto — empilhado por regional (QTD)")
-    st.caption("Eixo X: **empreendimento**; cores: **Regional ou IMOB**.")
-    pc1, pc2 = st.columns(2)
-    with pc1:
-        fg = _stack_xy_color(
-            "Previsão por produto — Facilitadas",
-            emp_c,
-            reg_c,
-            s_qfp,
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
-    with pc2:
-        fg = _stack_xy_color(
-            "Previsão por produto — Normais",
-            emp_c,
-            reg_c,
-            s_qnp,
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
-
-    if nf_p and nf_p in dff.columns and reg_c and reg_c in dff.columns:
-        st.markdown("##### Previsão agregada por tipo (Normal / Facilitada / …)")
-        vp = (
-            _formulario_num_series(dff, vprev)
-            if vprev
-            else pd.Series(1.0, index=dff.index, dtype=float)
-        )
-        sub = pd.DataFrame(
-            {
-                reg_c: dff[reg_c].astype(str),
-                nf_p: dff[nf_p].astype(str).replace("nan", "(vazio)"),
-                "_y": vp,
-            }
-        )
-        sub = sub.groupby([reg_c, nf_p], as_index=False)["_y"].sum()
-        sub = sub[sub["_y"] != 0]
-        if not sub.empty:
-            xcats = sorted(sub[reg_c].unique().tolist())
-            fig = go.Figure()
-            for i, lab in enumerate(sorted(sub[nf_p].unique().tolist())):
-                chunk = sub[sub[nf_p] == lab]
-                yv = chunk.set_index(reg_c)["_y"].reindex(xcats).fillna(0).values
-                fig.add_trace(
-                    go.Bar(
-                        name=str(lab)[:40],
-                        x=xcats,
-                        y=yv,
-                        marker_color=pal[i % len(pal)],
-                        text=[f"{v:.0f}" if v > 0 else "" for v in yv],
-                        textposition="outside",
-                    )
-                )
-            fig.update_layout(
-                **_plotly_layout_direcional(
-                    title="Previsão — soma de «Vendas Previsão» por regional e tipo",
-                    height=400,
-                    barmode="stack",
-                    legend=_plotly_legend_bottom(),
-                    xaxis_tickangle=-28,
-                    margin=dict(t=100, l=52, r=36, b=138),
-                )
+    def _xl_for_dim(_dim_title: str, col: str | None, *, canon_canal: bool) -> pd.Series | None:
+        if col == "__ref_d__":
+            if "_ref_d" not in dff.columns:
+                return None
+            return dff["_ref_d"].map(
+                lambda t: pd.Timestamp(t).strftime("%Y-%m-%d") if pd.notna(t) else "(sem data)"
             )
-            st.plotly_chart(fig, width="stretch", config=_ipc)
-        else:
-            st.caption("Sem dados para o gráfico de tipos.")
+        if col is None or col not in dff.columns:
+            return None
+        if canon_canal:
+            return dff[col].map(_formulario_canon_canal)
+        return dff[col].astype(str)
 
-    st.markdown("##### Previsão × Real — por **Regional ou IMOB**")
-    gx1, gx2 = st.columns(2)
-    with gx1:
-        fg = _group_prev_real(
-            "Vendas Previsão × Real — Facilitadas (QTD)",
-            reg_c,
-            s_qfp,
-            s_qfr,
-            "QTD facilitadas previstas",
-            "QTD facilitadas reais",
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
-    with gx2:
-        fg = _group_prev_real(
-            "Vendas Previsão × Real — Normais (QTD)",
-            reg_c,
-            s_qnp,
-            s_qnr,
-            "QTD normais previstas",
-            "QTD normais reais",
-        )
-        if fg:
-            st.plotly_chart(fg, width="stretch", config=_ipc)
-        else:
-            st.caption("—")
+    _dim_specs: list[tuple[str, str | None, bool, bool]] = [
+        ("Data de referência (sábado da semana)", "__ref_d__", False, True),
+        ("Região", regiao_c, False, False),
+        ("Canal", canal_c, True, False),
+        ("Regional ou IMOB", reg_c, False, False),
+        ("Imobiliária", imob_c, False, False),
+        ("Empreendimento (previsto para ter venda)", emp_c, False, False),
+        ("Normal ou Facilitada — previsto", nf_prev_c, False, False),
+        ("Normal ou Facilitada — real", nf_real_c, False, False),
+    ]
 
-    st.markdown("##### Previsão × Real — por **empreendimento** (top por volume previsto)")
-    if emp_c and emp_c in dff.columns:
-        sub = pd.DataFrame(
-            {
-                emp_c: dff[emp_c].astype(str),
-                "_p": s_qnp + s_qfp,
-                "_pf": s_qfp,
-                "_pr": s_qfr,
-                "_qn": s_qnp,
-                "_qr": s_qnr,
-            }
-        )
-        g = sub.groupby(emp_c, as_index=False).agg(
-            _p=("_p", "sum"),
-            _pf=("_pf", "sum"),
-            _pr=("_pr", "sum"),
-            _qn=("_qn", "sum"),
-            _qr=("_qr", "sum"),
-        )
-        g = g.sort_values("_p", ascending=False).head(22)
-        if not g.empty:
-            xcats = g[emp_c].tolist()
+    st.markdown("##### Análises — previsto × real por dimensão")
+    for i_dim, (dim_title, col_key, canon_canal, sort_dates) in enumerate(_dim_specs):
+        xl = _xl_for_dim(dim_title, col_key, canon_canal=canon_canal)
+        if xl is None:
+            continue
+        st.markdown(f"###### {dim_title}")
+        g1, g2 = st.columns(2)
+        with g1:
+            fg = _group_prev_real(
+                f"{dim_title} — QTD facilitadas",
+                xl,
+                s_qfp,
+                s_qfr,
+                _om_labels["q_fac_p"],
+                _om_labels["q_fac_r"],
+                sort_dates=sort_dates,
+            )
+            if fg:
+                st.plotly_chart(fg, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        with g2:
+            fg = _group_prev_real(
+                f"{dim_title} — QTD normais",
+                xl,
+                s_qnp,
+                s_qnr,
+                _om_labels["q_norm_p"],
+                _om_labels["q_norm_r"],
+                sort_dates=sort_dates,
+            )
+            if fg:
+                st.plotly_chart(fg, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        g3, g4 = st.columns(2)
+        with g3:
+            fg = _group_prev_real(
+                f"{dim_title} — Vendas facilitadas (R$)",
+                xl,
+                s_vfp,
+                s_vfr,
+                _om_labels["v_fac_p"],
+                _om_labels["v_fac_r"],
+                money=True,
+                sort_dates=sort_dates,
+            )
+            if fg:
+                st.plotly_chart(fg, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        with g4:
+            fg = _group_prev_real(
+                f"{dim_title} — Vendas normais (R$)",
+                xl,
+                s_vnp,
+                s_vnr,
+                _om_labels["v_norm_p"],
+                _om_labels["v_norm_r"],
+                money=True,
+                sort_dates=sort_dates,
+            )
+            if fg:
+                st.plotly_chart(fg, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        if i_dim < len(_dim_specs) - 1:
+            st.divider()
 
-            def _pair_fig(title: str, yp: str, yr: str, npref: str, nrref: str) -> go.Figure:
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Bar(
-                        name=npref,
-                        x=xcats,
-                        y=g[yp],
-                        marker_color=PLOT_AZUL,
-                        text=[f"{v:.0f}" for v in g[yp]],
-                        textposition="outside",
-                    )
-                )
-                fig.add_trace(
-                    go.Bar(
-                        name=nrref,
-                        x=xcats,
-                        y=g[yr],
-                        marker_color=PLOT_ACCENT,
-                        text=[f"{v:.0f}" for v in g[yr]],
-                        textposition="outside",
-                    )
-                )
-                fig.update_layout(
-                    **_plotly_layout_direcional(
-                        title=title,
-                        height=440,
-                        barmode="group",
-                        legend=_plotly_legend_bottom(),
-                        xaxis_tickangle=-40,
-                        margin=dict(t=100, l=52, r=36, b=188),
-                    )
-                )
-                return fig
-
-            gy1, gy2 = st.columns(2)
-            with gy1:
-                st.plotly_chart(
-                    _pair_fig(
-                        "Facilitadas — previstas × reais",
-                        "_pf",
-                        "_pr",
-                        "QTD facilitadas previstas",
-                        "QTD facilitadas reais",
-                    ),
-                    width="stretch",
-                    config=_ipc,
-                )
-            with gy2:
-                st.plotly_chart(
-                    _pair_fig(
-                        "Normais — previstas × reais",
-                        "_qn",
-                        "_qr",
-                        "QTD normais previstas",
-                        "QTD normais reais",
-                    ),
-                    width="stretch",
-                    config=_ipc,
-                )
-    else:
-        st.caption("—")
-
-    st.markdown("##### Tabelas resumo — **Região** × canal (DV / IMOB)")
+    st.markdown("##### Tabelas — **Região** × **Canal** (oito métricas)")
     if regiao_c and regiao_c in dff.columns and canal_c and canal_c in dff.columns:
-        dpx = dff[[regiao_c, canal_c]].copy()
-        dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
-        dpx["_q_prev"] = s_qnp + s_qfp
-        dpx["_q_real"] = s_qnr + s_qfr
-        pv = (
-            dpx.pivot_table(
-                index=regiao_c,
-                columns="_can",
-                values="_q_prev",
-                aggfunc="sum",
-                fill_value=0,
-            )
-            .reset_index()
-        )
-        pr = (
-            dpx.pivot_table(
-                index=regiao_c,
-                columns="_can",
-                values="_q_real",
-                aggfunc="sum",
-                fill_value=0,
-            )
-            .reset_index()
-        )
-        pv.columns = [str(c) if c != regiao_c else "Região" for c in pv.columns]
-        pr.columns = [str(c) if c != regiao_c else "Região" for c in pr.columns]
 
         def _add_total_row(tab: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
             if tab.empty:
@@ -7477,52 +7409,38 @@ def _render_tab_formulario_previsao_humano() -> None:
                     row[c] = pd.to_numeric(tab[c], errors="coerce").fillna(0).sum()
             return pd.concat([tab, pd.DataFrame([row])], ignore_index=True)
 
-        num_p = [c for c in pv.columns if c != "Região"]
-        num_r = [c for c in pr.columns if c != "Região"]
-        st.caption("Totais de **QTD** (normais + facilitadas) por região e canal.")
-        t1, t2 = st.columns(2)
-        with t1:
-            st.markdown("**Previsão (QTD)**")
-            st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
-        with t2:
-            st.markdown("**Realizado (QTD)**")
-            st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
+        def _pivot_vals(vals: pd.Series) -> pd.DataFrame:
+            dpx = dff[[regiao_c, canal_c]].copy()
+            dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
+            dpx["_v"] = vals
+            pt = dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_v",
+                aggfunc="sum",
+                fill_value=0,
+            ).reset_index()
+            pt.columns = [str(c) if c != regiao_c else "Região" for c in pt.columns]
+            return pt
 
-        if vgp and vgr:
-            dpx["_v_prev"] = s_vgp
-            dpx["_v_real"] = s_vgr
-            pv2 = (
-                dpx.pivot_table(
-                    index=regiao_c,
-                    columns="_can",
-                    values="_v_prev",
-                    aggfunc="sum",
-                    fill_value=0,
-                )
-                .reset_index()
-            )
-            pr2 = (
-                dpx.pivot_table(
-                    index=regiao_c,
-                    columns="_can",
-                    values="_v_real",
-                    aggfunc="sum",
-                    fill_value=0,
-                )
-                .reset_index()
-            )
-            pv2.columns = [str(c) if c != regiao_c else "Região" for c in pv2.columns]
-            pr2.columns = [str(c) if c != regiao_c else "Região" for c in pr2.columns]
-            st.markdown("**VGV por região e canal (R$)**")
-            t3, t4 = st.columns(2)
-            with t3:
-                st.caption("Previsão")
-                n3 = [c for c in pv2.columns if c != "Região"]
-                st.dataframe(_add_total_row(pv2, n3), width="stretch", hide_index=True)
-            with t4:
-                st.caption("Realizado")
-                n4 = [c for c in pr2.columns if c != "Região"]
-                st.dataframe(_add_total_row(pr2, n4), width="stretch", hide_index=True)
+        _tab_pairs: list[tuple[str, pd.Series, pd.Series]] = [
+            (_om_labels["q_fac_p"] + " × " + _om_labels["q_fac_r"], s_qfp, s_qfr),
+            (_om_labels["q_norm_p"] + " × " + _om_labels["q_norm_r"], s_qnp, s_qnr),
+            (_om_labels["v_fac_p"] + " × " + _om_labels["v_fac_r"], s_vfp, s_vfr),
+            (_om_labels["v_norm_p"] + " × " + _om_labels["v_norm_r"], s_vnp, s_vnr),
+        ]
+        for pair_title, sp, sr in _tab_pairs:
+            st.caption(pair_title + " (previsto | realizado)")
+            pv, pr = _pivot_vals(sp), _pivot_vals(sr)
+            num_p = [c for c in pv.columns if c != "Região"]
+            num_r = [c for c in pr.columns if c != "Região"]
+            t1, t2 = st.columns(2)
+            with t1:
+                st.markdown("**Previsto**")
+                st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
+            with t2:
+                st.markdown("**Realizado**")
+                st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
     else:
         st.caption("Defina colunas **Região** e **Canal** na planilha para ver as tabelas cruzadas.")
 
@@ -7535,15 +7453,17 @@ def _render_tab_formulario_previsao_humano() -> None:
                 reg_c,
                 canal_c,
                 regiao_c,
+                imob_c,
+                nf_prev_c,
+                nf_real_c,
                 qfp,
                 qfr,
                 qnp,
                 qnr,
-                vgp,
-                vgr,
-                vprev,
-                vreal,
-                mc.get("erro"),
+                vfp,
+                vfr,
+                vnp,
+                vnr,
             ]
             if c and c in dff.columns
         ]
@@ -8226,21 +8146,27 @@ def _render_tab_introducao() -> None:
 def _render_streamlit_ml_feature_importance(
     por_h: dict[Any, dict[str, Any]],
     plot_config: dict[str, Any],
+    horizontes: list[int] | None = None,
 ) -> None:
     """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
     import plotly.graph_objects as go
 
+    hz_list = (
+        list(horizontes)
+        if horizontes
+        else sorted(h for h in por_h if isinstance(h, int))
+    )
     _tem_imp = any(
         (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
         or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
-        for h in (3, 7, 30)
+        for h in hz_list
     )
     if _tem_imp:
         st.markdown(
             '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
             unsafe_allow_html=True,
         )
-        for h in (3, 7, 30):
+        for h in hz_list:
             sub = por_h.get(h) or {}
             c1, c2 = st.columns(2)
             with c1:
@@ -8734,7 +8660,7 @@ def _render_streamlit_tab_analises(
         )
         _xr_m = _plotly_xaxis_range_from_dates(dates)
         _xax_m = {**_lo_m_base["xaxis"], **({"range": _xr_m} if _xr_m else {})}
-        fig_m.update_layout({**_lo_m_base, "xaxis": _xax_m})
+        fig_m.update_layout(**{**_lo_m_base, "xaxis": _xax_m})
         st.plotly_chart(fig_m, width="stretch", config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
@@ -8766,8 +8692,14 @@ def _render_streamlit_tab_apendice(
     blend_top_k: int,
     random_seed: int,
     daily: dict[str, Any],
+    horizontes: list[int] | None = None,
 ) -> None:
-    hz_txt = ", ".join(str(x) for x in (3, 7, 30))
+    hz_use = (
+        list(horizontes)
+        if horizontes
+        else sorted(h for h in por_h if isinstance(h, int))
+    )
+    hz_txt = ", ".join(str(x) for x in hz_use) if hz_use else "3, 7 ou 30 (um por execução)"
     modo = (
         "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
         "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
@@ -8780,15 +8712,17 @@ def _render_streamlit_tab_apendice(
         '<p class="pv-section-title">Apêndice</p>',
         unsafe_allow_html=True,
     )
-    tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
-        ["Metodologia", "H = 3 dias", "H = 7 dias", "H = 30 dias", "Personalizado"]
-    )
+    _tab_labels = ["Metodologia"] + [f"H = {h} dias" for h in hz_use] + ["Personalizado"]
+    _tabs = st.tabs(_tab_labels)
+    tab_met = _tabs[0]
+    tab_cust = _tabs[-1]
+    tab_h_blocks = _tabs[1:-1]
     with tab_met:
         st.markdown(
             f"""
 #### Resumo
 
-- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*, com *H* ∈ {{{hz_txt}}}; o vetor *X* incorpora apenas informação até *t*. Além disso, na aba **Previsões**, um intervalo entre datas de início e fim define um alvo complementar.
+- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*; em cada execução treina-se **um** *H* entre {{{hz_txt}}} (conforme seleção na aba **Previsões**). Um intervalo entre datas define, adicionalmente, um alvo complementar.
 - **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Optuna:** algoritmo TPE, **TimeSeriesSplit** e **MedianPruner**; a função objetivo penaliza a variância entre *folds*, promovendo estabilidade. Semente: **{random_seed}**.
@@ -8820,12 +8754,9 @@ O relatório HTML exportável na aba **Previsões** reúne, entre outros element
         st.markdown("**Hiperparâmetros LightGBM (VGV)**")
         st.json(bp.get("valor") or {})
 
-    with tab3:
-        _ap_horizon_block(3)
-    with tab7:
-        _ap_horizon_block(7)
-    with tab30:
-        _ap_horizon_block(30)
+    for _ti, _h in enumerate(hz_use):
+        with tab_h_blocks[_ti]:
+            _ap_horizon_block(_h)
 
     with tab_cust:
         bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
@@ -8848,6 +8779,7 @@ def _render_streamlit_dossie_ml(
     por_h: dict[Any, dict[str, Any]],
     daily_pack: dict[str, Any],
     por_custom: dict[str, Any] | None,
+    horizontes: list[int] | None = None,
 ) -> None:
     import plotly.graph_objects as go
 
@@ -9177,14 +9109,19 @@ def _render_streamlit_dossie_ml(
             st.plotly_chart(fig_b, width="stretch", config=_dpc)
 
     with td5:
-        _render_streamlit_ml_feature_importance(por_h, _dpc)
+        _hz_d = (
+            list(horizontes)
+            if horizontes
+            else sorted(h for h in por_h if isinstance(h, int))
+        )
+        _render_streamlit_ml_feature_importance(por_h, _dpc, horizontes=_hz_d)
         st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
         st.markdown(
             "**Acurácia dir.:** no conjunto de teste, corresponde à percentagem de dias em que o valor real e a previsão "
             "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
         )
         rows_m = []
-        for h in (3, 7, 30):
+        for h in _hz_d:
             sub = por_h.get(h) or {}
             for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
                 m = (sub.get(alvo) or {}).get("metrics_test") or {}
@@ -9272,7 +9209,7 @@ def main() -> None:
     st.markdown(
         '<div class="pv-hero-block">'
         '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
-        '<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>'
+        '<p class="pv-hero-sub">Consolidação da matriz diária, treino de <strong>um horizonte</strong> por execução (3, 7 ou 30 dias) e exportação de relatório HTML.</p>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -9302,9 +9239,18 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "Por padrão, estimam-se sempre os horizontes de <strong>3, 7 e 30</strong> dias. Adicionalmente, caso indique "
-            "um intervalo opcional nas datas abaixo, treina-se um par de modelos cuja soma-alvo corresponde ao calendário entre essas datas.</div>",
+            "Cada execução de <strong>Gerar previsões</strong> treina <strong>apenas um</strong> horizonte fixo (3, 7 ou 30 dias), "
+            "para reduzir tempo de CPU; execute novamente com outro horizonte se precisar de outro <em>H</em>. "
+            "Opcionalmente, um intervalo de datas abaixo acrescenta um par de modelos com alvo de soma nesse calendário.</div>",
             unsafe_allow_html=True,
+        )
+        hz_pick = st.radio(
+            "Horizonte a treinar nesta execução",
+            options=list(HORIZONTES_FIXOS_DISPONIVEIS),
+            index=list(HORIZONTES_FIXOS_DISPONIVEIS).index(HORIZONTE_TREINO_PADRAO),
+            format_func=lambda x: f"{x} dias",
+            horizontal=True,
+            key="pv_horizon_pick",
         )
         ic1, ic2 = st.columns(2)
         with ic1:
@@ -9322,7 +9268,7 @@ def main() -> None:
         if d_ini is not None and d_fim is not None:
             a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
             st.info(
-                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
+                f"Intervalo adicional **{a.isoformat()}** → **{b.isoformat()}** (além do horizonte **{hz_pick}** dias)."
             )
         elif d_ini is None and d_fim is None:
             pass
@@ -9361,7 +9307,12 @@ def main() -> None:
                             daily_pack,
                             dossie_ml,
                             por_custom,
-                        ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
+                            hz_done,
+                        ) = run_training_pipeline(
+                            dfs,
+                            custom_previsao=custom_previsao,
+                            horizontes_fixos=[hz_pick],
+                        )
                     st.session_state.resultado = {
                         "stats_base": stats_base,
                         "ticket": ticket,
@@ -9372,6 +9323,7 @@ def main() -> None:
                         "daily_pack": daily_pack,
                         "dossie_ml": dossie_ml,
                         "por_custom": por_custom,
+                        "horizontes": hz_done,
                         "full_train": FULL_PERIOD_TRAIN_FIXO,
                         "sheet_metas": sheet_metas,
                         "used_sa": used_sa,
@@ -9444,9 +9396,13 @@ def main() -> None:
             )
             rows = []
             lbl = "In-sample" if full_train else "Holdout 30%"
-            for h in (3, 7, 30):
-                q = por_h[h]["qtd"]
-                v = por_h[h]["valor"]
+            _hz_show = res.get("horizontes") or sorted(k for k in por_h if isinstance(k, int))
+            for h in _hz_show:
+                ph = por_h.get(h)
+                if not ph:
+                    continue
+                q = ph["qtd"]
+                v = ph["valor"]
                 acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
                 acc_v = v.get("metrics_test", {}).get("Acc_dir_mediana")
                 rows.append(
@@ -9491,7 +9447,7 @@ def main() -> None:
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             acc_warn = False
-            for h in (3, 7, 30):
+            for h in _hz_show:
                 for part in ("qtd", "valor"):
                     m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
@@ -9586,6 +9542,7 @@ def main() -> None:
                 res_d["por_h"],
                 res_d["daily_pack"],
                 res_d.get("por_custom"),
+                horizontes=res_d.get("horizontes"),
             )
         elif isinstance(dex_d, dict) and dex_d.get("dossie_ml") and dex_d.get("daily_pack"):
             _render_streamlit_dossie_ml(
@@ -9593,6 +9550,7 @@ def main() -> None:
                 {},
                 dex_d["daily_pack"],
                 None,
+                horizontes=[],
             )
 
     with tab_apendice:
@@ -9616,6 +9574,7 @@ def main() -> None:
                 BLEND_TOP_K_FIXO,
                 RANDOM_SEED,
                 res_ap["daily_pack"],
+                horizontes=res_ap.get("horizontes"),
             )
         elif isinstance(dex_ap, dict) and dex_ap.get("daily_pack"):
             _render_streamlit_tab_apendice(
@@ -9625,6 +9584,7 @@ def main() -> None:
                 BLEND_TOP_K_FIXO,
                 RANDOM_SEED,
                 dex_ap["daily_pack"],
+                horizontes=[],
             )
 
     st.markdown(
