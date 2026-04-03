@@ -3120,6 +3120,71 @@ def _dict_google_sheets_sem_json_bruto(gs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Chaves em [google_sheets] que não são IDs de planilhas (credenciais, metadados, sub-tabelas).
+_GOOGLE_SHEETS_RESERVED_LOWER: frozenset[str] = frozenset(
+    x.lower()
+    for x in (
+        *_SERVICE_ACCOUNT_JSON_KEYS,
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "google_service_account_json",
+        "SERVICE_ACCOUNT_JSON",
+        "service_account_json",
+        "SPREADSHEET_ID",
+        "spreadsheet_id",
+        "WORKSHEET_NAME",
+        "worksheet_name",
+        "GERENTES_WORKSHEET",
+        "gerentes_worksheet",
+        "NOME_CONTA_COLUMN",
+        "nome_conta_column",
+        "VALORES_FIXOS_WORKSHEET",
+        "valores_fixos_worksheet",
+        "spreadsheet_ids",
+        "sheets",
+        "csv_gid_hints",
+    )
+)
+
+
+def service_account_from_google_sheets_section(st: Any) -> dict[str, Any] | None:
+    """
+    Leitura alinhada à **Ficha Vendas RJ**: credenciais na secção `[google_sheets]`.
+    - `SERVICE_ACCOUNT_JSON` / `service_account_json` como **dict** (TOML) ou **string** JSON;
+    - repara `private_key` com quebras literais (`_reparar_private_key_json_com_quebras_literais`);
+    - ou as mesmas chaves do JSON em linhas TOML (`type`, `client_email`, `private_key`, …).
+    """
+    try:
+        gs = st.secrets.get("google_sheets")
+    except Exception:
+        gs = None
+    if not isinstance(gs, dict):
+        return None
+    for jkey in (
+        "SERVICE_ACCOUNT_JSON",
+        "service_account_json",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "google_service_account_json",
+    ):
+        raw = gs.get(jkey)
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            if _service_account_credenciais_preenchidas(raw):
+                return raw
+            continue
+        info = _parse_service_account_json_string(_secret_str(raw))
+        if info and _service_account_credenciais_preenchidas(info):
+            return info
+    flat = _dict_google_sheets_sem_json_bruto(gs)
+    if flat.get("type") == "service_account" or (
+        str(flat.get("client_email") or "").strip()
+        and str(flat.get("private_key") or "").strip()
+    ):
+        if _service_account_credenciais_preenchidas(flat):
+            return flat
+    return None
+
+
 def try_gspread_client() -> Any | None:
     """Instancia cliente gspread a partir de credenciais no ambiente (sem Streamlit)."""
     try:
@@ -3139,12 +3204,13 @@ def try_gspread_client() -> Any | None:
 def _service_account_info_from_env() -> dict[str, Any] | None:
     import os
 
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw or not str(raw).strip():
-        return None
-    info = _parse_service_account_json_string(str(raw))
-    if info and _service_account_credenciais_preenchidas(info):
-        return info
+    for env_key in ("GOOGLE_SERVICE_ACCOUNT_JSON", "SERVICE_ACCOUNT_JSON"):
+        raw = os.environ.get(env_key)
+        if not raw or not str(raw).strip():
+            continue
+        info = _parse_service_account_json_string(str(raw))
+        if info and _service_account_credenciais_preenchidas(info):
+            return info
     return None
 
 
@@ -3185,12 +3251,22 @@ def _service_account_from_flat_streamlit_root(st: Any) -> dict[str, Any] | None:
 
 
 def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
-    """Lê JSON completo (raiz ou [google_sheets]) ou secção TOML tipo ficheiro Google Cloud."""
+    """
+    Ordem de leitura (compatível com **Ficha Vendas RJ** e deploys antigos):
+    1. `[google_sheets]` — SERVICE_ACCOUNT_JSON (dict/str), GOOGLE_*, ou chaves espelhadas do JSON;
+    2. Raiz: chaves planas `client_email` + `private_key`;
+    3. Raiz: `GOOGLE_SERVICE_ACCOUNT_JSON` ou `SERVICE_ACCOUNT_JSON` (dict/str);
+    4. Secções `google_service_account` / `gcp_service_account` / `service_account`.
+    """
     try:
         import streamlit as st
     except ImportError:
         return None
     try:
+        info_gs = service_account_from_google_sheets_section(st)
+        if info_gs:
+            return info_gs
+
         root_flat = _service_account_from_flat_streamlit_root(st)
         if root_flat:
             return root_flat
@@ -3202,26 +3278,15 @@ def service_account_info_from_streamlit_secrets() -> dict[str, Any] | None:
                 if info and _service_account_credenciais_preenchidas(info):
                     return info
 
-        gs = st.secrets.get("google_sheets")
-        if isinstance(gs, dict):
-            for jkey in (
-                "GOOGLE_SERVICE_ACCOUNT_JSON",
-                "google_service_account_json",
-                "SERVICE_ACCOUNT_JSON",
-                "service_account_json",
-            ):
-                raw = _secret_str(gs.get(jkey))
-                if raw:
-                    info = _parse_service_account_json_string(raw)
-                    if info and _service_account_credenciais_preenchidas(info):
-                        return info
-            flat = _dict_google_sheets_sem_json_bruto(gs)
-            if flat.get("type") == "service_account" or (
-                str(flat.get("client_email") or "").strip()
-                and str(flat.get("private_key") or "").strip()
-            ):
-                if _service_account_credenciais_preenchidas(flat):
-                    return flat
+        if "SERVICE_ACCOUNT_JSON" in st.secrets:
+            raw_root = st.secrets["SERVICE_ACCOUNT_JSON"]
+            if isinstance(raw_root, dict) and _service_account_credenciais_preenchidas(raw_root):
+                return raw_root
+            raw_s = _secret_str(raw_root)
+            if raw_s:
+                info = _parse_service_account_json_string(raw_s)
+                if info and _service_account_credenciais_preenchidas(info):
+                    return info
 
         for key in ("google_service_account", "gcp_service_account", "service_account"):
             if key in st.secrets:
@@ -4848,10 +4913,50 @@ div.metric-card .val {{
     )
 
 
+def _merge_spreadsheet_config_from_google_sheets(
+    ids: dict[str, str], hints: dict[str, list[str]]
+) -> None:
+    """IDs e *hints* opcionais dentro de `[google_sheets]` (mesmo padrão da Ficha: uma secção só)."""
+    try:
+        gs = st.secrets.get("google_sheets")
+    except Exception:
+        return
+    if not isinstance(gs, dict):
+        return
+    for k, v in gs.items():
+        kl = str(k).strip().lower()
+        if kl in _GOOGLE_SHEETS_RESERVED_LOWER:
+            continue
+        if k in ids and str(v).strip():
+            ids[k] = str(v).strip()
+    sid_map = gs.get("spreadsheet_ids")
+    if isinstance(sid_map, dict):
+        for k, v in dict(sid_map).items():
+            if k in ids:
+                ids[k] = str(v).strip()
+    sh_map = gs.get("sheets")
+    if isinstance(sh_map, dict):
+        for k, v in dict(sh_map).items():
+            if k not in ids:
+                continue
+            if isinstance(v, (list, tuple)) and len(v) >= 1:
+                ids[k] = str(v[0]).strip()
+                if len(v) >= 2:
+                    g = str(v[1]).strip()
+                    cur = hints.get(k, [])
+                    hints[k] = [g] + [x for x in cur if x != g]
+    gh = gs.get("csv_gid_hints")
+    if isinstance(gh, dict):
+        for k, v in dict(gh).items():
+            if k in hints and isinstance(v, list):
+                hints[k] = [str(x) for x in v]
+
+
 def _data_source_config() -> tuple[dict[str, str], dict[str, list[str]]]:
     ids = dict(DEFAULT_SPREADSHEET_IDS)
     hints = {k: list(v) for k, v in CSV_GID_HINTS.items()}
     try:
+        _merge_spreadsheet_config_from_google_sheets(ids, hints)
         if "spreadsheet_ids" in st.secrets:
             for k, v in dict(st.secrets["spreadsheet_ids"]).items():
                 if k in ids:
@@ -5997,9 +6102,12 @@ def main() -> None:
 
         with st.expander("Suporte e manutenção"):
             st.markdown(
-                "• **Secrets:** `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz **ou** `[google_sheets].GOOGLE_SERVICE_ACCOUNT_JSON` "
-                "(string multilinha com o JSON; também `SERVICE_ACCOUNT_JSON`). Alternativa: secção `google_service_account` "
-                "com as chaves do ficheiro Google Cloud. Opcionais: `spreadsheet_ids`, `sheets`, `csv_gid_hints`.\n\n"
+                "• **Secrets (Google):** prioridade **`[google_sheets]`** como na Ficha Vendas RJ — `SERVICE_ACCOUNT_JSON` "
+                "(dict TOML ou string JSON; aliases `GOOGLE_SERVICE_ACCOUNT_JSON` / `service_account_json`). "
+                "Raiz: `GOOGLE_SERVICE_ACCOUNT_JSON` ou `SERVICE_ACCOUNT_JSON`. Variável de ambiente: "
+                "`GOOGLE_SERVICE_ACCOUNT_JSON` ou `SERVICE_ACCOUNT_JSON`. "
+                "IDs de planilhas: `[spreadsheet_ids]` na raiz **ou** chaves `vendas`/`leads`/… **dentro** de `[google_sheets]`, "
+                "ou `[google_sheets.spreadsheet_ids]`. Opcional: `csv_gid_hints`.\n\n"
                 "• **Logo:** coloque `502.57_LOGO DIRECIONAL_V2F-01.png` na raiz do repositório ou defina `branding.LOGO_URL`.\n\n"
                 "• **Favicon:** `502.57_LOGO D_COR_V3F.png` na raiz."
             )
