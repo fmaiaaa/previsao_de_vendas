@@ -3999,7 +3999,7 @@ def _methodology_appendix_block(
     return f"""
     <div class="glass-card p-8 mb-8 border-l-4 border-blue-600">
       <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia e escolha de modelos</h2>
-      <div class="text-sm text-slate-700 space-y-4 leading-relaxed">
+      <div class="text-sm text-slate-700 space-y-4 leading-relaxed text-justify">
         <p><b>Formulação.</b> Para cada dia <code>t</code>, o alvo é a <b>soma de vendas (quantidade ou VGV) nos próximos <code>H</code> dias</b>, com <code>H</code> ∈ {{{hz_txt}}}. As features usam apenas informação até <code>t</code> (lags, médias móveis, calendário, STL, feriados RJ, macro BCB quando ativo, formulário com defasagem, etc.).</p>
         <p><b>Dimensão dos dados.</b> <b>{n_rows:,}</b> dias na matriz diária consolidada; <b>{n_features}</b> colunas após engenharia.</p>
         <p><b>Validação temporal.</b> {modo}</p>
@@ -4019,7 +4019,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
     html_frag = """
     <div class="glass-card p-6 mb-6">
       <h3 class="text-xl font-black text-slate-900 mb-2">Séries diárias — funil e alvos</h3>
-      <p class="text-sm text-slate-600 mb-4">Contagens do funil (empilhadas), vendas diárias em quantidade e VGV.</p>
+      <p class="text-sm text-slate-600 mb-4 text-justify">Contagens do funil (empilhadas), vendas diárias em quantidade e VGV.</p>
       <div id="an_combo" style="height:480px;width:100%;"></div>
     </div>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
@@ -4047,6 +4047,10 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         var s = Math.sqrt(v) || 1;
         return arr.map(function(x) {{ return (x - m) / s; }});
       }}
+      function xAxisRangeFromDates(ds) {{
+        if (!ds || ds.length < 2) return {{}};
+        return {{ range: [ds[0], ds[ds.length - 1]] }};
+      }}
       Plotly.newPlot('an_combo', [
         {{ x: dates, y: D.vol_leads, name: 'Leads', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(15,23,42,0.35)', type: 'scatter', mode: 'lines' }},
         {{ x: dates, y: D.vol_agend, name: 'Agend.', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(59,130,246,0.4)', type: 'scatter', mode: 'lines' }},
@@ -4058,7 +4062,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fafafa',
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
         margin: {{ t: 40, l: 52, r: 56, b: 72 }},
-        xaxis: {{ title: 'Data' }},
+        xaxis: Object.assign({{ title: 'Data' }}, xAxisRangeFromDates(dates)),
         yaxis: {{ title: 'Funil (empilhado)', gridcolor: '#e5e7eb' }},
         yaxis2: {{ overlaying: 'y', side: 'right', title: 'Qtd vendas', showgrid: false }},
         yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'VGV mi', showgrid: false }},
@@ -4103,6 +4107,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           title: 'Macro (z-score por série)',
           font: {{ family: 'Plus Jakarta Sans', size: 11 }},
           margin: {{ t: 48, l: 48, r: 28, b: 48 }},
+          xaxis: Object.assign({{}}, xAxisRangeFromDates(dates)),
           yaxis: {{ title: 'z' }}, legend: {{ orientation: 'h', y: -0.22 }}
         }}, {{ responsive: true }});
       }} else {{
@@ -4163,7 +4168,7 @@ def _build_appendix_html(
     bench_intro = """
     <div class="glass-card p-6 mb-8 border-l-4 border-indigo-500">
       <h2 class="text-xl font-black text-slate-900 mb-3">Benchmark de candidatos</h2>
-      <p class="text-sm text-slate-600 leading-relaxed">
+      <p class="text-sm text-slate-600 leading-relaxed text-justify">
         Tabelas de regressão e classificação auxiliar; ROC e barras de MAE no período de teste indicado.
         MinMaxScaler com <code>clip=True</code> em todas as pipelines.
       </p>
@@ -4375,6 +4380,11 @@ def render_dashboard(
                         var lo = Object.assign({{}}, layoutBase, {{
                             xaxis: Object.assign({{}}, layoutBase.xaxis, {{tickangle: -35}})
                         }});
+                        if (xdt.length >= 2) {{
+                            lo.xaxis = Object.assign({{}}, lo.xaxis, {{
+                                range: [xdt[0], xdt[xdt.length - 1]]
+                            }});
+                        }}
                         if (splitIdx > 0 && splitIdx < xdt.length) {{
                             var sd = xdt[splitIdx];
                             lo.shapes = [{{
@@ -4471,8 +4481,8 @@ def render_dashboard(
     }}
   </style>
 </head>
-<body class="p-4 md:p-8">
-  <div class="max-w-7xl mx-auto">
+<body class="p-3 md:p-5">
+  <div class="max-w-7xl mx-auto px-1 sm:px-2">
     <header class="glass-card p-6 mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
       <div>
         <h1 class="text-2xl md:text-3xl font-extrabold text-slate-900">Previsão de vendas</h1>
@@ -4693,6 +4703,35 @@ def _plotly_layout_direcional(
     return lo
 
 
+def _plotly_traces_hidden_until_legend_click(fig: Any) -> None:
+    """
+    Todas as séries começam ocultas; o utilizador clica nos itens da legenda para mostrá-las
+    (comportamento nativo do Plotly com visible='legendonly').
+    """
+    try:
+        if len(fig.data) > 1:
+            fig.update_traces(visible="legendonly")
+    except (AttributeError, TypeError):
+        pass
+
+
+def _plotly_xaxis_range_from_dates(dates: Any) -> list[Any] | None:
+    """Intervalo [mín, máx] das datas da série para o eixo X (sem folga além do necessário)."""
+    if not dates:
+        return None
+    try:
+        s = pd.to_datetime(pd.Series(list(dates)), errors="coerce").dropna()
+        if s.empty:
+            return None
+        t0, t1 = s.min(), s.max()
+        if t0 == t1:
+            t0 = t0 - pd.Timedelta(days=1)
+            t1 = t1 + pd.Timedelta(days=1)
+        return [t0, t1]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
@@ -4862,8 +4901,8 @@ header[data-testid="stHeader"],
   background: rgba(255, 255, 255, 0.12) !important;
 }}
 [data-testid="stMain"] {{
-  padding-left: clamp(8px, 2vw, 28px) !important;
-  padding-right: clamp(8px, 2vw, 28px) !important;
+  padding-left: clamp(4px, 1.2vw, 16px) !important;
+  padding-right: clamp(4px, 1.2vw, 16px) !important;
   padding-top: clamp(12px, 3.5vh, 40px) !important;
   padding-bottom: clamp(14px, 4vh, 44px) !important;
   box-sizing: border-box !important;
@@ -4880,7 +4919,7 @@ section.main > div {{
   margin-right: auto !important;
   margin-top: clamp(4px, 1vh, 14px) !important;
   margin-bottom: clamp(4px, 1vh, 14px) !important;
-  padding: 1.35rem clamp(0.75rem, 2.5vw, 2rem) 1.45rem clamp(0.75rem, 2.5vw, 2rem) !important;
+  padding: 1.35rem clamp(0.45rem, 1.4vw, 1.15rem) 1.45rem clamp(0.45rem, 1.4vw, 1.15rem) !important;
   background: rgba(255, 255, 255, 0.97) !important;
   backdrop-filter: blur(14px) saturate(1.2);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
@@ -4952,6 +4991,14 @@ div[data-testid="stTabs"] [aria-selected="true"] {{
 [data-testid="stMarkdownContainer"] li {{
   color: #334155 !important;
   line-height: 1.55;
+  text-align: justify;
+  text-justify: inter-word;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}}
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] p {{
+  text-align: justify;
+  text-justify: inter-word;
 }}
 [data-testid="stCaptionContainer"],
 [data-testid="stCaptionContainer"] * {{
@@ -5013,15 +5060,21 @@ div[data-baseweb="input"]:focus-within {{
   border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
   box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
 }}
-.stButton > button {{
+.stButton > button,
+div[data-testid="stButton"] > button {{
   border-radius: 12px !important;
   transition: transform 0.2s ease, box-shadow 0.2s ease !important;
 }}
-.stButton > button:hover {{
+.stButton > button:hover,
+div[data-testid="stButton"] > button:hover {{
   transform: translateY(-2px);
   box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
 }}
-.stButton > button[kind="primary"] {{
+/* Botão primário (vermelho): texto e filhos em branco (Streamlit usa p/span e baseButton-primary). */
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="baseButton-primary"],
+div[data-testid="stButton"] > button[kind="primary"],
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] {{
   background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
   color: #ffffff !important;
   border: none !important;
@@ -5033,8 +5086,44 @@ div[data-baseweb="input"]:focus-within {{
   font-size: 1rem !important;
   letter-spacing: 0.02em;
 }}
-.stButton > button[kind="primary"]:hover {{
+.stButton > button[kind="primary"] p,
+.stButton > button[kind="primary"] span,
+.stButton > button[data-testid="baseButton-primary"] p,
+.stButton > button[data-testid="baseButton-primary"] span,
+div[data-testid="stButton"] > button[kind="primary"] p,
+div[data-testid="stButton"] > button[kind="primary"] span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] span {{
+  color: #ffffff !important;
+}}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[kind="primary"]:focus,
+.stButton > button[kind="primary"]:focus-visible,
+.stButton > button[kind="primary"]:active,
+.stButton > button[data-testid="baseButton-primary"]:hover,
+.stButton > button[data-testid="baseButton-primary"]:focus,
+.stButton > button[data-testid="baseButton-primary"]:focus-visible,
+.stButton > button[data-testid="baseButton-primary"]:active,
+div[data-testid="stButton"] > button[kind="primary"]:hover,
+div[data-testid="stButton"] > button[kind="primary"]:focus,
+div[data-testid="stButton"] > button[kind="primary"]:focus-visible,
+div[data-testid="stButton"] > button[kind="primary"]:active,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus-visible,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:active {{
+  color: #ffffff !important;
   box-shadow: 0 8px 22px -6px rgba({RGB_VERMELHO_CSS}, 0.45) !important;
+}}
+.stButton > button[kind="primary"]:hover p,
+.stButton > button[kind="primary"]:hover span,
+.stButton > button[data-testid="baseButton-primary"]:hover p,
+.stButton > button[data-testid="baseButton-primary"]:hover span,
+div[data-testid="stButton"] > button[kind="primary"]:hover p,
+div[data-testid="stButton"] > button[kind="primary"]:hover span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover span {{
+  color: #ffffff !important;
 }}
 a[href*="whatsapp.com"],
 a[href*="wa.me"] {{
@@ -5307,22 +5396,6 @@ def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, An
         st.error("Não foi possível carregar todas as fontes.\n\n" + modo + "\n\n" + "\n\n".join(errors))
         st.stop()
     return out, metas, use_sa
-
-
-def _parse_previsao_int_list(s: str, *, max_val: int = 10_000) -> list[int]:
-    """Lista de inteiros positivos a partir de texto (vírgula, ponto e vírgula ou espaços)."""
-    out: list[int] = []
-    for part in re.split(r"[,;\s]+", (s or "").strip()):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            v = int(part)
-            if 0 < v <= max_val:
-                out.append(v)
-        except ValueError:
-            continue
-    return sorted(set(out))
 
 
 def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
@@ -5771,7 +5844,7 @@ def _render_tab_introducao() -> None:
 
     def _ix(html: str) -> None:
         st.markdown(
-            f'<div style="text-align:center;max-width:920px;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem">{html}</div>',
+            f'<div style="text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:920px;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem">{html}</div>',
             unsafe_allow_html=True,
         )
 
@@ -5803,16 +5876,9 @@ def _render_tab_introducao() -> None:
         "<strong>H</strong> primeiros dias da <em>série</em> imediatamente após <em>t</em> (dias efetivamente presentes no índice)."
     )
     _ix(
-        "<strong>Intervalo de calendário [d₁, d₂].</strong> <strong>Y</strong> soma vendas nos dias da série tais que "
-        "<em>t</em> &lt; data ≤ d₂ e d₁ ≤ data ≤ d₂ — útil para janelas fixas no calendário."
-    )
-    _ix(
-        "<strong>Deslocamentos k₁,…,kₘ.</strong> <strong>Y</strong> é a soma das observações nas posições <em>t + kⱼ</em> "
-        "(índice da série), não necessariamente os “primeiros H” dias consecutivos na grade."
-    )
-    _ix(
-        "<strong>Dias do mês.</strong> Escolhem-se dias D₁, D₂,… no <strong>mesmo mês</strong> que <em>t</em>, com dia do mês "
-        "&gt; dia(<em>t</em>), e somam-se as vendas nessas datas quando existirem na base."
+        "<strong>Intervalo de calendário [d₁, d₂].</strong> Na aba <strong>Previsões</strong> pode definir-se opcionalmente um "
+        "intervalo (data inicial e final); <strong>Y</strong> soma vendas nos dias da série tais que "
+        "<em>t</em> &lt; data ≤ d₂ e d₁ ≤ data ≤ d₂ — além dos horizontes fixos 3, 7 e 30 dias."
     )
     _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
     _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
@@ -6049,6 +6115,7 @@ def _render_tab_introducao() -> None:
             yaxis_title="Unidades",
         ),
     )
+    _plotly_traces_hidden_until_legend_click(fig_ser)
     st.plotly_chart(fig_ser, use_container_width=True, config=_ipc)
 
     st.markdown("#### 9 · Onde ver cada coisa nesta app")
@@ -6069,7 +6136,7 @@ def _render_tab_introducao() -> None:
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Previsões</strong></td>
 <td style="padding:8px;text-align:center">Treino Optuna, tabela de previsões, download HTML</td></tr>
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Dossiê</strong></td>
-<td style="padding:8px;text-align:center">EDA completa; métricas de modelos após <strong>Previsões</strong></td></tr>
+<td style="padding:8px;text-align:center">EDA completa; métricas e importância de <em>features</em> (sub-aba <strong>Modelos</strong>) após <strong>Previsões</strong></td></tr>
 <tr><td style="padding:8px;text-align:center"><strong>Apêndice</strong></td>
 <td style="padding:8px;text-align:center">Metodologia resumida; hiperparâmetros finais após <strong>Previsões</strong></td></tr>
 </tbody></table></div>
@@ -6082,12 +6149,93 @@ def _render_tab_introducao() -> None:
     )
 
 
+def _render_streamlit_ml_feature_importance(
+    por_h: dict[Any, dict[str, Any]],
+    plot_config: dict[str, Any],
+) -> None:
+    """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
+    import plotly.graph_objects as go
+
+    _tem_imp = any(
+        (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
+        or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
+        for h in (3, 7, 30)
+    )
+    if _tem_imp:
+        st.markdown(
+            '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
+            unsafe_allow_html=True,
+        )
+        for h in (3, 7, 30):
+            sub = por_h.get(h) or {}
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption(f"**H={h}d** — volume (quantidade)")
+                names = sub.get("qtd", {}).get("importance_names") or []
+                vals = sub.get("qtd", {}).get("importance_vals") or []
+                if names and vals:
+                    top_n = min(18, len(names))
+                    fig_i = go.Figure(
+                        go.Bar(
+                            x=vals[:top_n][::-1],
+                            y=names[:top_n][::-1],
+                            orientation="h",
+                            marker_color=PLOT_AZUL,
+                            marker_line=dict(width=0),
+                        )
+                    )
+                    fig_i.update_layout(
+                        **_plotly_layout_direcional(
+                            height=28 * top_n + 88,
+                            margin=dict(l=220, r=40, t=40, b=48),
+                            xaxis_title="Importância",
+                            showlegend=False,
+                        ),
+                    )
+                    st.plotly_chart(fig_i, use_container_width=True, config=plot_config)
+                else:
+                    st.caption("—")
+            with c2:
+                st.caption(f"**H={h}d** — VGV")
+                names = sub.get("valor", {}).get("importance_names") or []
+                vals = sub.get("valor", {}).get("importance_vals") or []
+                if names and vals:
+                    top_n = min(18, len(names))
+                    fig_iv = go.Figure(
+                        go.Bar(
+                            x=vals[:top_n][::-1],
+                            y=names[:top_n][::-1],
+                            orientation="h",
+                            marker_color=PLOT_VERMELHO,
+                            marker_line=dict(width=0),
+                        )
+                    )
+                    fig_iv.update_layout(
+                        **_plotly_layout_direcional(
+                            height=28 * top_n + 88,
+                            margin=dict(l=220, r=40, t=40, b=48),
+                            xaxis_title="Importância",
+                            showlegend=False,
+                        ),
+                    )
+                    st.plotly_chart(fig_iv, use_container_width=True, config=plot_config)
+                else:
+                    st.caption("—")
+        st.divider()
+    else:
+        st.markdown(
+            '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin-top:0.5rem">'
+            "Importância de <em>features</em> por horizonte: disponível após <strong>Gerar previsões</strong>.</p>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+
 def _render_streamlit_tab_analises(
     daily: dict[str, Any],
     stats_base: dict[str, float],
     ticket: float,
     conv: float,
-    por_h: dict[int, dict[str, Any]],
 ) -> None:
     import plotly.graph_objects as go
 
@@ -6197,8 +6345,12 @@ def _render_streamlit_tab_analises(
             hovertemplate="%{x}<br>VGV: %{y:.3f} mi R$<extra></extra>",
         )
     )
+    _lo_f = _plotly_layout_direcional(title="Funil diário (empilhado) e alvos", height=500)
+    _xr_f = _plotly_xaxis_range_from_dates(dates)
+    if _xr_f:
+        _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
     fig_f.update_layout(
-        **_plotly_layout_direcional(title="Funil diário (empilhado) e alvos", height=500),
+        **_lo_f,
         xaxis_title="Data",
         yaxis_title="Funil (empilhado)",
         yaxis2=dict(
@@ -6218,6 +6370,7 @@ def _render_streamlit_tab_analises(
             tickfont=dict(size=11),
         ),
     )
+    _plotly_traces_hidden_until_legend_click(fig_f)
     st.plotly_chart(fig_f, use_container_width=True, config=_pc)
 
     tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
@@ -6239,11 +6392,14 @@ def _render_streamlit_tab_analises(
             line=dict(color=PLOT_AZUL, width=2.8),
         )
     )
-    fig_roll.update_layout(
-        **_plotly_layout_direcional(
-            title="Vendas diárias e suavização (7 dias)", height=380, xaxis_title="Data", yaxis_title="Quantidade"
-        ),
+    _lo_roll = _plotly_layout_direcional(
+        title="Vendas diárias e suavização (7 dias)", height=380, xaxis_title="Data", yaxis_title="Quantidade"
     )
+    _xr_roll = _plotly_xaxis_range_from_dates(dates)
+    if _xr_roll:
+        _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
+    fig_roll.update_layout(**_lo_roll)
+    _plotly_traces_hidden_until_legend_click(fig_roll)
     st.plotly_chart(fig_roll, use_container_width=True, config=_pc)
 
     fig_sc = go.Figure()
@@ -6299,6 +6455,7 @@ def _render_streamlit_tab_analises(
             tickfont=dict(size=11),
         ),
     )
+    _plotly_traces_hidden_until_legend_click(fig_d)
     st.plotly_chart(fig_d, use_container_width=True, config=_pc)
 
     cl = daily.get("corr_labels") or []
@@ -6352,88 +6509,19 @@ def _render_streamlit_tab_analises(
                     line=dict(width=2),
                 )
             )
-        fig_m.update_layout(
-            **_plotly_layout_direcional(
-                title="Indicadores macro (z-score por série)",
-                height=400,
-                xaxis_title="Data",
-                yaxis_title="Desvios σ",
-                legend=dict(orientation="h", yanchor="bottom", y=-0.42, x=0.5, xanchor="center"),
-            ),
+        _lo_m = _plotly_layout_direcional(
+            title="Indicadores macro (z-score por série)",
+            height=400,
+            xaxis_title="Data",
+            yaxis_title="Desvios σ",
+            legend=dict(orientation="h", yanchor="bottom", y=-0.42, x=0.5, xanchor="center"),
         )
+        _xr_m = _plotly_xaxis_range_from_dates(dates)
+        if _xr_m:
+            _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
+        fig_m.update_layout(**_lo_m)
+        _plotly_traces_hidden_until_legend_click(fig_m)
         st.plotly_chart(fig_m, use_container_width=True, config=_pc)
-
-    _tem_imp = any(
-        (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
-        or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
-        for h in (3, 7, 30)
-    )
-    if _tem_imp:
-        st.markdown(
-            '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
-            unsafe_allow_html=True,
-        )
-        for h in (3, 7, 30):
-            sub = por_h.get(h) or {}
-            c1, c2 = st.columns(2)
-            with c1:
-                st.caption(f"**H={h}d** — volume (quantidade)")
-                names = sub.get("qtd", {}).get("importance_names") or []
-                vals = sub.get("qtd", {}).get("importance_vals") or []
-                if names and vals:
-                    top_n = min(18, len(names))
-                    fig_i = go.Figure(
-                        go.Bar(
-                            x=vals[:top_n][::-1],
-                            y=names[:top_n][::-1],
-                            orientation="h",
-                            marker_color=PLOT_AZUL,
-                            marker_line=dict(width=0),
-                        )
-                    )
-                    fig_i.update_layout(
-                        **_plotly_layout_direcional(
-                            height=28 * top_n + 88,
-                            margin=dict(l=220, r=40, t=40, b=48),
-                            xaxis_title="Importância",
-                            showlegend=False,
-                        ),
-                    )
-                    st.plotly_chart(fig_i, use_container_width=True, config=_pc)
-                else:
-                    st.caption("—")
-            with c2:
-                st.caption(f"**H={h}d** — VGV")
-                names = sub.get("valor", {}).get("importance_names") or []
-                vals = sub.get("valor", {}).get("importance_vals") or []
-                if names and vals:
-                    top_n = min(18, len(names))
-                    fig_iv = go.Figure(
-                        go.Bar(
-                            x=vals[:top_n][::-1],
-                            y=names[:top_n][::-1],
-                            orientation="h",
-                            marker_color=PLOT_VERMELHO,
-                            marker_line=dict(width=0),
-                        )
-                    )
-                    fig_iv.update_layout(
-                        **_plotly_layout_direcional(
-                            height=28 * top_n + 88,
-                            margin=dict(l=220, r=40, t=40, b=48),
-                            xaxis_title="Importância",
-                            showlegend=False,
-                        ),
-                    )
-                    st.plotly_chart(fig_iv, use_container_width=True, config=_pc)
-                else:
-                    st.caption("—")
-    else:
-        st.markdown(
-            '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin-top:0.5rem">'
-            "Importância de <em>features</em> por horizonte: disponível após <strong>Gerar previsões</strong>.</p>",
-            unsafe_allow_html=True,
-        )
 
 
 def _render_streamlit_tab_apendice(
@@ -6463,7 +6551,7 @@ def _render_streamlit_tab_apendice(
             f"""
 #### Resumo executivo
 
-- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem). Pode ainda definir-se um **intervalo de calendário** ou **dias combinados** na aba Previsões.
+- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem). Opcionalmente, na aba **Previsões**, pode definir-se um **intervalo de calendário** (data inicial e final) para treinar um cenário extra.
 - **Dados:** **{daily.get("n_rows", 0):,}** observações diárias na matriz consolidada; **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Otimização:** LightGBM via **Optuna** (TPE + **MedianPruner**) com **TimeSeriesSplit**; espaço de busca **encolhe** com poucos dados; o objetivo penaliza **instabilidade entre folds** (MAE + variância + dispersão), favorecendo soluções que generalizam no tempo. Semente **{random_seed}**.
@@ -6529,7 +6617,7 @@ def _render_streamlit_dossie_ml(
     _dpc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
 
     st.markdown(
-        "<div style='text-align:center;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
+        "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
         "<strong>Análise e modelagem</strong> — estatísticas descritivas, outliers (IQR), correlações, VIF, "
         "balanceamento, distribuições e notas sobre dados e <em>overfitting</em>.</div>",
         unsafe_allow_html=True,
@@ -6769,6 +6857,7 @@ def _render_streamlit_dossie_ml(
             st.plotly_chart(fig_b, use_container_width=True, config=_dpc)
 
     with td5:
+        _render_streamlit_ml_feature_importance(por_h, _dpc)
         st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
         st.markdown(
             "**Acurácia dir. (mediana)** = fração de dias de teste em que o modelo acerta se o alvo está "
@@ -6853,66 +6942,6 @@ def _render_streamlit_dossie_ml(
             st.caption("Sem cenário personalizado nesta execução.")
 
 
-@st.dialog("Intervalo e cenário de previsão", width="large")
-def _dialog_previsao_personalizada() -> None:
-    from datetime import date, timedelta
-
-    st.markdown(
-        "Defina um **intervalo no calendário** (soma das vendas nos dias da série dentro desse período, "
-        "estritamente após cada data de referência) ou use o modo **avançado** (dias t+k ou dias do mês)."
-    )
-    t_cal, t_adv = st.tabs(["Calendário", "Avançado"])
-    with t_cal:
-        today = date.today()
-        d1 = st.date_input("Data inicial do intervalo", value=today, key="pvdlg_d1")
-        d2 = st.date_input(
-            "Data final do intervalo",
-            value=today + timedelta(days=7),
-            key="pvdlg_d2",
-        )
-        if st.button("Aplicar intervalo", type="primary", key="pvdlg_apply_range"):
-            a, b = (d1, d2) if d1 <= d2 else (d2, d1)
-            st.session_state["pv_custom_cfg"] = {
-                "mode": "range",
-                "date_start": a.isoformat(),
-                "date_end": b.isoformat(),
-            }
-            st.rerun()
-    with t_adv:
-        mode_custom = st.radio(
-            "Tipo de soma",
-            [
-                "Deslocamento: soma em t + k dias",
-                "Dias do mês: mesmo mês, após o dia corrente",
-            ],
-            key="pvdlg_mode_adv",
-        )
-        txt = st.text_input(
-            "Valores separados por vírgula ou espaço",
-            placeholder="Ex.: 7, 14, 15",
-            key="pvdlg_vals_adv",
-        )
-        st.caption(
-            "Ex.: último dia = dia 3 e quer os dias 7, 14 e 15 **do mesmo mês** → segundo modo. "
-            "Para **t+7, t+14** → primeiro modo."
-        )
-        if st.button("Aplicar avançado", type="primary", key="pvdlg_apply_adv"):
-            vals_c: list[int] = []
-            if txt and txt.strip():
-                if mode_custom.startswith("Deslocamento"):
-                    vals_c = _parse_previsao_int_list(txt, max_val=400)
-                else:
-                    vals_c = [v for v in _parse_previsao_int_list(txt, max_val=31) if v <= 31]
-            if vals_c:
-                st.session_state["pv_custom_cfg"] = {
-                    "mode": "offsets" if mode_custom.startswith("Deslocamento") else "dom",
-                    "values": vals_c,
-                }
-                st.rerun()
-            else:
-                st.warning("Indique pelo menos um número válido.")
-
-
 def main() -> None:
     fav = _resolver_png_raiz(FAVICON_ARQUIVO)
     st.set_page_config(
@@ -6935,8 +6964,6 @@ def main() -> None:
 
     if "resultado" not in st.session_state:
         st.session_state.resultado = None
-    if "pv_custom_cfg" not in st.session_state:
-        st.session_state.pv_custom_cfg = None
     if "dados_exploratorios" not in st.session_state:
         st.session_state.dados_exploratorios = None
 
@@ -6953,110 +6980,88 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div style='text-align:center;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "Sempre são treinados os horizontes <strong>3, 7 e 30 dias</strong>. Opcionalmente, abra o diálogo para um "
-            "<strong>intervalo de calendário</strong> ou <strong>dias combinados</strong> (t+k ou dias do mês).</div>",
+            "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
+            "Sempre são treinados os horizontes <strong>3, 7 e 30 dias</strong>. Opcionalmente, indique <strong>dia inicial</strong> e "
+            "<strong>dia final</strong> para treinar também um modelo cuja soma-alvo corresponde a esse intervalo no calendário.</div>",
             unsafe_allow_html=True,
         )
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            if st.button(
-                "Intervalo de previsão",
-                use_container_width=True,
-                key="pv_open_dlg",
-            ):
-                _dialog_previsao_personalizada()
-        with r2:
-            if st.button(
-                "Limpar cenário opcional",
-                use_container_width=True,
-                key="pv_clear_cfg",
-            ):
-                st.session_state["pv_custom_cfg"] = None
-                st.rerun()
-        with r3:
-            if st.button(
-                "Limpar cache das planilhas",
-                use_container_width=True,
-                key="pv_clear_cache",
-            ):
-                _load_one_role_cached.clear()
-                st.success("Cache limpo. Volte a carregar dados ou gerar previsões.")
-
-        cfg = st.session_state.get("pv_custom_cfg")
-        if isinstance(cfg, dict) and cfg.get("mode"):
-            if str(cfg.get("mode")) == "range" and cfg.get("date_start") and cfg.get("date_end"):
-                st.success(
-                    f"Cenário ativo: **intervalo** {cfg.get('date_start')} → {cfg.get('date_end')}"
-                )
-            elif cfg.get("values"):
-                st.markdown(
-                    f"<div style='text-align:center;color:#0f172a;font-size:0.92rem'>Cenário ativo: "
-                    f"<strong>{cfg.get('mode')}</strong> — {', '.join(str(x) for x in cfg['values'])}</div>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.markdown(
-                "<p style='text-align:center;color:#64748b;font-size:0.88rem'>"
-                "Horizontes fixos 3 / 7 / 30 dias. Opcional: <strong>Intervalo de previsão</strong>.</p>",
-                unsafe_allow_html=True,
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            d_ini = st.date_input(
+                "Dia inicial do intervalo (opcional)",
+                value=None,
+                key="pv_interval_start",
             )
+        with ic2:
+            d_fim = st.date_input(
+                "Dia final do intervalo (opcional)",
+                value=None,
+                key="pv_interval_end",
+            )
+        if d_ini is not None and d_fim is not None:
+            a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+            st.success(
+                f"Cenário extra por intervalo: **{a.isoformat()}** → **{b.isoformat()}** (além dos horizontes 3, 7 e 30 dias)."
+            )
+        elif d_ini is None and d_fim is None:
+            st.caption(
+                "Sem intervalo opcional: apenas horizontes **3, 7 e 30** dias. No fim da página pode **limpar o cenário** ou **limpar o cache** das planilhas."
+            )
+        else:
+            st.warning("Preencha **dia inicial e dia final** ou deixe os **dois** em branco.")
 
         run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
 
         if run_btn:
-            with st.spinner("A carregar e analisar as planilhas…"):
-                dfs, sheet_metas, used_sa = build_data_bundle()
-            st.session_state["sheet_metas"] = sheet_metas
-            st.session_state["used_service_account"] = used_sa
-            try:
-                custom_previsao = None
-                cfg_run = st.session_state.get("pv_custom_cfg")
-                if isinstance(cfg_run, dict):
-                    m = str(cfg_run.get("mode") or "")
-                    if m == "range":
-                        ds0, de0 = cfg_run.get("date_start"), cfg_run.get("date_end")
-                        if ds0 and de0:
-                            custom_previsao = {
-                                "mode": "range",
-                                "date_start": str(ds0),
-                                "date_end": str(de0),
-                            }
-                    elif m in ("offsets", "dom") and cfg_run.get("values"):
-                        custom_previsao = {"mode": m, "values": list(cfg_run["values"])}
-                with st.spinner(
-                    "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
-                ):
-                    (
-                        stats_base,
-                        ticket,
-                        conv,
-                        por_h,
-                        bpp,
-                        html_out,
-                        daily_pack,
-                        dossie_ml,
-                        por_custom,
-                    ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
-                st.session_state.resultado = {
-                    "stats_base": stats_base,
-                    "ticket": ticket,
-                    "conv": conv,
-                    "por_h": por_h,
-                    "best_params_preview": bpp,
-                    "html": html_out,
-                    "daily_pack": daily_pack,
-                    "dossie_ml": dossie_ml,
-                    "por_custom": por_custom,
-                    "full_train": FULL_PERIOD_TRAIN_FIXO,
-                    "sheet_metas": sheet_metas,
-                    "used_sa": used_sa,
-                }
-                st.success("Previsões geradas com sucesso.")
-                st.session_state.dados_exploratorios = None
-            except Exception as e:
-                st.error(f"Erro na execução: {e}")
-                st.exception(e)
+            if (d_ini is None) ^ (d_fim is None):
+                st.error("Intervalo incompleto: defina **ambas** as datas ou deixe as duas em branco antes de gerar previsões.")
+            else:
+                with st.spinner("A carregar e analisar as planilhas…"):
+                    dfs, sheet_metas, used_sa = build_data_bundle()
+                st.session_state["sheet_metas"] = sheet_metas
+                st.session_state["used_service_account"] = used_sa
+                try:
+                    custom_previsao = None
+                    if d_ini is not None and d_fim is not None:
+                        a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+                        custom_previsao = {
+                            "mode": "range",
+                            "date_start": a.isoformat(),
+                            "date_end": b.isoformat(),
+                        }
+                    with st.spinner(
+                        "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
+                    ):
+                        (
+                            stats_base,
+                            ticket,
+                            conv,
+                            por_h,
+                            bpp,
+                            html_out,
+                            daily_pack,
+                            dossie_ml,
+                            por_custom,
+                        ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
+                    st.session_state.resultado = {
+                        "stats_base": stats_base,
+                        "ticket": ticket,
+                        "conv": conv,
+                        "por_h": por_h,
+                        "best_params_preview": bpp,
+                        "html": html_out,
+                        "daily_pack": daily_pack,
+                        "dossie_ml": dossie_ml,
+                        "por_custom": por_custom,
+                        "full_train": FULL_PERIOD_TRAIN_FIXO,
+                        "sheet_metas": sheet_metas,
+                        "used_sa": used_sa,
+                    }
+                    st.success("Previsões geradas com sucesso.")
+                    st.session_state.dados_exploratorios = None
+                except Exception as e:
+                    st.error(f"Erro na execução: {e}")
+                    st.exception(e)
 
         res = st.session_state.resultado
         if res is None:
@@ -7196,6 +7201,24 @@ def main() -> None:
                 "As métricas de erro seguem o esquema temporal do pipeline (ver Apêndice). O HTML inclui benchmark completo e curvas ROC da tarefa binária auxiliar."
             )
 
+        st.divider()
+        if st.button(
+            "Limpar cenário opcional",
+            use_container_width=True,
+            key="pv_clear_cfg",
+        ):
+            for _k in ("pv_interval_start", "pv_interval_end"):
+                st.session_state.pop(_k, None)
+            st.session_state.pop("pv_custom_cfg", None)
+            st.rerun()
+        if st.button(
+            "Limpar cache das planilhas",
+            use_container_width=True,
+            key="pv_clear_cache",
+        ):
+            _load_one_role_cached.clear()
+            st.success("Cache limpo. Volte a carregar dados ou gerar previsões.")
+
     with tab_analises:
         st.markdown(
             '<p class="pv-section-title">Análises exploratórias sobre os seus dados</p>',
@@ -7212,20 +7235,16 @@ def main() -> None:
         res_a = st.session_state.resultado
         dex_a = st.session_state.get("dados_exploratorios")
         fonte_a: dict[str, Any] | None = None
-        por_h_a: dict[int, dict[str, Any]] = {}
         if res_a and res_a.get("daily_pack"):
             fonte_a = res_a
-            por_h_a = res_a.get("por_h") or {}
         elif isinstance(dex_a, dict) and dex_a.get("daily_pack"):
             fonte_a = dex_a
-            por_h_a = {}
         if fonte_a:
             _render_streamlit_tab_analises(
                 fonte_a["daily_pack"],
                 fonte_a["stats_base"],
                 fonte_a["ticket"],
                 fonte_a["conv"],
-                por_h_a,
             )
 
     with tab_dossie:
