@@ -2237,6 +2237,9 @@ def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
         [
             ["valor", "real", "venda"],
             ["valor", "real"],
+            ["vgv", "real"],
+            ["valor", "venda"],
+            ["vgv"],
         ],
     )
     if c_val is None:
@@ -2752,24 +2755,58 @@ def _inject_ts_and_stl_features(
         df_master[f"ts_stl_seasamp_{short}"] = seas_amp
 
 
-def _find_val_col_no_qtd(df: pd.DataFrame, parts: list[str]) -> str | None:
-    """Coluna de valor (VGV) nas colunas 'Vendas ...' sem 'qtd' no nome."""
-    for col in df.columns:
-        c = str(col)
-        if "qtd" in c:
-            continue
-        if all(p in c for p in parts):
-            return col
+def _find_formulario_vgv_col(
+    df: pd.DataFrame,
+    alternatives: list[list[str]],
+    *,
+    used: set[str],
+) -> str | None:
+    """
+    Coluna numérica de VGV no formulário (exclui colunas cujo nome sugere quantidade).
+    Tenta várias convenções de cabeçalho: muitas folhas usam 'vgv' em vez de 'vendas'.
+    """
+    for parts in alternatives:
+        for col in df.columns:
+            if col in used:
+                continue
+            c = str(col)
+            if "qtd" in c:
+                continue
+            if all(p in c for p in parts):
+                used.add(col)
+                return col
     return None
 
 
-def _find_qtd_col(df: pd.DataFrame, parts: list[str]) -> str | None:
+def _find_qtd_col(
+    df: pd.DataFrame,
+    parts: list[str],
+    *,
+    used: set[str] | None = None,
+) -> str | None:
     for col in df.columns:
+        if used is not None and col in used:
+            continue
         c = str(col)
         if "qtd" not in c:
             continue
         if all(p in c for p in parts):
+            if used is not None:
+                used.add(col)
             return col
+    return None
+
+
+def _find_formulario_qtd_col(
+    df: pd.DataFrame,
+    alternatives: list[list[str]],
+    *,
+    used: set[str],
+) -> str | None:
+    for parts in alternatives:
+        c = _find_qtd_col(df, parts, used=used)
+        if c is not None:
+            return c
     return None
 
 
@@ -2803,14 +2840,90 @@ def build_formulario_weekly_aggregates(df: pd.DataFrame) -> pd.DataFrame:
             f"Colunas disponíveis: {list(df.columns)[:35]}"
         )
 
-    val_prev_fac = _find_val_col_no_qtd(df, ["vendas", "facilitadas", "previstas"])
-    val_prev_norm = _find_val_col_no_qtd(df, ["vendas", "normais", "previstas"])
-    val_real_fac = _find_val_col_no_qtd(df, ["vendas", "facilitadas", "reais"])
-    val_real_norm = _find_val_col_no_qtd(df, ["vendas", "normais", "reais"])
-    q_prev_fac = _find_qtd_col(df, ["facilitadas", "previstas"])
-    q_prev_norm = _find_qtd_col(df, ["normais", "previstas"])
-    q_real_fac = _find_qtd_col(df, ["facilitadas", "reais"])
-    q_real_norm = _find_qtd_col(df, ["normais", "reais"])
+    used_v: set[str] = set()
+    val_prev_fac = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "facilitadas", "previstas"],
+            ["vgv", "facilitadas", "previstas"],
+            ["valor", "facilitadas", "previstas"],
+            ["facilitadas", "previstas", "vgv"],
+            ["facilitadas", "previstas"],
+        ],
+        used=used_v,
+    )
+    val_prev_norm = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "normais", "previstas"],
+            ["vgv", "normais", "previstas"],
+            ["valor", "normais", "previstas"],
+            ["normais", "previstas", "vgv"],
+            ["normais", "previstas"],
+        ],
+        used=used_v,
+    )
+    val_real_fac = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "facilitadas", "reais"],
+            ["vendas", "facilitadas", "real"],
+            ["vgv", "facilitadas", "reais"],
+            ["facilitadas", "reais", "vgv"],
+            ["facilitadas", "reais"],
+            ["facilitadas", "realizado"],
+            ["facilitadas", "realizada"],
+        ],
+        used=used_v,
+    )
+    val_real_norm = _find_formulario_vgv_col(
+        df,
+        [
+            ["vendas", "normais", "reais"],
+            ["vendas", "normais", "real"],
+            ["vgv", "normais", "reais"],
+            ["normais", "reais", "vgv"],
+            ["normais", "reais"],
+            ["normais", "realizado"],
+            ["normais", "realizada"],
+        ],
+        used=used_v,
+    )
+    used_q: set[str] = set()
+    q_prev_fac = _find_formulario_qtd_col(
+        df,
+        [
+            ["facilitadas", "previstas"],
+            ["facilitada", "prevista"],
+        ],
+        used=used_q,
+    )
+    q_prev_norm = _find_formulario_qtd_col(
+        df,
+        [
+            ["normais", "previstas"],
+            ["normal", "prevista"],
+        ],
+        used=used_q,
+    )
+    q_real_fac = _find_formulario_qtd_col(
+        df,
+        [
+            ["facilitadas", "reais"],
+            ["facilitadas", "real"],
+            ["facilitada", "real"],
+        ],
+        used=used_q,
+    )
+    q_real_norm = _find_formulario_qtd_col(
+        df,
+        [
+            ["normais", "reais"],
+            ["normais", "real"],
+            ["normal", "real"],
+        ],
+        used=used_q,
+    )
 
     dref = _to_day(df[ref_c])
     base = pd.DataFrame({"_ref": dref})
@@ -3651,6 +3764,39 @@ def _json_safe(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _numeric_series_for_corr_picker(df: pd.DataFrame, *, max_cols: int = 120) -> dict[str, list[float]]:
+    """Colunas numéricas alinhadas ao índice diário (para dispersão e correlação entre qualquer par na UI)."""
+    if df is None or len(df) == 0:
+        return {}
+    n = len(df)
+    cols: list[Any] = []
+    seen: set[str] = set()
+    for c in df.select_dtypes(include=[np.number]).columns:
+        key = str(c).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        cols.append(c)
+        if len(cols) >= max_cols:
+            break
+    out: dict[str, list[float]] = {}
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        vals: list[float] = []
+        for v in s.to_numpy():
+            try:
+                if pd.isna(v):
+                    vals.append(float("nan"))
+                else:
+                    fv = float(v)
+                    vals.append(fv if math.isfinite(fv) else float("nan"))
+            except (TypeError, ValueError):
+                vals.append(float("nan"))
+        if len(vals) == n:
+            out[str(c)] = vals
+    return out
+
+
 def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
     """Séries agregadas para gráficos (HTML + Streamlit); evita expor matriz completa de features."""
     if df is None or len(df) == 0:
@@ -3671,6 +3817,7 @@ def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
             "corr_z": [],
             "n_rows": 0,
             "n_features": 0,
+            "numeric_series_for_picker": {},
         }
     idx = pd.DatetimeIndex(df.index)
     dates = [d.strftime("%Y-%m-%d") for d in idx]
@@ -3705,8 +3852,10 @@ def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
             "target_valor",
         )
         or str(c).startswith("macro_")
+        or str(c).startswith("fb_vgv_")
+        or str(c).startswith("fb_qtd_")
     ]
-    num_cols = num_cols[:35]
+    num_cols = num_cols[:40]
     corr_labels: list[str] = []
     corr_z: list[list[float]] = []
     if len(num_cols) >= 2:
@@ -3732,7 +3881,406 @@ def _daily_pack_from_master(df: pd.DataFrame) -> dict[str, Any]:
         "corr_z": corr_z,
         "n_rows": int(len(df)),
         "n_features": int(df.shape[1]),
+        "numeric_series_for_picker": _numeric_series_for_corr_picker(df),
     }
+
+
+def _openai_key_and_model() -> tuple[str | None, str]:
+    key: str | None = None
+    model = "gpt-4o-mini"
+    try:
+        import streamlit as st
+
+        if hasattr(st, "secrets"):
+            raw = st.secrets.get("OPENAI_API_KEY")
+            if raw:
+                key = str(raw).strip() or None
+            oa = st.secrets.get("openai")
+            if isinstance(oa, dict):
+                if not key and oa.get("api_key"):
+                    key = str(oa["api_key"]).strip() or None
+                if oa.get("model"):
+                    model = str(oa["model"]).strip() or model
+    except Exception:
+        pass
+    import os
+
+    if not key:
+        envk = os.environ.get("OPENAI_API_KEY", "").strip()
+        key = envk or None
+    env_m = os.environ.get("OPENAI_MODEL", "").strip()
+    if env_m:
+        model = env_m
+    return key, model
+
+
+def _openai_chat_completion(
+    messages: list[dict[str, str]],
+    *,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    timeout: int = 75,
+) -> str | None:
+    import json
+    import urllib.error
+    import urllib.request
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 900,
+        "temperature": 0.35,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return None
+
+
+def _pearson_r_vectors(a: list[Any], b: list[Any]) -> float | None:
+    if len(a) != len(b) or len(a) < 3:
+        return None
+    x = np.asarray(a, dtype=float)
+    y = np.asarray(b, dtype=float)
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+        return None
+    sx = float(np.std(x))
+    sy = float(np.std(y))
+    if sx < 1e-12 or sy < 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _pearson_pairwise_complete(x: list[Any], y: list[Any]) -> tuple[float | None, int]:
+    """Pearson em pares (xᵢ, yᵢ) com ambos finitos; ignora NaN. Devolve (r, n_válido)."""
+    if len(x) != len(y):
+        return None, 0
+    xs: list[float] = []
+    ys: list[float] = []
+    for a, b in zip(x, y):
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fa) and math.isfinite(fb):
+            xs.append(fa)
+            ys.append(fb)
+    n = len(xs)
+    if n < 3:
+        return None, n
+    xa = np.asarray(xs, dtype=float)
+    ya = np.asarray(ys, dtype=float)
+    if float(np.std(xa)) < 1e-12 or float(np.std(ya)) < 1e-12:
+        return None, n
+    return float(np.corrcoef(xa, ya)[0, 1]), n
+
+
+def _corr_pairs_sorted(labels: list[str], z: list[list[float]]) -> list[tuple[str, str, float]]:
+    n = len(labels)
+    if n < 2 or len(z) != n or any(len(row) != n for row in z):
+        return []
+    out: list[tuple[str, str, float]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            r = z[i][j]
+            if isinstance(r, (int, float)) and math.isfinite(float(r)):
+                out.append((str(labels[i]), str(labels[j]), float(r)))
+    out.sort(key=lambda t: abs(t[2]), reverse=True)
+    return out
+
+
+def _interpret_text_funil_vendas(daily: dict[str, Any]) -> str:
+    tq = daily.get("target_qtd") or []
+    if len(tq) < 10:
+        return ""
+    n = len(tq)
+    k = max(1, min(n // 5, 90))
+    first = float(np.mean(np.asarray(tq[:k], dtype=float)))
+    last = float(np.mean(np.asarray(tq[-k:], dtype=float)))
+    if first < 1e-9:
+        return ""
+    chg = (last - first) / first * 100.0
+    return (
+        f"Em média, a quantidade vendida nos primeiros ~{k} dias da série foi {first:,.1f}; "
+        f"já nos últimos ~{k} dias, fixou-se em {last:,.1f}, o que representa {chg:+.1f}% face ao início. "
+        f"Assim, o gráfico permite confrontar, no tempo, os picos do funil com o comportamento das vendas e do VGV."
+    )
+
+
+def _interpret_text_rolagem_7d(daily: dict[str, Any]) -> str:
+    tq = daily.get("target_qtd") or []
+    if len(tq) < 14:
+        return ""
+    s = pd.to_numeric(pd.Series(tq), errors="coerce").fillna(0.0)
+    roll = s.rolling(7, min_periods=1).mean()
+    last = float(roll.iloc[-1])
+    if len(roll) >= 30:
+        prev = float(roll.iloc[-30])
+        d = last - prev
+        return (
+            f"A média móvel de 7 dias no último dia regista {last:,.1f} unidades; por comparação, há cerca de "
+            f"30 observações o valor situava-se em {prev:,.1f}, pelo que a variação é de {d:+,.1f}. "
+            f"Deste modo, a curva suavizada atenua o ruído de curto prazo sem ocultar a tendência."
+        )
+    return (
+        f"No último dia, a média móvel de 7 dias é de {last:,.1f} unidades; todavia, a série é curta demais "
+        f"para uma comparação fiável com janelas mais longas."
+    )
+
+
+def _interpret_text_leads_vendas(daily: dict[str, Any]) -> str:
+    x = daily.get("vol_leads") or []
+    y = daily.get("target_qtd") or []
+    r = _pearson_r_vectors(x, y)
+    if r is None:
+        return (
+            "No cruzamento leads × vendas (mesmo dia), a amostra é insuficiente ou apresenta variância nula; "
+            "por conseguinte, o coeficiente de Pearson não é estimável de forma robusta."
+        )
+    qual = "fraca"
+    if abs(r) >= 0.5:
+        qual = "moderada"
+    if abs(r) >= 0.75:
+        qual = "forte"
+    sinal = "positiva" if r > 0 else "negativa"
+    return (
+        f"A correlação de Pearson, no mesmo dia, é r = {r:+.2f}, o que corresponde a uma associação linear {qual} e {sinal}. "
+        f"Contudo, tal medida não implica relação causal: efeitos defasados, sazonalidade ou variáveis confundidoras "
+        f"podem explicar parte do padrão observado."
+    )
+
+
+def _interpret_text_dow(daily: dict[str, Any]) -> str:
+    dl = daily.get("dow_labels") or []
+    dq = daily.get("dow_mean_qtd") or []
+    dv = daily.get("dow_mean_valor") or []
+    if len(dl) != len(dq) or not dq:
+        return ""
+    dq_f = [float(x) for x in dq]
+    imax = int(np.argmax(dq_f))
+    imin = int(np.argmin(dq_f))
+    parts = [
+        f"No perfil semanal, a maior média de quantidade verifica-se à {dl[imax]} ({dq_f[imax]:,.1f}), "
+        f"ao passo que o menor nível médio ocorre à {dl[imin]} ({dq_f[imin]:,.1f})."
+    ]
+    if len(dv) == len(dl):
+        dv_f = [float(v) for v in dv]
+        jmax = int(np.argmax(dv_f))
+        parts.append(
+            f"Relativamente ao VGV, o maior valor médio ocorre à {dl[jmax]} (R$ {dv_f[jmax]/1e6:.2f} mi)."
+        )
+    return " ".join(parts)
+
+
+def _interpret_text_correlation_matrix(labels: list[str], z: list[list[float]]) -> str:
+    pairs = _corr_pairs_sorted(labels, z)
+    if not pairs:
+        return ""
+    strong = [p for p in pairs if abs(p[2]) >= 0.7][:8]
+    pos = sorted((p for p in pairs if p[2] > 0), key=lambda t: t[2], reverse=True)[:5]
+    neg = sorted((p for p in pairs if p[2] < 0), key=lambda t: t[2])[:5]
+    chunks: list[str] = []
+    if strong:
+        chunks.append(
+            "Registam-se associações lineares fortes (|r| ≥ 0,70), nomeadamente: "
+            + "; ".join(f"{a} ↔ {b} ({r:+.2f})" for a, b, r in strong)
+            + "."
+        )
+    pos_f = [p for p in pos if p[2] >= 0.25]
+    if pos_f:
+        chunks.append(
+            "Além disso, as correlações positivas mais marcadas são as seguintes: "
+            + "; ".join(f"{a}–{b}: {r:+.2f}" for a, b, r in pos_f)
+            + "."
+        )
+    neg_f = [p for p in neg if p[2] <= -0.25]
+    if neg_f:
+        chunks.append(
+            "Por outro lado, destacam-se estas associações negativas: "
+            + "; ".join(f"{a}–{b}: {r:+.2f}" for a, b, r in neg_f)
+            + "."
+        )
+    near = [p for p in pairs if abs(p[2]) < 0.15][:3]
+    if near and len(labels) > 4:
+        chunks.append(
+            "Há ainda pares com correlação quase nula (por exemplo, "
+            + ", ".join(f"{a}–{b} ({r:+.2f})" for a, b, r in near)
+            + "), o que sugere pouca ligação linear direta entre essas variáveis nesta amostra."
+        )
+    chunks.append(
+        "Em suma, o coeficiente de Pearson quantifica apenas a tendência linear simultânea; "
+        "não evidencia, por si só, relações causais nem efeitos com desfasamento temporal."
+    )
+    return " ".join(x for x in chunks if x)
+
+
+def _interpret_text_macro(macro: dict[str, Any]) -> str:
+    keys = [k for k in macro.keys() if isinstance(macro.get(k), list)][:12]
+    if len(keys) < 2:
+        return ""
+    lengths = [len(macro[k]) for k in keys]
+    m = min(lengths)
+    if m < 6:
+        return ""
+    mat = np.array([[float(macro[k][i] or 0.0) for k in keys] for i in range(m)], dtype=float)
+    cm = np.corrcoef(mat.T)
+    pair_list: list[tuple[str, str, float]] = []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            r = float(cm[i, j])
+            if math.isfinite(r):
+                pair_list.append((str(keys[i]), str(keys[j]), r))
+    pair_list.sort(key=lambda t: abs(t[2]), reverse=True)
+    top = pair_list[:5]
+    if not top:
+        return ""
+    return (
+        "Entre os indicadores macro, calculadas sobre o mesmo período e nos níveis originais, "
+        "as correlações mais elevadas são: "
+        + "; ".join(f"{a} ↔ {b}: {r:+.2f}" for a, b, r in top)
+        + ". Observe que, no gráfico, as séries são normalizadas em z-score unicamente para facilitar "
+        "a comparação da forma temporal, sem alterar a estrutura de correlação acima referida."
+    )
+
+
+def _interpret_text_vif_rows(vifs: list[Any]) -> str:
+    if not vifs:
+        return ""
+    scored: list[tuple[str, float]] = []
+    for r in vifs:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("variavel", "")) or "?"
+        try:
+            vf = float(r.get("vif"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(vf) and vf >= 5.0:
+            scored.append((name, vf))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    if not scored:
+        return (
+            "Neste subconjunto, nenhuma variável apresenta VIF ≥ 5; assim, há pouca evidência estatística "
+            "de redundância linear acentuada entre as colunas consideradas."
+        )
+    top = scored[:8]
+    return (
+        "Identificam-se variáveis com VIF elevado (≥ 5), entre as quais: "
+        + "; ".join(f"{n} (~{v:.1f})" for n, v in top)
+        + ". Isto indica dependência linear relevante face a outras *features*; consequentemente, "
+        "convém interpretar importâncias e coeficientes com prudência, sobretudo em modelos lineares."
+    )
+
+
+def _facts_corr_vif_for_llm(
+    labels: list[str], z: list[list[float]], vifs: list[Any]
+) -> str:
+    chunks: list[str] = []
+    if len(labels) >= 2 and z:
+        t = _interpret_text_correlation_matrix(labels, z)
+        if t:
+            chunks.append(t)
+    tv = _interpret_text_vif_rows(vifs)
+    if tv:
+        chunks.append(tv)
+    return "\n".join(chunks)
+
+
+def _facts_eda_compact(daily: dict[str, Any]) -> str:
+    lines = [
+        _interpret_text_funil_vendas(daily),
+        _interpret_text_rolagem_7d(daily),
+        _interpret_text_leads_vendas(daily),
+        _interpret_text_dow(daily),
+    ]
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        lines.append(_interpret_text_correlation_matrix(cl, cz))
+    lines.append(_interpret_text_macro(daily.get("macro") or {}))
+    return "\n".join(x for x in lines if x)
+
+
+def _openai_eda_synopsis(facts: str) -> str | None:
+    key, model = _openai_key_and_model()
+    if not key or not facts.strip():
+        return None
+    sys_m = (
+        "Assume o papel de analista de dados sénior. Redige em português (Brasil), com 2 a 4 parágrafos curtos, "
+        "tom profissional e conectivos adequados (por exemplo: contudo, além disso, neste contexto, em suma, assim). "
+        "Utiliza exclusivamente os factos fornecidos; não inventes quantidades nem conclusões não suportadas. "
+        "Referencia explicitamente que correlação não implica causalidade e que as vendas podem reagir com defasagem "
+        "a variáveis explicativas."
+    )
+    return _openai_chat_completion(
+        [
+            {"role": "system", "content": sys_m},
+            {
+                "role": "user",
+                "content": "Elabore uma síntese profissional para gestão, com base nos indicadores abaixo. "
+                "Utilize conectivos adequados e estruture a resposta de forma lógica:\n\n" + facts.strip(),
+            },
+        ],
+        api_key=key,
+        model=model,
+    )
+
+
+def _html_eda_interpretacoes(daily: dict[str, Any]) -> str:
+    blocks: list[tuple[str, str]] = [
+        ("Funil e vendas", _interpret_text_funil_vendas(daily)),
+        ("Suavização 7 dias", _interpret_text_rolagem_7d(daily)),
+        ("Leads × vendas (dispersão)", _interpret_text_leads_vendas(daily)),
+        ("Dia da semana", _interpret_text_dow(daily)),
+    ]
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        blocks.append(("Matriz de correlação", _interpret_text_correlation_matrix(cl, cz)))
+    mx = _interpret_text_macro(daily.get("macro") or {})
+    if mx:
+        blocks.append(("Indicadores macro", mx))
+    parts: list[str] = []
+    for title, body in blocks:
+        if not body:
+            continue
+        parts.append(
+            f'<h5 class="font-semibold text-slate-800 text-sm mt-3 mb-1">{html_lib.escape(title)}</h5>'
+            f'<p class="text-sm text-slate-600 text-justify leading-relaxed">{html_lib.escape(body)}</p>'
+        )
+    if not parts:
+        return ""
+    foot = html_lib.escape(
+        "Nota metodológica: as interpretações são geradas automaticamente com base em regras e estatística descritiva; "
+        "o relatório HTML permanece autónomo, isto é, não recorre a serviços de API externos."
+    )
+    return (
+        '<div class="glass-card p-6 mb-6 border-l-4 border-sky-500">'
+        '<h4 class="text-lg font-black text-slate-900 mb-1">Interpretações automáticas</h4>'
+        + "".join(parts)
+        + f'<p class="text-xs text-slate-400 mt-3">{foot}</p></div>'
+    )
+
+
+def _st_interpretacao_grafico(titulo: str, texto: str) -> None:
+    if not texto:
+        return
+    st.markdown(
+        f'<div class="pv-interpret-wrap"><p class="pv-interpret-title">{html_lib.escape(titulo)}</p>'
+        f'<p class="pv-interpret-text">{html_lib.escape(texto)}</p></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _cell_metric(
@@ -3922,7 +4470,7 @@ def _appendix_for_horizon_target(
       }});
       traces.push({{ x: [0,1], y: [0,1], mode: 'lines', name: 'aleatório', line: {{ dash: 'dot', color: '#94a3b8' }} }});
       Plotly.newPlot('roc_{slug}_{h}', traces, {{
-        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(250,250,250,1)',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {{ family: 'Plus Jakarta Sans', size: 11, color: '#475569' }},
         margin: {{ t: 36, l: 48, r: 12, b: 48 }},
         xaxis: {{ title: 'Taxa de falsos positivos', gridcolor: '#e2e8f0', zeroline: false }},
@@ -3944,7 +4492,7 @@ def _appendix_for_horizon_target(
         y: yv,
         marker: {{ color: '#4f46e5', opacity: 0.85 }}
       }}], {{
-        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(255,255,255,1)',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
         margin: {{ t: 28, l: 52, r: 12, b: 120 }},
         xaxis: {{ tickangle: -55, automargin: true }},
@@ -3967,12 +4515,10 @@ def _methodology_appendix_block(
 ) -> str:
     hz_txt = ", ".join(str(x) for x in horizontes)
     modo = (
-        "O pipeline final reajusta o modelo em <b>100% da série</b> disponível; a escolha do ensemble usa uma "
-        "fatia final (~8%) apenas para ranquear candidatos, sem conjunto de teste separado nas métricas principais."
+        "<b>100% da série</b> no modelo final; ~8% finais só para pesos do ensemble (sem holdout nas métricas principais)."
         if full_period_train
-        else "A série diária é dividida em <b>70% treino</b> e <b>30% teste</b> cronológicos. "
-        "Dentro dos 70%, reserva-se ~8% no fim para validação interna na escolha do ensemble. "
-        "Métricas reportadas (MAE, RMSE, R², etc.) referem-se ao <b>bloco de teste (30%)</b>, exceto quando indicado."
+        else "<b>70% / 30%</b> cronológicos; ~8% no fim do treino para escolher o ensemble. "
+        "MAE, RMSE, R² no <b>teste (30%)</b> salvo indicação em contrário."
     )
     params_blocks: list[str] = []
     for h in horizontes:
@@ -3998,15 +4544,15 @@ def _methodology_appendix_block(
     )
     return f"""
     <div class="glass-card p-8 mb-8 border-l-4 border-blue-600">
-      <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia e escolha de modelos</h2>
-      <div class="text-sm text-slate-700 space-y-4 leading-relaxed text-justify">
-        <p><b>Formulação.</b> Para cada dia <code>t</code>, o alvo é a <b>soma de vendas (quantidade ou VGV) nos próximos <code>H</code> dias</b>, com <code>H</code> ∈ {{{hz_txt}}}. As features usam apenas informação até <code>t</code> (lags, médias móveis, calendário, STL, feriados RJ, macro BCB quando ativo, formulário com defasagem, etc.).</p>
-        <p><b>Dimensão dos dados.</b> <b>{n_rows:,}</b> dias na matriz diária consolidada; <b>{n_features}</b> colunas após engenharia.</p>
-        <p><b>Validação temporal.</b> {modo}</p>
-        <p><b>LightGBM e Optuna (generalização).</b> Hiperparâmetros por <code>Optuna</code> (TPE) com <code>TimeSeriesSplit</code>, <b>limites de complexidade proporcionais a n</b>, objetivo = MAE médio nos folds + penalização da <b>variância entre folds</b> e da <b>amplitude</b> fold-a-fold (penaliza overfitting/instabilidade), e <code>MedianPruner</code> para descartar configurações fracas cedo. Semente <b>{random_seed}</b>. Modelos lineares e arbóreos do <i>benchmark</i> usam regularização mais conservadora para equilibrar viés-variância.</p>
-        <p><b>Benchmark.</b> Candidatos: {candidatos} O ranking usa o MAE na validação interna. Os <b>{blend_top_k}</b> melhores compõem um super-ensemble com pesos <code>∝ exp(−(MAE−MAE_min)/τ)</code>; se o ganho for relevante, o blend é adotado; senão, o melhor modelo isolado.</p>
-        <p><b>Pré-processamento.</b> <b>MinMaxScaler (0,1) com clip</b> nas entradas numéricas dos pipelines.</p>
-        <p><b>Métricas binárias nas tabelas.</b> Complementares: comparam valores preditos vs mediana de <code>y</code> no treino do benchmark.</p>
+      <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia</h2>
+      <div class="text-sm text-slate-700 space-y-3 leading-relaxed text-justify">
+        <p><b>Alvo.</b> Em cada <code>t</code>, soma de vendas (qtd ou VGV) nos próximos <code>H</code> dias, <code>H</code> ∈ {{{hz_txt}}}. <code>X</code> só com dados até <code>t</code> (lags, calendário, STL, feriados, macro BCB, formulário defasado, etc.).</p>
+        <p><b>Dados.</b> <b>{n_rows:,}</b> dias; <b>{n_features}</b> colunas após engenharia.</p>
+        <p><b>Validação.</b> {modo}</p>
+        <p><b>Optuna / LightGBM.</b> TPE + <code>TimeSeriesSplit</code>, <code>MedianPruner</code>, MAE nos folds com penalização de variância entre folds; limites de complexidade ligados a <code>n</code>. Semente <b>{random_seed}</b>. Demais candidatos do benchmark com regularização mais conservadora.</p>
+        <p><b>Benchmark e ensemble.</b> {candidatos} Ranking por MAE na validação interna. Os <b>{blend_top_k}</b> melhores entram num blend com pesos <code>∝ exp(−(MAE−MAE_min)/τ)</code> ou fica o melhor isolado se não houver ganho.</p>
+        <p><b>Entradas.</b> <b>MinMaxScaler (0,1)</b> com <code>clip</code>.</p>
+        <p><b>Métricas binárias (HTML).</b> Comparação à mediana de <code>y</code> no treino do benchmark.</p>
       </div>
     </div>
     <h3 class="text-lg font-black text-slate-800 mb-3">Parâmetros LightGBM finais (pós-Optuna) por horizonte</h3>
@@ -4015,7 +4561,9 @@ def _methodology_appendix_block(
 
 
 def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
-    dj = _json_safe(daily)
+    daily_html = {k: v for k, v in daily.items() if k != "numeric_series_for_picker"}
+    dj = _json_safe(daily_html)
+    interp_block = _html_eda_interpretacoes(daily)
     html_frag = """
     <div class="glass-card p-6 mb-6">
       <h3 class="text-xl font-black text-slate-900 mb-2">Séries diárias — funil e alvos</h3>
@@ -4032,11 +4580,24 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         <div id="an_corr" style="height:380px;width:100%;"></div>
       </div>
     </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6" id="an_scatter_row">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × qtd (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Complementa a matriz acima: cada ponto corresponde a um dia civil, com leads no eixo horizontal e vendas em quantidade no vertical.</p>
+        <div id="an_scatter_q" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × VGV (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Mesmo eixo horizontal (leads); o VGV diário é apresentado em milhões de reais, de modo a alinhar a escala à leitura do funil.</p>
+        <div id="an_scatter_v" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
     <div class="glass-card p-6 mb-6" id="an_macro_wrap">
       <h4 class="font-bold text-slate-800 mb-2">Indicadores macro (normalizados)</h4>
       <div id="an_macro" style="height:360px;width:100%;"></div>
     </div>
     """
+    html_frag = html_frag + interp_block
     script = f"""
     (function() {{
       var D = {dj};
@@ -4059,7 +4620,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         {{ x: dates, y: D.target_qtd, name: 'Vendas (qtd)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
         {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (mi R$)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
       ], {{
-        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fafafa',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
         margin: {{ t: 40, l: 52, r: 56, b: 72 }},
         xaxis: Object.assign({{ title: 'Data' }}, xAxisRangeFromDates(dates)),
@@ -4075,7 +4636,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
         {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'VGV médio (mi)', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
       ], {{
         barmode: 'group',
-        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fff',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         yaxis: {{ title: 'Qtd' }},
         yaxis2: {{ overlaying: 'y', side: 'right', title: 'mi R$' }},
         font: {{ family: 'Plus Jakarta Sans', size: 11 }},
@@ -4089,11 +4650,39 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           z: z, x: labs, y: labs, type: 'heatmap', colorscale: 'RdBu', zmid: 0,
           hoverongaps: false
         }}], {{
-          paper_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 28, l: 120, r: 28, b: 120 }},
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 28, l: 120, r: 28, b: 120 }},
           font: {{ size: 10 }}, xaxis: {{ tickangle: -45 }}
         }}, {{ responsive: true }});
       }} else {{
         document.getElementById('an_corr').innerHTML = '<p class="text-sm text-slate-500 p-4">Correlação indisponível.</p>';
+      }}
+
+      var vl = D.vol_leads || [];
+      var tqsc = D.target_qtd || [];
+      var tvmi = (D.target_valor || []).map(function(v){{ return v / 1e6; }});
+      var scatterOk = vl.length > 5 && vl.length === tqsc.length && vl.length === tvmi.length;
+      if (scatterOk) {{
+        Plotly.newPlot('an_scatter_q', [{{
+          x: vl, y: tqsc, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#3b82f6', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Vendas (qtd)', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+        Plotly.newPlot('an_scatter_v', [{{
+          x: vl, y: tvmi, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#0d9488', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'VGV (mi R$)', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        var srow = document.getElementById('an_scatter_row');
+        if (srow) srow.style.display = 'none';
       }}
 
       var macro = D.macro || {{}};
@@ -4103,7 +4692,7 @@ def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
           return {{ x: dates, y: zscore(macro[k] || []), name: k, line: {{ width: 1.4 }} }};
         }});
         Plotly.newPlot('an_macro', traces, {{
-          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#fafafa',
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
           title: 'Macro (z-score por série)',
           font: {{ family: 'Plus Jakarta Sans', size: 11 }},
           margin: {{ t: 48, l: 48, r: 28, b: 48 }},
@@ -4167,11 +4756,8 @@ def _build_appendix_html(
             scripts.append(sv)
     bench_intro = """
     <div class="glass-card p-6 mb-8 border-l-4 border-indigo-500">
-      <h2 class="text-xl font-black text-slate-900 mb-3">Benchmark de candidatos</h2>
-      <p class="text-sm text-slate-600 leading-relaxed text-justify">
-        Tabelas de regressão e classificação auxiliar; ROC e barras de MAE no período de teste indicado.
-        MinMaxScaler com <code>clip=True</code> em todas as pipelines.
-      </p>
+      <h2 class="text-xl font-black text-slate-900 mb-2">Benchmark</h2>
+      <p class="text-sm text-slate-600">Regressão, tarefa binária auxiliar, ROC e MAE no teste. Scaler 0–1 com <code>clip</code>.</p>
     </div>
     """
     return intro_meth + bench_intro + "\n".join(parts), "\n".join(scripts)
@@ -4206,11 +4792,9 @@ def render_dashboard(
     funnel_json = _json_safe(funnel)
     hoje = datetime.now().strftime("%d/%m/%Y")
     subtreino = (
-        "Treino em 100% do histórico · última fatia (~8%) só para ranquear o ensemble · "
-        "previsão = próximos H dias a partir da última data nos ficheiros."
+        "Modelo final no histórico completo; ~8% finais para pesos do ensemble. Previsão: H dias após a última data."
         if full_period_train
-        else "Split 70%/30%: métricas e gráficos no holdout final (30%); "
-        "pipeline operacional reajustado em 100% do histórico · Optuna (TSS, trials adaptativos) + ensemble."
+        else "Métricas no bloco final (30%); modelo operacional reajustado em todo o histórico."
     )
     lbl_mae_grande = "MAE in-sample (100%)" if full_period_train else "MAE teste (30%)"
     lbl_r2_grande = "R² in-sample (100%)" if full_period_train else "R² teste (30%)"
@@ -4444,9 +5028,6 @@ def render_dashboard(
         n_features,
     )
     analises_html, analises_scripts = _build_analises_pane_html(dp)
-    tech_blurb = (
-        " · Validação temporal · MinMax (0–1) · benchmark e ensemble (MAE na validação interna)"
-    )
 
     html = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -4486,7 +5067,7 @@ def render_dashboard(
     <header class="glass-card p-6 mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
       <div>
         <h1 class="text-2xl md:text-3xl font-extrabold text-slate-900">Previsão de vendas</h1>
-        <p class="text-slate-500 mt-1">{subtreino}{tech_blurb} · STL rolante · LGBM fair/quantil · blend médio+quantil alto · Ridge em TS · Optuna (TSS)</p>
+        <p class="text-slate-500 mt-1">{subtreino}</p>
       </div>
       <span class="text-sm font-semibold text-slate-600 bg-slate-100 px-4 py-2 rounded-full">{hoje}</span>
     </header>
@@ -4642,6 +5223,9 @@ PLOT_VERMELHO = COR_VERMELHO
 PLOT_ACCENT = "#0e7490"
 PLOT_MUTED = "#64748b"
 PLOT_GRID = "#e2e8f0"
+# Fundo dos gráficos: transparente para fundir com o cartão (.block-container) no Streamlit e glass-card no HTML
+PLOTLY_PAPER_BG = "rgba(0,0,0,0)"
+PLOTLY_PLOT_BG = "rgba(0,0,0,0)"
 
 
 def _plotly_layout_direcional(
@@ -4652,8 +5236,8 @@ def _plotly_layout_direcional(
     """Layout base Plotly: paleta e tipografia alinhadas à marca."""
     lo: dict[str, Any] = {
         "template": "plotly_white",
-        "paper_bgcolor": "rgba(0,0,0,0)",
-        "plot_bgcolor": "#f8fafc",
+        "paper_bgcolor": PLOTLY_PAPER_BG,
+        "plot_bgcolor": PLOTLY_PLOT_BG,
         "font": dict(
             family="Montserrat, Inter, sans-serif",
             size=12,
@@ -4828,6 +5412,9 @@ def inject_css() -> None:
   0% {{ background-position: 0% 50%; }}
   100% {{ background-position: 200% 50%; }}
 }}
+:root {{
+  --pv-content-max: min(880px, 93vw);
+}}
 html, body {{
   font-family: 'Inter', sans-serif;
   color: {COR_TEXTO_LABEL};
@@ -4913,17 +5500,17 @@ section.main > div {{
   padding-bottom: 0.35rem !important;
 }}
 .block-container {{
-  max-width: 100% !important;
+  max-width: var(--pv-content-max) !important;
   width: 100% !important;
   margin-left: auto !important;
   margin-right: auto !important;
   margin-top: clamp(4px, 1vh, 14px) !important;
   margin-bottom: clamp(4px, 1vh, 14px) !important;
-  padding: 1.35rem clamp(0.45rem, 1.4vw, 1.15rem) 1.45rem clamp(0.45rem, 1.4vw, 1.15rem) !important;
+  padding: 1rem clamp(0.65rem, 2vw, 1rem) 1.1rem clamp(0.65rem, 2vw, 1rem) !important;
   background: rgba(255, 255, 255, 0.97) !important;
   backdrop-filter: blur(14px) saturate(1.2);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
-  border-radius: 24px !important;
+  border-radius: 18px !important;
   border: 1px solid rgba(255, 255, 255, 0.85) !important;
   box-shadow:
     0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
@@ -4949,12 +5536,51 @@ h4, h5, h6 {{
   margin-right: auto !important;
 }}
 .pv-section-title {{
-  text-align: center;
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
   font-family: 'Montserrat', sans-serif;
   font-weight: 800;
   color: {COR_AZUL_ESC};
   font-size: 1.05rem;
-  margin: 0.85rem 0 0.5rem 0;
+  margin-top: 0.85rem;
+  margin-bottom: 0.5rem;
+  text-justify: auto !important;
+  hyphens: none !important;
+}}
+.pv-interpret-wrap {{
+  max-width: 100%;
+  margin: 0.35rem auto 0.85rem auto;
+  padding: 0 0.15rem;
+  box-sizing: border-box;
+  text-align: center;
+}}
+.pv-interpret-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 700;
+  font-size: 0.92rem;
+  color: {COR_AZUL_ESC};
+  margin: 0.4rem 0 0.25rem 0;
+  text-align: center !important;
+}}
+.pv-interpret-text {{
+  font-size: 0.86rem;
+  color: #475569 !important;
+  line-height: 1.5;
+  margin: 0 0 0.5rem 0;
+  text-align: center !important;
+  text-justify: none !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"] p.pv-interpret-title,
+[data-testid="stMarkdownContainer"] p.pv-interpret-text {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
 }}
 div[data-testid="stTabs"] {{
   margin-top: 0.4rem;
@@ -4995,6 +5621,37 @@ div[data-testid="stTabs"] [aria-selected="true"] {{
   text-justify: inter-word;
   hyphens: auto;
   -webkit-hyphens: auto;
+}}
+[data-testid="stMarkdownContainer"] p.pv-section-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-sub {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,
+[data-testid="stMarkdownContainer"] h4,
+[data-testid="stMarkdownContainer"] h5,
+[data-testid="stMarkdownContainer"] h6 {{
+  text-align: center !important;
+}}
+[data-testid="stMetric"] {{
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  text-align: center !important;
+}}
+[data-testid="stMetric"] [data-testid="stMarkdownContainer"] p {{
+  text-align: center !important;
+  text-justify: auto !important;
+}}
+[data-testid="stMetric"] label,
+[data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+  text-align: center !important;
+  justify-content: center !important;
 }}
 div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] p {{
   text-align: justify;
@@ -5049,6 +5706,13 @@ div[data-testid="stAlert"] svg {{
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid {COR_BORDA};
+}}
+[data-testid="stPlotlyChart"],
+[data-testid="stPlotlyChart"] > div,
+[data-testid="stPlotlyChart"] .js-plotly-plot,
+[data-testid="stPlotlyChart"] .plot-container {{
+  background: transparent !important;
+  background-color: transparent !important;
 }}
 div[data-baseweb="input"] {{
   border-radius: 10px !important;
@@ -5219,6 +5883,7 @@ div.metric-card {{
   border-left: 3px solid {COR_AZUL_ESC};
   transition: box-shadow 0.35s ease, transform 0.35s ease;
   animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+  text-align: center;
 }}
 div.metric-card:hover {{
   box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
@@ -5232,12 +5897,14 @@ div.metric-card h4 {{
   letter-spacing: 0.1em;
   font-weight: 800;
   margin: 0 0 0.35rem 0;
+  text-align: center;
 }}
 div.metric-card .val {{
   color: #0f172a;
   font-size: 1.28rem;
   font-weight: 800;
   font-family: 'Montserrat', sans-serif;
+  text-align: center;
 }}
 .stDownloadButton > button {{
   border-radius: 12px !important;
@@ -5421,8 +6088,14 @@ def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
         if c in dm.columns
     ]
     num = dm.select_dtypes(include=[np.number])
-    cols_extra = [c for c in num.columns if c not in core][:30]
-    focus_cols = core + cols_extra
+    fb_cols = [
+        c
+        for c in num.columns
+        if str(c).startswith("fb_vgv_") or str(c).startswith("fb_qtd_")
+    ]
+    seen = set(core) | set(fb_cols)
+    cols_extra = [c for c in num.columns if c not in seen][:30]
+    focus_cols = core + fb_cols + cols_extra
 
     rows_stats: list[dict[str, Any]] = []
     outliers_iqr: list[dict[str, Any]] = []
@@ -5844,65 +6517,68 @@ def _render_tab_introducao() -> None:
 
     def _ix(html: str) -> None:
         st.markdown(
-            f'<div style="text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:920px;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem">{html}</div>',
+            f'<div style="text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem;box-sizing:border-box">{html}</div>',
             unsafe_allow_html=True,
         )
 
     def _lx(s: str) -> None:
-        _, m, _ = st.columns([1, 6, 1])
-        with m:
-            st.latex(s)
+        st.latex(s)
 
     _ipc = {"displayModeBar": True, "displaylogo": False}
     st.markdown(
-        '<p class="pv-section-title">Introdução — modelos, alvos e análises</p>',
+        '<p class="pv-section-title">Introdução</p>',
         unsafe_allow_html=True,
     )
     _ix(
-        "Estimam-se <strong>quantidade</strong> e <strong>VGV</strong> futuros a partir de uma matriz diária (funil, vendas, calendário). "
-        "A validação é <strong>sempre temporal</strong>: em cada dia <em>t</em> só entram em <strong>X</strong> variáveis observadas até <em>t</em> — "
-        "não se usa informação do futuro para construir *features* (evita <em>leakage</em>). O texto abaixo detalha <strong>alvos</strong>, "
-        "<strong>métricas</strong>, <strong>modelos</strong>, <strong>EDA</strong> e o mapeamento para as abas da aplicação."
+        "Esta aplicação estima <strong>quantidade</strong> e <strong>VGV</strong> a partir da matriz diária consolidada. "
+        "Em cada instante <em>t</em>, o vetor <strong>X</strong> incorpora exclusivamente informação disponível até <em>t</em>, "
+        "garantindo, deste modo, coerência temporal no treino e na previsão."
     )
 
     st.markdown("#### 1 · Problema e alvos")
     _ix(
-        "Trata-se de <strong>regressão supervisionada</strong> indexada pelo tempo. Para cada <em>t</em> define-se um escalar "
-        "<strong>Y</strong> (alvo) e um vetor <strong>X</strong> (preditores). A causalidade temporal exige que cada componente de "
-        "<strong>X</strong> seja função apenas de dados disponíveis até <em>t</em> (lags, médias móveis, indicadores de calendário, etc.)."
+        "Trata-se de um problema de regressão ao longo do tempo: o alvo <strong>Y</strong> é escalar e o preditor "
+        "<strong>X</strong> é vetorial, ambos indexados por <em>t</em>. Ademais, cada componente de <strong>X</strong> "
+        "deve depender apenas do passado observado até <em>t</em>, sob pena de enviesar a validação fora da amostra."
     )
     _ix(
-        "<strong>Horizonte fixo H ∈ {3, 7, 30}.</strong> <strong>Y</strong> é a soma de vendas (qtd ou valor) nos "
-        "<strong>H</strong> primeiros dias da <em>série</em> imediatamente após <em>t</em> (dias efetivamente presentes no índice)."
+        "<strong>Horizonte fixo H ∈ {3, 7, 30}.</strong> Para cada <em>t</em>, <strong>Y</strong> define-se como a soma de vendas "
+        "(em quantidade ou valor) nos <strong>H</strong> primeiros dias da <em>série</em> imediatamente posteriores a <em>t</em>, "
+        "considerando apenas os dias efetivamente presentes no índice temporal."
     )
     _ix(
-        "<strong>Intervalo de calendário [d₁, d₂].</strong> Na aba <strong>Previsões</strong> pode definir-se opcionalmente um "
-        "intervalo (data inicial e final); <strong>Y</strong> soma vendas nos dias da série tais que "
-        "<em>t</em> &lt; data ≤ d₂ e d₁ ≤ data ≤ d₂ — além dos horizontes fixos 3, 7 e 30 dias."
+        "<strong>Intervalo [d₁, d₂].</strong> Na aba <strong>Previsões</strong>, quando indicadas duas datas, "
+        "define-se um alvo adicional correspondente à soma no calendário entre esses limites, complementando, portanto, "
+        "os horizontes fixos H ∈ {3, 7, 30}."
     )
     _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
     _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
     _ix(
-        "𝒟<sub>t,7</sub>: até <strong>sete</strong> primeiros instantes da série <strong>estritamente posteriores</strong> a <em>t</em>, por ordem temporal."
+        "O conjunto 𝒟<sub>t,7</sub> reúne, por ordem temporal, até <strong>sete</strong> instantes da série "
+        "<strong>estritamente posteriores</strong> a <em>t</em>, ou seja, o primeiro dia útil após <em>t</em> e os seis seguintes "
+        "no índice observado."
     )
 
     st.markdown("#### 2 · Métricas de erro (regressão)")
     _ix(
-        "No <strong>conjunto de teste</strong> (≈ últimos 30% da série, ordem cronológica preservada), com <em>n</em> observações, "
-        "valor real <em>yᵢ</em> e previsão <em>ŷᵢ</em>:"
+        "No conjunto de <strong>teste</strong> — tipicamente os últimos ~30% da série, preservando a ordem cronológica — "
+        "consideram-se <em>n</em> pares (<em>yᵢ</em>, <em>ŷᵢ</em>) para as definições seguintes:"
     )
     _lx(r"\mathrm{MAE} = \frac{1}{n}\sum_{i=1}^{n} \left| y_i - \hat{y}_i \right|")
-    _ix("MAE — erro médio absoluto; mesma unidade que o alvo.")
+    _ix("O MAE mede o erro médio absoluto e exprime-se na mesma unidade que o alvo, facilitando, assim, a leitura em escala de negócio.")
     _lx(r"\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{y}_i)^2}")
-    _ix("RMSE — penaliza mais erros grandes (sensível a outliers).")
+    _ix("O RMSE penaliza de forma mais acentuada os erros grandes; consequentemente, é mais sensível a outliers do que o MAE.")
     _lx(r"R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}")
-    _ix("R² — desempenho vs. predizer sempre a média <em>ȳ</em> do bloco de teste.")
+    _ix(
+        "O R² compara o modelo a uma referência ingênua que prediz sempre a média <em>ȳ</em> do bloco de teste; "
+        "valores mais altos indicam melhor ajuste, embora devam ser interpretados em conjunto com MAE e RMSE."
+    )
 
     st.markdown("#### 3 · Acurácia direcional (auxiliar)")
     _ix(
-        "Define-se a <strong>mediana de Y</strong> apenas no conjunto de <strong>treino</strong>. Em cada dia de teste compara-se "
-        "se <em>y</em> e <em>ŷ</em> ficam acima ou abaixo dessa mediana. É uma métrica <strong>binária ilustrativa</strong>; "
-        "decisões de negócio devem privilegiar MAE / RMSE / R²."
+        "<strong>Acurácia direcional:</strong> calcula-se a mediana de <em>Y</em> no treino e, em teste, compara-se se "
+        "<em>y</em> e <em>ŷ</em> ficam ambos acima ou ambos abaixo dessa mediana. Este indicador complementa, portanto, "
+        "MAE, RMSE e R², focando na capacidade de antever a direção do desvio face ao patamar histórico."
     )
     _lx(
         r"\hat{b}_i = \mathbb{1}\left[ \hat{y}_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right],\quad"
@@ -5912,20 +6588,20 @@ def _render_tab_introducao() -> None:
 
     st.markdown("#### 4 · Pré-processamento e validação")
     _ix(
-        "<strong>MinMaxScaler (0, 1)</strong> com <em>clip</em> nas entradas numéricas dos <em>pipelines</em> — alinha escalas para "
-        "SVR, k-NN e redes lineares."
+        "As entradas numéricas dos <em>pipelines</em> passam por <strong>MinMaxScaler (0, 1)</strong> com <em>clip</em>, "
+        "uniformizando escalas entre algoritmos heterogêneos."
     )
     _ix(
-        "<strong>Partição temporal:</strong> ~70% treino / 30% teste. No treino, <strong>TimeSeriesSplit</strong> para avaliar candidatos "
-        "sem baralhar ordem temporal."
+        "A <strong>partição</strong> principal segue aproximadamente 70% treino e 30% teste, em ordem temporal; "
+        "no bloco de treino, recorre-se a <strong>TimeSeriesSplit</strong> para manter a validação alinhada com a natureza da série."
     )
     _ix(
-        "<strong>Optuna</strong> (TPE + <em>MedianPruner</em>): procura hiperparâmetros minimizando MAE com penalização pela "
-        "<strong>variância entre folds</strong> (modelos mais estáveis no tempo)."
+        "A <strong>Optuna</strong> (TPE e <em>MedianPruner</em>) minimiza o MAE médio nos <em>folds</em>, "
+        "incorporando ainda penalização pela <strong>variância entre folds</strong>, de modo a privilegiar soluções estáveis no tempo."
     )
     _ix(
-        "<strong>Pesos amostrais:</strong> onde o algoritmo permite, reforçam-se observações recentes e regimes de volume extremo "
-        "para refletir melhor o presente."
+        "Sempre que o algoritmo o suporta, aplicam-se <strong>pesos amostrais</strong> com maior ênfase em observações recentes "
+        "e em regiões de cauda de volume, refletindo, assim, a relevância operacional desses regimes."
     )
 
     st.markdown("#### 5 · Famílias de modelos candidatas")
@@ -5968,15 +6644,15 @@ def _render_tab_introducao() -> None:
     ]
     st.dataframe(pd.DataFrame(rows_mod), use_container_width=True, hide_index=True)
     _ix(
-        f"Competem dezenas de <em>pipelines</em>; os <strong>{BLEND_TOP_K_FIXO}</strong> melhores em MAE de validação podem integrar um "
-        r"<strong>super-ensemble</strong> com pesos proporcionais a exp(−(MAE−MAE<sub>min</sub>)/τ). "
-        "Se a combinação não superar claramente o melhor isolado, fica o modelo vencedor único."
+        f"Os <strong>{BLEND_TOP_K_FIXO}</strong> modelos com menor MAE na validação interna integram um <strong>ensemble</strong> "
+        r"cujos pesos seguem ∝ exp(−(MAE−MAE<sub>min</sub>)/τ). Contudo, caso não exista ganho estatístico claro, "
+        f"preserva-se unicamente o melhor modelo individual."
     )
 
-    st.markdown("#### 6 · Exemplo ilustrativo — hiperparâmetros LightGBM (nomes típicos)")
+    st.markdown("#### 6 · LightGBM — parâmetros (referência)")
     _ix(
-        "Na prática a Optuna varre intervalos de hiperparâmetros; a tabela abaixo resume o <strong>significado</strong> "
-        "dos mais citados no LightGBM (valores reais dependem dos dados e do orçamento de busca)."
+        "A tabela seguinte resume nomes usuais de hiperparâmetros; os valores efetivos resultam, contudo, "
+        "da otimização via Optuna e podem variar entre execuções."
     )
     ex_hp = pd.DataFrame(
         [
@@ -5990,10 +6666,10 @@ def _render_tab_introducao() -> None:
     )
     st.dataframe(ex_hp, use_container_width=True, hide_index=True)
 
-    st.markdown("#### 7 · Análises exploratórias (EDA) no dossiê")
+    st.markdown("#### 7 · Dossiê (EDA)")
     _ix(
-        "Antes e independentemente do ajuste fino dos modelos, o <strong>Dossiê</strong> resume a qualidade e o comportamento "
-        "dos dados. Cada bloco responde a uma pergunta diferente (forma da distribuição, redundância, outliers, sazonalidade semanal)."
+        "O <strong>Dossiê</strong> agrega, de forma estruturada, estatísticas descritivas, análise de outliers, "
+        "matrizes de correlação, VIF, histogramas e o perfil semanal — permitindo, assim, uma leitura integrada da qualidade dos dados."
     )
     st.markdown(
         """
@@ -6027,17 +6703,23 @@ def _render_tab_introducao() -> None:
     )
     _ix("<strong>VIF</strong> da variável <em>j</em> (via regressão OLS de <em>xⱼ</em> nas demais colunas do subconjunto):")
     _lx(r"\mathrm{VIF}_j = \frac{1}{1 - R^2_j}")
-    _ix("R²ⱼ é o coeficiente de determinação dessa regressão auxiliar — VIF alto (&gt; 5–10) sugere colinearidade.")
-    _ix("<strong>Outliers (regra IQR):</strong> IQR = Q3 − Q1; pontos fora de [L<sub>inf</sub>, L<sub>sup</sub>] são destacados (não são removidos automaticamente do alvo de negócio).")
+    _ix(
+        "Aqui, R²ⱼ designa o coeficiente de determinação dessa regressão auxiliar; assim, valores de VIF elevados "
+        "(&gt; 5–10) sugerem colinearidade potencialmente problemática."
+    )
+    _ix(
+        "<strong>Outliers (regra IQR):</strong> define-se IQR = Q3 − Q1; os pontos fora de [L<sub>inf</sub>, L<sub>sup</sub>] "
+        "são destacados para análise, todavia <strong>não</strong> são eliminados automaticamente do alvo de negócio."
+    )
     _lx(
         r"L_{\mathrm{inf}} = Q_1 - 1.5 \cdot \mathrm{IQR},\quad "
         r"L_{\mathrm{sup}} = Q_3 + 1.5 \cdot \mathrm{IQR}"
     )
 
-    st.markdown("#### 8 · Gráficos usados na aplicação (exemplos sintéticos)")
+    st.markdown("#### 8 · Gráficos de exemplo")
     _ix(
-        "Na aba <strong>Análises</strong> verá funil empilhado, dispersão, médias por dia da semana, etc. Abaixo, três figuras "
-        "<strong>puramente ilustrativas</strong> (dados inventados) para familiarizar com o tipo de leitura."
+        "Os gráficos abaixo replicam os tipos utilizados na aba <strong>Análises</strong>; porém, os dados são sintéticos "
+        "e destinam-se apenas a ilustrar a leitura visual."
     )
     g1, g2 = st.columns(2)
     with g1:
@@ -6059,7 +6741,7 @@ def _render_tab_introducao() -> None:
         )
         fig_ex.update_layout(
             **_plotly_layout_direcional(
-                title="Exemplo — importância relativa (ilustrativo)",
+                title="Importância relativa (exemplo)",
                 height=360,
                 showlegend=False,
                 margin=dict(l=160, r=24, t=52, b=40),
@@ -6083,7 +6765,7 @@ def _render_tab_introducao() -> None:
         )
         fig_c.update_layout(
             **_plotly_layout_direcional(
-                title="Exemplo — matriz de correlação (dados fictícios)",
+                title="Correlação (exemplo)",
                 height=360,
                 margin=dict(l=48, r=48, t=52, b=48),
             ),
@@ -6095,7 +6777,7 @@ def _render_tab_introducao() -> None:
         go.Scatter(
             y=[12, 15, 11, 18, 22, 19, 24, 21, 26, 23],
             mode="lines+markers",
-            name="Série fictícia",
+            name="Série A",
             line=dict(color=PLOT_AZUL, width=2.5),
         )
     )
@@ -6103,13 +6785,13 @@ def _render_tab_introducao() -> None:
         go.Scatter(
             y=[13, 14, 13, 17, 21, 20, 23, 22, 25, 24],
             mode="lines",
-            name="Suavização (ex.)",
+            name="Série B",
             line=dict(color=PLOT_VERMELHO, width=2, dash="dot"),
         )
     )
     fig_ser.update_layout(
         **_plotly_layout_direcional(
-            title="Exemplo — série temporal vs suavização (ilustrativo)",
+            title="Duas séries (exemplo)",
             height=340,
             xaxis_title="Índice",
             yaxis_title="Unidades",
@@ -6118,8 +6800,8 @@ def _render_tab_introducao() -> None:
     _plotly_traces_hidden_until_legend_click(fig_ser)
     st.plotly_chart(fig_ser, use_container_width=True, config=_ipc)
 
-    st.markdown("#### 9 · Onde ver cada coisa nesta app")
-    _ix("Mapa rápido das abas e do que precisa (ou não) de treino ML completo:")
+    st.markdown("#### 9 · Abas")
+    _ix("Segue-se um resumo orientativo das secções da aplicação:")
     st.markdown(
         """
 <div style="text-align:center;margin:0 auto 1.5rem auto;overflow-x:auto">
@@ -6130,22 +6812,22 @@ def _render_tab_introducao() -> None:
 </tr></thead>
 <tbody>
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Introdução</strong></td>
-<td style="padding:8px;text-align:center">Este guia conceitual (sempre disponível)</td></tr>
+<td style="padding:8px;text-align:center">Conceitos e notação</td></tr>
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Análises</strong></td>
-<td style="padding:8px;text-align:center">Indicadores e gráficos sobre a sua base (carregar dados ou após previsões)</td></tr>
+<td style="padding:8px;text-align:center">Indicadores e gráficos da série diária</td></tr>
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Previsões</strong></td>
-<td style="padding:8px;text-align:center">Treino Optuna, tabela de previsões, download HTML</td></tr>
+<td style="padding:8px;text-align:center">Treino, tabela e exportação HTML</td></tr>
 <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Dossiê</strong></td>
-<td style="padding:8px;text-align:center">EDA completa; métricas e importância de <em>features</em> (sub-aba <strong>Modelos</strong>) após <strong>Previsões</strong></td></tr>
+<td style="padding:8px;text-align:center">EDA; métricas e importância de <em>features</em> na sub-aba <strong>Modelos</strong> (com treino)</td></tr>
 <tr><td style="padding:8px;text-align:center"><strong>Apêndice</strong></td>
-<td style="padding:8px;text-align:center">Metodologia resumida; hiperparâmetros finais após <strong>Previsões</strong></td></tr>
+<td style="padding:8px;text-align:center">Metodologia e hiperparâmetros</td></tr>
 </tbody></table></div>
 """,
         unsafe_allow_html=True,
     )
     _ix(
-        "Nas abas <strong>Análises</strong>, <strong>Dossiê</strong> e <strong>Apêndice</strong> o botão de carregar dados "
-        "permite explorar a base <strong>sem</strong> executar o treino completo dos modelos."
+        "Repare-se que a opção <em>Carregar dados</em>, nas abas <strong>Análises</strong>, <strong>Dossiê</strong> e <strong>Apêndice</strong>, "
+        "atualiza apenas a matriz e os resumos exploratórios, <strong>sem</strong> executar o treino preditivo."
     )
 
 
@@ -6264,12 +6946,13 @@ def _render_streamlit_tab_analises(
         st.metric("Conversão leads → vendas", f"{conv:.2f} %")
 
     st.caption(
-        f"Matriz diária: **{daily.get('n_rows', 0):,}** dias · **{daily.get('n_features', 0)}** colunas após engenharia de features."
+        f"A matriz diária subjacente contém {daily.get('n_rows', 0):,} dias e {daily.get('n_features', 0)} colunas "
+        f"após engenharia de atributos."
     )
 
     dates = daily.get("dates") or []
     if not dates:
-        st.warning("Sem série temporal para gráficos.")
+        st.warning("Não há datas na série temporal; portanto, os gráficos não podem ser exibidos.")
         return
 
     _pc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
@@ -6372,6 +7055,7 @@ def _render_streamlit_tab_analises(
     )
     _plotly_traces_hidden_until_legend_click(fig_f)
     st.plotly_chart(fig_f, use_container_width=True, config=_pc)
+    _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
     tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
     roll7 = tq.rolling(7, min_periods=1).mean()
@@ -6401,6 +7085,7 @@ def _render_streamlit_tab_analises(
     fig_roll.update_layout(**_lo_roll)
     _plotly_traces_hidden_until_legend_click(fig_roll)
     st.plotly_chart(fig_roll, use_container_width=True, config=_pc)
+    _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
 
     fig_sc = go.Figure()
     fig_sc.add_trace(
@@ -6421,6 +7106,7 @@ def _render_streamlit_tab_analises(
         ),
     )
     st.plotly_chart(fig_sc, use_container_width=True, config=_pc)
+    _st_interpretacao_grafico("Leads × vendas (mesmo dia)", _interpret_text_leads_vendas(daily))
 
     dl = daily.get("dow_labels") or []
     fig_d = go.Figure()
@@ -6457,6 +7143,7 @@ def _render_streamlit_tab_analises(
     )
     _plotly_traces_hidden_until_legend_click(fig_d)
     st.plotly_chart(fig_d, use_container_width=True, config=_pc)
+    _st_interpretacao_grafico("Média por dia da semana", _interpret_text_dow(daily))
 
     cl = daily.get("corr_labels") or []
     cz = daily.get("corr_z") or []
@@ -6485,10 +7172,125 @@ def _render_streamlit_tab_analises(
             ),
         )
         st.plotly_chart(fig_h, use_container_width=True, config=_pc)
+        _st_interpretacao_grafico("Matriz de correlação (Pearson)", _interpret_text_correlation_matrix(cl, cz))
+        st.caption(
+            "A matriz resume associações lineares entre pares de variáveis; para ver a nuvem de pontos entre **quaisquer duas** "
+            "colunas numéricas (incluindo `target_qtd` e `target_valor`), utilize a secção **Dispersão — par de variáveis** abaixo — "
+            "ou o gráfico fixo **leads × vendas** mais acima nesta aba."
+        )
     else:
         st.markdown(
-            '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">Correlação indisponível (poucas colunas ou dados).</p>',
+            '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível, '
+            "seja por falta de colunas numéricas suficientes, seja por dados insuficientes.</p>",
             unsafe_allow_html=True,
+        )
+
+    ns_pick = daily.get("numeric_series_for_picker") or {}
+    n_pick_cols = len(ns_pick)
+    if n_pick_cols >= 2:
+        ref_len = len(next(iter(ns_pick.values())))
+        if any(len(v) != ref_len for v in ns_pick.values()):
+            st.warning(
+                "As séries numéricas do seletor têm comprimentos inconsistentes; volte a carregar ou a regenerar a matriz diária."
+            )
+        else:
+            st.markdown(
+                '<p class="pv-section-title">Dispersão — par de variáveis</p>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Escolha duas colunas numéricas da matriz diária: cada ponto corresponde ao mesmo dia civil (pares alinhados por data). "
+                "O coeficiente r de Pearson resume a associação linear da nuvem. "
+                "Para cruzar com vendas, utilize `target_qtd` ou `target_valor` em X ou em Y; para comparar métricas do funil, "
+                "selecione, por exemplo, `vol_leads` e `vol_visit`."
+            )
+            opts_pick = sorted(ns_pick.keys())
+            ix_x = opts_pick.index("vol_leads") if "vol_leads" in opts_pick else 0
+            ix_y = opts_pick.index("target_qtd") if "target_qtd" in opts_pick else min(1, len(opts_pick) - 1)
+            if ix_y == ix_x and len(opts_pick) > 1:
+                ix_y = (ix_x + 1) % len(opts_pick)
+            cxa, cxb = st.columns(2)
+            with cxa:
+                sel_x = st.selectbox(
+                    "Variável — eixo horizontal (X)",
+                    options=opts_pick,
+                    index=ix_x,
+                    key="pv_pair_var_x",
+                )
+            with cxb:
+                sel_y = st.selectbox(
+                    "Variável — eixo vertical (Y)",
+                    options=opts_pick,
+                    index=ix_y,
+                    key="pv_pair_var_y",
+                )
+            if sel_x == sel_y:
+                st.warning("Selecione duas variáveis distintas para exibir a dispersão e o coeficiente de correlação.")
+            else:
+                xv = ns_pick.get(sel_x) or []
+                yv = ns_pick.get(sel_y) or []
+                if len(xv) != len(yv):
+                    st.warning(
+                        "O comprimento das séries escolhidas não coincide; por favor, volte a carregar os dados."
+                    )
+                else:
+                    r_xy, n_xy = _pearson_pairwise_complete(xv, yv)
+                    mxa, mxb = st.columns(2)
+                    with mxa:
+                        st.metric("r de Pearson (X, Y)", f"{r_xy:+.3f}" if r_xy is not None else "—")
+                    with mxb:
+                        st.metric("Observações válidas (ambas finitas)", f"{n_xy:,}")
+                    xlab = str(sel_x) if len(str(sel_x)) <= 48 else str(sel_x)[:45] + "…"
+                    ylab = str(sel_y) if len(str(sel_y)) <= 48 else str(sel_y)[:45] + "…"
+                    use_dates = len(dates) == len(xv) == len(yv)
+                    htempl = (
+                        f"Data=%{{customdata}}<br>{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                        if use_dates
+                        else f"{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                    )
+                    fig_pair = go.Figure(
+                        data=go.Scatter(
+                            x=xv,
+                            y=yv,
+                            mode="markers",
+                            marker=dict(
+                                size=8,
+                                opacity=0.55,
+                                color=PLOT_AZUL,
+                                line=dict(width=0.45, color="#fff"),
+                            ),
+                            customdata=dates if use_dates else None,
+                            hovertemplate=htempl,
+                        )
+                    )
+                    fig_pair.update_layout(
+                        **_plotly_layout_direcional(
+                            title=f"Dispersão: {xlab} × {ylab}",
+                            height=440,
+                            xaxis_title=xlab,
+                            yaxis_title=ylab,
+                        ),
+                        margin=dict(t=56, l=56, r=48, b=56),
+                    )
+                    st.plotly_chart(fig_pair, use_container_width=True, config=_pc)
+                    _txt_r = (
+                        f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
+                        if r_xy is not None
+                        else "O coeficiente de Pearson não é definido (poucos pontos ou variância nula num dos eixos)."
+                    )
+                    _st_interpretacao_grafico(
+                        "Leitura",
+                        f"«{sel_x}» (eixo X) e «{sel_y}» (eixo Y) estão emparelhados por dia civil. {_txt_r} "
+                        "Trata-se de correlação linear contemporânea; assim, não implica causalidade nem substitui modelos com defasagem explícita.",
+                    )
+    elif n_pick_cols == 1:
+        st.caption(
+            "Para comparar duas variáveis na dispersão, a matriz diária precisa de pelo menos **duas** colunas numéricas além do índice."
+        )
+    elif not ns_pick:
+        st.caption(
+            "Para habilitar o seletor de pares numéricos, execute novamente **Carregar dados** ou **Gerar previsões**, "
+            "pois resultados antigos em cache podem não incluir `numeric_series_for_picker`."
         )
 
     macro = daily.get("macro") or {}
@@ -6522,6 +7324,32 @@ def _render_streamlit_tab_analises(
         fig_m.update_layout(**_lo_m)
         _plotly_traces_hidden_until_legend_click(fig_m)
         st.plotly_chart(fig_m, use_container_width=True, config=_pc)
+        _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
+
+    st.divider()
+    oa_key, oa_model = _openai_key_and_model()
+    if oa_key:
+        with st.expander("Síntese em prosa (OpenAI)", expanded=False):
+            st.caption(
+                f"Modelo configurado: `{oa_model}`. O texto gerado baseia-se exclusivamente nos resumos automáticos desta aba."
+            )
+            if st.button("Gerar síntese", key="pv_eda_openai_btn"):
+                facts = _facts_eda_compact(daily)
+                with st.spinner("A contactar a API…"):
+                    syn = _openai_eda_synopsis(facts)
+                if syn:
+                    st.session_state["pv_eda_openai_syn"] = syn
+                else:
+                    st.error(
+                        "Não foi obtida resposta válida da API; verifique a rede, quotas ou a chave de autenticação."
+                    )
+            if st.session_state.get("pv_eda_openai_syn"):
+                st.markdown(st.session_state["pv_eda_openai_syn"])
+    else:
+        st.caption(
+            "Caso pretenda uma síntese em prosa, defina `OPENAI_API_KEY` nas secrets do Streamlit ou como variável de ambiente; "
+            "alternativamente, utilize a secção `[openai]` com `api_key` e `model` (por exemplo, `gpt-4o-mini`)."
+        )
 
 
 def _render_streamlit_tab_apendice(
@@ -6534,13 +7362,15 @@ def _render_streamlit_tab_apendice(
 ) -> None:
     hz_txt = ", ".join(str(x) for x in (3, 7, 30))
     modo = (
-        "O modelo final é reajustado em **100%** da série; uma fatia final (~8%) serve apenas para ranquear candidatos do ensemble."
+        "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
+        "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
         if full_period_train
-        else "Divisão **70% treino / 30% teste** cronológicos; dentro do treino, ~8% no fim para validação interna na escolha do ensemble. "
-        "As métricas principais (MAE, RMSE, R², etc.) referem-se ao **bloco de teste (30%)**."
+        else "Adota-se uma divisão **70% treino / 30% teste** segundo a ordem cronológica; ademais, nos 70% iniciais, "
+        "reserva-se cerca de 8% no extremo temporal para validação interna na escolha do *ensemble*. "
+        "Neste cenário, as métricas principais (MAE, RMSE, R², entre outras) reportam-se ao **bloco de teste (30%)**."
     )
     st.markdown(
-        '<p class="pv-section-title">Apêndice técnico</p>',
+        '<p class="pv-section-title">Apêndice</p>',
         unsafe_allow_html=True,
     )
     tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
@@ -6549,17 +7379,17 @@ def _render_streamlit_tab_apendice(
     with tab_met:
         st.markdown(
             f"""
-#### Resumo executivo
+#### Resumo
 
-- **Alvo:** para cada dia *t*, soma de vendas (quantidade ou VGV) nos **próximos H dias**, com *H* ∈ {{{hz_txt}}}. As variáveis explicativas usam apenas informação **até t** (lags, médias móveis, calendário, componentes sazonais, feriados, macro quando disponível, formulário com defasagem). Opcionalmente, na aba **Previsões**, pode definir-se um **intervalo de calendário** (data inicial e final) para treinar um cenário extra.
-- **Dados:** **{daily.get("n_rows", 0):,}** observações diárias na matriz consolidada; **{daily.get("n_features", 0)}** colunas após engenharia.
+- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*, com *H* ∈ {{{hz_txt}}}; o vetor *X* incorpora apenas informação até *t*. Além disso, na aba **Previsões**, um intervalo entre datas de início e fim define um alvo complementar.
+- **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
-- **Otimização:** LightGBM via **Optuna** (TPE + **MedianPruner**) com **TimeSeriesSplit**; espaço de busca **encolhe** com poucos dados; o objetivo penaliza **instabilidade entre folds** (MAE + variância + dispersão), favorecendo soluções que generalizam no tempo. Semente **{random_seed}**.
-- **Seleção:** vários algoritmos competem (Ridge, ElasticNet, **SVM (SVR)**, **k-NN**, florestas, boosting LightGBM/XGBoost/CatBoost, NGBoost no VGV, baselines, *stacks* leves). O ranking usa MAE na validação interna; os **{blend_top_k}** melhores entram num **super-ensemble** com pesos proporcionais a exp(−(MAE−MAE_min)/τ). Se o blend não ganhar de forma clara, mantém-se o melhor modelo isolado. **Balanceamento** de regimes de volume: *sample weights* temporais nos modelos que suportam (mais peso a observações recentes e caudas).
-- **Pré-processamento:** **MinMaxScaler (0,1)** com *clip* nas entradas numéricas dos *pipelines*.
-- **Métricas binárias** nas tabelas do HTML são **auxiliares** (predição vs mediana histórica de *y* no treino do benchmark).
+- **Optuna:** algoritmo TPE, **TimeSeriesSplit** e **MedianPruner**; a função objetivo penaliza a variância entre *folds*, promovendo estabilidade. Semente: **{random_seed}**.
+- **Modelos:** candidatos incluem Ridge, ElasticNet, SVR, k-NN, florestas, LightGBM/XGBoost/CatBoost, NGBoost (VGV), baselines e *stacks* leves; o ranking baseia-se no MAE na validação interna, sendo que os **{blend_top_k}** melhores podem integrar um *ensemble* ou, caso contrário, prevalece o modelo único vencedor. *Sample weights* aplicam-se quando o algoritmo o permite.
+- **Entrada numérica:** **MinMaxScaler (0,1)** com *clip*.
+- **Tabelas binárias no HTML:** comparam-se previsões à mediana de *y* no treino do benchmark, funcionando como métrica auxiliar.
 
-O relatório HTML descarregável na aba **Previsões** contém curvas de teste, ROC auxiliar, tabelas completas de benchmark e o mesmo texto técnico com formatação rica.
+O relatório HTML exportável na aba **Previsões** reúne, entre outros elementos, gráficos operacionais, curvas ROC e o *benchmark* de modelos.
 """
         )
 
@@ -6618,8 +7448,8 @@ def _render_streamlit_dossie_ml(
 
     st.markdown(
         "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
-        "<strong>Análise e modelagem</strong> — estatísticas descritivas, outliers (IQR), correlações, VIF, "
-        "balanceamento, distribuições e notas sobre dados e <em>overfitting</em>.</div>",
+        "O Dossiê consolida estatísticas descritivas, análise IQR, matrizes de correlação, VIF, histogramas e, "
+        "quando aplicável, métricas de modelo — oferecendo, desta forma, uma visão integrada da qualidade dos dados e do ajuste.</div>",
         unsafe_allow_html=True,
     )
 
@@ -6643,17 +7473,16 @@ def _render_streamlit_dossie_ml(
     with td1:
         st.markdown(
             """
-**Limpeza e integridade**
-- Índice diário **deduplicado** (mantém-se a última ocorrência por data).
-- **Alvos** (`target_qtd`, `target_valor`): remoção apenas de linhas com alvo em falta; valores não finitos tratados antes da agregação.
-- **Features**: `inf`/`-inf` substituídos; **valores em falta preenchidos com 0** após engenharia (lags e indicadores já usam apenas informação passada), evitando perder séries inteiras por uma coluna esparsa.
-- **Normalização:** `MinMaxScaler(0,1)` com `clip=True` em todas as *pipelines* (estabiliza SVM, k-NN, redes lineares sob deriva da distribuição).
-- **Outliers no alvo:** não são removidos automaticamente (são eventos reais de negócio); a robustez vem da validação temporal, *ensemble*, regularização e **limite (*cap*)** nas previsões calibrado no treino.
+**Tratamento**
+- O índice diário é deduplicado, conservando a última linha por data.
+- Nos alvos, eliminam-se apenas as linhas sem `target_qtd` ou `target_valor`; valores não finitos são tratados antes da agregação.
+- Nas *features*, `inf` é convertido para valor finito e a ausência de dados imputa-se a 0 após a engenharia (lags utilizam exclusivamente o passado).
+- Nos modelos, aplica-se `MinMaxScaler(0,1)` com `clip`.
+- Os outliers no alvo não são truncados; o *cap* aplicado às previsões deriva, portanto, do próprio treino.
 
-**Anti-overfitting**
-- Split **70% / 30%** cronológico; Optuna com **TimeSeriesSplit** e **MedianPruner**.
-- Objetivo de tuning penaliza **variância entre folds** (além do MAE).
-- Modelos lineares e **SVR** com regularização moderada; **k-NN** com *k* alto e pesos por distância.
+**Validação / tuning**
+- Utiliza-se *split* cronológico 70/30; em paralelo, a Optuna recorre a **TimeSeriesSplit** e **MedianPruner**, penalizando a variância entre *folds*.
+- Os modelos SVR e k-NN adotam regularização e parâmetro *k* mais conservadores, de modo a reduzir sobreajuste.
 """
         )
         m1, m2 = st.columns(2)
@@ -6662,7 +7491,7 @@ def _render_streamlit_dossie_ml(
         with m2:
             st.metric("Colunas após engenharia", f"{dossie.get('n_colunas', 0):,}")
         st.caption(
-            f"Período: **{dossie.get('primeira_data', '—')}** → **{dossie.get('ultima_data', '—')}**"
+            f"Período coberto pela matriz: de **{dossie.get('primeira_data', '—')}** a **{dossie.get('ultima_data', '—')}**."
         )
 
     desc = dossie.get("descritivas") or []
@@ -6671,17 +7500,17 @@ def _render_streamlit_dossie_ml(
         if desc:
             st.markdown("##### Estatísticas descritivas")
             st.caption(
-                "**Curtose** em pandas = *excesso* de curtose (0 ≈ normal). **Moda**: primeiro valor modal da série."
+                "A curtose reportada corresponde ao excesso (definição *pandas*); a moda corresponde ao primeiro valor modal encontrado."
             )
             st.dataframe(pd.DataFrame(desc), use_container_width=True, hide_index=True)
         else:
-            st.caption("Sem tabela descritiva disponível.")
+            st.caption("Não há tabela descritiva disponível para o conjunto atual.")
         st.divider()
         if oi:
             st.markdown("##### Outliers (regra IQR — 1,5×IQR)")
             st.dataframe(pd.DataFrame(oi), use_container_width=True, hide_index=True)
         else:
-            st.caption("Sem resumo de outliers.")
+            st.caption("Não foi possível gerar o resumo de outliers para estes dados.")
 
     cl = dossie.get("correlation_labels") or []
     cz = dossie.get("correlation_matrix") or []
@@ -6714,11 +7543,75 @@ def _render_streamlit_dossie_ml(
                 ),
             )
             st.plotly_chart(fig_h, use_container_width=True, config=_dpc)
+            _st_interpretacao_grafico(
+                "Correlações (leitura automática)",
+                _interpret_text_correlation_matrix(cl, cz),
+            )
         else:
             st.markdown(
-                '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">Matriz de correlação indisponível.</p>',
+                '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível neste subconjunto (colunas ou dados insuficientes).</p>',
                 unsafe_allow_html=True,
             )
+
+        _vl3 = daily_pack.get("vol_leads") or []
+        _tq3 = daily_pack.get("target_qtd") or []
+        _tv3 = daily_pack.get("target_valor") or []
+        if len(_vl3) == len(_tq3) == len(_tv3) and len(_vl3) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
+            st.caption(
+                "Além dos valores agregados na matriz de correlação, a dispersão posiciona cada dia no plano "
+                "leads × volume, permitindo visualizar dispersão, aglomerados e observações atípicas que o coeficiente r resume de forma sintética."
+            )
+            from plotly.subplots import make_subplots
+
+            _tv3_mi = [float(v) / 1e6 for v in _tv3]
+            fig_td3 = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=("Quantidade diária", "VGV (mi R$ / dia)"),
+                horizontal_spacing=0.12,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tq3,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
+                    name="qtd",
+                    hovertemplate="Leads=%{x:.4g}<br>qtd=%{y:,.0f}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tv3_mi,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_VERMELHO, line=dict(width=0.5, color="#ffffff")),
+                    name="VGV",
+                    hovertemplate="Leads=%{x:.4g}<br>VGV mi=%{y:.3f}<extra></extra>",
+                ),
+                row=1,
+                col=2,
+            )
+            base_td3 = _plotly_layout_direcional(height=420, showlegend=False)
+            fig_td3.update_layout(**{k: v for k, v in base_td3.items() if k not in ("xaxis", "yaxis")})
+            fig_td3.update_layout(
+                title=dict(
+                    text="Dispersão (eixo horizontal: leads; mesmos dias da série diária)",
+                    font=dict(size=15, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+                    x=0.5,
+                    xanchor="center",
+                ),
+                margin=dict(t=56, l=56, r=48, b=56),
+            )
+            fig_td3.update_xaxes(title_text="Leads", row=1, col=1)
+            fig_td3.update_xaxes(title_text="Leads", row=1, col=2)
+            fig_td3.update_yaxes(title_text="Qtd", row=1, col=1)
+            fig_td3.update_yaxes(title_text="mi R$", row=1, col=2)
+            st.plotly_chart(fig_td3, use_container_width=True, config=_dpc)
+
         st.divider()
         if pares:
             st.markdown("##### Pares com |r| ≥ 0,85")
@@ -6726,11 +7619,27 @@ def _render_streamlit_dossie_ml(
         if vifs:
             st.markdown("##### VIF (subconjunto de *features*)")
             st.caption(
-                "VIF elevado (> 5–10) sugere redundância; *tree-based* toleram melhor do que SVM/k-NN em escala."
+                "Valores de VIF superiores a 5–10 sugerem possível redundância linear entre *features*; interprete-as em conjunto com a matriz de correlação."
             )
             st.dataframe(pd.DataFrame(vifs), use_container_width=True, hide_index=True)
+            _st_interpretacao_grafico("VIF (leitura automática)", _interpret_text_vif_rows(vifs))
         if not pares and not vifs:
-            st.caption("Sem tabelas de multicolinearidade.")
+            st.caption("Não há tabelas de multicolinearidade para apresentar nesta execução.")
+        facts_cv = _facts_corr_vif_for_llm(cl, cz, vifs)
+        oa_key_d, oa_model_d = _openai_key_and_model()
+        if oa_key_d and facts_cv.strip():
+            st.divider()
+            with st.expander("Síntese: correlação e VIF (OpenAI)", expanded=False):
+                st.caption(f"Modelo: `{oa_model_d}`.")
+                if st.button("Gerar síntese", key="pv_dossie_openai_btn"):
+                    with st.spinner("A contactar a API…"):
+                        syn_d = _openai_eda_synopsis(facts_cv)
+                    if syn_d:
+                        st.session_state["pv_dossie_openai_syn"] = syn_d
+                    else:
+                        st.error("Sem resposta ou erro na API.")
+                if st.session_state.get("pv_dossie_openai_syn"):
+                    st.markdown(st.session_state["pv_dossie_openai_syn"])
 
     bal = dossie.get("balanceamento_qtd") or {}
     hq = dossie.get("hist_target_qtd") or {}
@@ -6860,8 +7769,8 @@ def _render_streamlit_dossie_ml(
         _render_streamlit_ml_feature_importance(por_h, _dpc)
         st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
         st.markdown(
-            "**Acurácia dir. (mediana)** = fração de dias de teste em que o modelo acerta se o alvo está "
-            "acima ou abaixo da mediana do **conjunto de treino** (métrica auxiliar; o negócio continua a ser regressão — MAE/RMSE/R²)."
+            "**Acurácia dir.:** no conjunto de teste, corresponde à percentagem de dias em que o valor real e a previsão "
+            "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
         )
         rows_m = []
         for h in (3, 7, 30):
@@ -6897,7 +7806,7 @@ def _render_streamlit_dossie_ml(
         else:
             st.markdown(
                 '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin:0.5rem 0">'
-                "Métricas de modelos após <strong>Gerar previsões</strong>. O restante do dossiê reflete os dados já carregados.</p>",
+                "As métricas detalhadas surgirão nesta secção após executar <strong>Gerar previsões</strong>.</p>",
                 unsafe_allow_html=True,
             )
         low_acc: list[dict[str, Any]] = []
@@ -6913,17 +7822,13 @@ def _render_streamlit_dossie_ml(
                 low_acc.append(r)
         if _hay_metricas and low_acc:
             st.warning(
-                "Em pelo menos um horizonte/alvo, a **acurácia direcional** ficou abaixo de **80%**. "
-                "Revise *features*, horizonte ou volume de dados; evite aumentar complexidade sem validação temporal."
-            )
-        elif _hay_metricas and rows_m and not low_acc:
-            st.success(
-                "Acurácia direcional ≥ 80% em todos os horizontes reportados acima (onde a métrica foi calculada)."
+                "A acurácia direcional é inferior a 80% em, pelo menos, um horizonte ou alvo; analise o conjunto de métricas "
+                "antes de utilizar as previsões como único critério de decisão."
             )
         st.divider()
         if por_custom:
-            st.markdown("##### Cenário de previsão personalizado")
-            st.markdown(f"**Definição:** {por_custom.get('label', '—')}")
+            st.markdown("##### Intervalo personalizado")
+            st.markdown(f"**{por_custom.get('label', '—')}**")
             qc = por_custom.get("qtd") or {}
             vc = por_custom.get("valor") or {}
             st.markdown(
@@ -6935,11 +7840,10 @@ def _render_streamlit_dossie_ml(
                 f"Acurácia dir.: {float((vc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%"
             )
             st.caption(
-                "As *features* `fwd_*` incluem fins de semana e **feriados BR** nos dias que entram na soma, "
-                "para o modelo condicionar em calendário conhecido."
+                "As variáveis `fwd_*` incorporam fins de semana e feriados brasileiros dentro do horizonte da soma, quando aplicável."
             )
         else:
-            st.caption("Sem cenário personalizado nesta execução.")
+            st.caption("Não foi definido cenário personalizado por intervalo de datas nesta execução.")
 
 
 def main() -> None:
@@ -6955,9 +7859,7 @@ def main() -> None:
 
     st.markdown(
         f'<p class="pv-hero-title">Previsão de vendas</p>'
-        f'<p class="pv-hero-sub">Validação temporal, vários algoritmos de ML e análises exploratórias. '
-        f"Navegue por <strong>Introdução</strong>, <strong>Análises</strong>, <strong>Previsões</strong>, "
-        f"<strong>Dossiê</strong> e <strong>Apêndice</strong>.</p>",
+        f'<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>',
         unsafe_allow_html=True,
     )
     st.markdown('<div class="pv-bar-wrap"><div class="pv-bar"></div></div>', unsafe_allow_html=True)
@@ -6981,8 +7883,8 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "Sempre são treinados os horizontes <strong>3, 7 e 30 dias</strong>. Opcionalmente, indique <strong>dia inicial</strong> e "
-            "<strong>dia final</strong> para treinar também um modelo cuja soma-alvo corresponde a esse intervalo no calendário.</div>",
+            "Por padrão, estimam-se sempre os horizontes de <strong>3, 7 e 30</strong> dias. Adicionalmente, caso indique "
+            "um intervalo opcional nas datas abaixo, treina-se um par de modelos cuja soma-alvo corresponde ao calendário entre essas datas.</div>",
             unsafe_allow_html=True,
         )
         ic1, ic2 = st.columns(2)
@@ -7000,21 +7902,23 @@ def main() -> None:
             )
         if d_ini is not None and d_fim is not None:
             a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
-            st.success(
-                f"Cenário extra por intervalo: **{a.isoformat()}** → **{b.isoformat()}** (além dos horizontes 3, 7 e 30 dias)."
+            st.info(
+                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
             )
         elif d_ini is None and d_fim is None:
             st.caption(
-                "Sem intervalo opcional: apenas horizontes **3, 7 e 30** dias. No fim da página pode **limpar o cenário** ou **limpar o cache** das planilhas."
+                "Sem intervalo opcional: apenas os horizontes 3, 7 e 30 dias. No final da página, pode limpar o cenário ou o cache das planilhas."
             )
         else:
-            st.warning("Preencha **dia inicial e dia final** ou deixe os **dois** em branco.")
+            st.warning(
+                "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
+            )
 
         run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
 
         if run_btn:
             if (d_ini is None) ^ (d_fim is None):
-                st.error("Intervalo incompleto: defina **ambas** as datas ou deixe as duas em branco antes de gerar previsões.")
+                st.error("Intervalo incompleto: são necessárias duas datas válidas ou nenhuma (deixe ambos os campos vazios).")
             else:
                 with st.spinner("A carregar e analisar as planilhas…"):
                     dfs, sheet_metas, used_sa = build_data_bundle()
@@ -7029,9 +7933,7 @@ def main() -> None:
                             "date_start": a.isoformat(),
                             "date_end": b.isoformat(),
                         }
-                    with st.spinner(
-                        "A treinar modelos e gerar o relatório. Este passo pode demorar vários minutos — não feche a página."
-                    ):
+                    with st.spinner("A treinar modelos e gerar o relatório…"):
                         (
                             stats_base,
                             ticket,
@@ -7057,10 +7959,10 @@ def main() -> None:
                         "sheet_metas": sheet_metas,
                         "used_sa": used_sa,
                     }
-                    st.success("Previsões geradas com sucesso.")
+                    st.success("Execução concluída com sucesso.")
                     st.session_state.dados_exploratorios = None
                 except Exception as e:
-                    st.error(f"Erro na execução: {e}")
+                    st.error(f"Ocorreu um erro durante a execução: {e}")
                     st.exception(e)
 
         res = st.session_state.resultado
@@ -7077,7 +7979,7 @@ def main() -> None:
 
             if sheet_metas:
                 st.markdown(
-                    '<p class="pv-section-title">Folhas selecionadas (auditoria)</p>',
+                    '<p class="pv-section-title">Fontes carregadas</p>',
                     unsafe_allow_html=True,
                 )
                 rows_m = []
@@ -7185,12 +8087,12 @@ def main() -> None:
                         acc_warn = True
             if acc_warn:
                 st.warning(
-                    "Pelo menos uma **acurácia direcional** (vs mediana do treino) está abaixo de **80%**. "
-                    "Considere mais histórico, revisão de *features* ou horizonte; não aumente a complexidade sem ganho na validação temporal."
+                    "A acurácia direcional situa-se abaixo de 80% em, pelo menos, um horizonte ou alvo; recomenda-se "
+                    "cruzar este sinal com MAE, RMSE e estabilidade temporal antes de decisões operacionais."
                 )
 
             st.download_button(
-                label="Descarregar relatório HTML (gráficos e apêndice técnico)",
+                label="Descarregar relatório HTML",
                 data=html_out.encode("utf-8"),
                 file_name="dashboard_previsao_vendas.html",
                 mime="text/html; charset=utf-8",
@@ -7198,7 +8100,8 @@ def main() -> None:
             )
 
             st.caption(
-                "As métricas de erro seguem o esquema temporal do pipeline (ver Apêndice). O HTML inclui benchmark completo e curvas ROC da tarefa binária auxiliar."
+                "O detalhe do esquema de métricas encontra-se no **Apêndice**; o ficheiro HTML inclui, adicionalmente, "
+                "o *benchmark* de modelos e as curvas ROC."
             )
 
         st.divider()
@@ -7217,15 +8120,15 @@ def main() -> None:
             key="pv_clear_cache",
         ):
             _load_one_role_cached.clear()
-            st.success("Cache limpo. Volte a carregar dados ou gerar previsões.")
+            st.success("O cache das planilhas foi limpo; na próxima leitura, os ficheiros serão obtidos novamente.")
 
     with tab_analises:
         st.markdown(
-            '<p class="pv-section-title">Análises exploratórias sobre os seus dados</p>',
+            '<p class="pv-section-title">Análises</p>',
             unsafe_allow_html=True,
         )
         if st.button(
-            "Carregar dados para análises (sem treinar modelos)",
+            "Carregar dados (sem treino)",
             type="primary",
             use_container_width=True,
             key="pv_load_eda",
@@ -7250,7 +8153,7 @@ def main() -> None:
     with tab_dossie:
         st.markdown('<p class="pv-section-title">Dossiê</p>', unsafe_allow_html=True)
         if st.button(
-            "Carregar dados para análises (sem treinar modelos)",
+            "Carregar dados (sem treino)",
             type="primary",
             use_container_width=True,
             key="pv_load_eda_dossie",
@@ -7277,7 +8180,7 @@ def main() -> None:
     with tab_apendice:
         st.markdown('<p class="pv-section-title">Apêndice</p>', unsafe_allow_html=True)
         if st.button(
-            "Carregar dados para análises (sem treinar modelos)",
+            "Carregar dados (sem treino)",
             type="primary",
             use_container_width=True,
             key="pv_load_eda_apendice",
