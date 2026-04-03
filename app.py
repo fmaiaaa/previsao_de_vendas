@@ -4903,6 +4903,11 @@ h1, h2, h3 {{
 h4, h5, h6 {{
   font-family: 'Montserrat', sans-serif !important;
   color: {COR_AZUL_ESC} !important;
+  text-align: center !important;
+}}
+.katex-display {{
+  margin-left: auto !important;
+  margin-right: auto !important;
 }}
 .pv-section-title {{
   text-align: center;
@@ -5737,83 +5742,124 @@ def run_analytics_only_pipeline(
     return stats_base, ticket, conv, daily_pack, dossie_ml
 
 
+def _streamlit_carregar_dados_exploratorios() -> None:
+    """Lê planilhas, constrói matriz diária e preenche `dados_exploratorios` (sem treino ML)."""
+    with st.spinner("A carregar e consolidar dados…"):
+        dfs_e, sheet_e, used_e = build_data_bundle()
+    st.session_state["sheet_metas"] = sheet_e
+    st.session_state["used_service_account"] = used_e
+    try:
+        with st.spinner("A preparar indicadores e série diária…"):
+            sb, tk, cv, dpk, dml = run_analytics_only_pipeline(dfs_e)
+        st.session_state.dados_exploratorios = {
+            "stats_base": sb,
+            "ticket": tk,
+            "conv": cv,
+            "daily_pack": dpk,
+            "dossie_ml": dml,
+            "sheet_metas": sheet_e,
+        }
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao preparar análises: {e}")
+        st.exception(e)
+
+
 def _render_tab_introducao() -> None:
     """Secção estática: metodologia, métricas, modelos e exemplos (sem dados reais)."""
     import plotly.graph_objects as go
+
+    def _ix(html: str) -> None:
+        st.markdown(
+            f'<div style="text-align:center;max-width:920px;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem">{html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    def _lx(s: str) -> None:
+        _, m, _ = st.columns([1, 6, 1])
+        with m:
+            st.latex(s)
 
     _ipc = {"displayModeBar": True, "displaylogo": False}
     st.markdown(
         '<p class="pv-section-title">Introdução — modelos, alvos e análises</p>',
         unsafe_allow_html=True,
     )
-    st.markdown(
-        """
-<div style="text-align:center;max-width:100%;margin:0 auto 1.2rem auto;color:#475569;font-size:0.95rem;line-height:1.6">
-Esta aplicação estima <strong>vendas futuras</strong> (quantidade e VGV) a partir de funil, calendário, lags e outras <em>features</em>,
-com validação <strong>temporal</strong> (sem misturar o futuro no treino). Abaixo resume-se o que cada parte faz — foco em <strong>modelos e métricas</strong>, não em integrações.
-</div>
-""",
-        unsafe_allow_html=True,
+    _ix(
+        "Estimam-se <strong>quantidade</strong> e <strong>VGV</strong> futuros a partir de uma matriz diária (funil, vendas, calendário). "
+        "A validação é <strong>sempre temporal</strong>: em cada dia <em>t</em> só entram em <strong>X</strong> variáveis observadas até <em>t</em> — "
+        "não se usa informação do futuro para construir *features* (evita <em>leakage</em>). O texto abaixo detalha <strong>alvos</strong>, "
+        "<strong>métricas</strong>, <strong>modelos</strong>, <strong>EDA</strong> e o mapeamento para as abas da aplicação."
     )
 
     st.markdown("#### 1 · Problema e alvos")
-    st.markdown(
-        """
-Para cada dia **t** da série diária constrói-se um alvo **Y** e um vetor de características **X** usando apenas informação **≤ t**.
-
-- **Horizonte fixo** *H* ∈ {3, 7, 30}: **Y** = soma de vendas (qtd ou valor) nos **H** dias **calendário** imediatamente após *t* (dias presentes na base).
-- **Intervalo de calendário** [d₁, d₂]: **Y** = soma das vendas nos dias da série com *t* < *data* ≤ d₂ e d₁ ≤ *data* ≤ d₂.
-- **Deslocamentos** *k*₁,…,*k*ₘ: **Y** = soma nas observações em *t*+*k* (índice da série).
-- **Dias do mês**: **Y** = soma nos dias D₁,… do **mesmo mês**, estritamente após o dia de *t*.
-
-Exemplo simbólico (horizonte *H* = 7, soma de quantidades):
-
-""",
-        unsafe_allow_html=True,
+    _ix(
+        "Trata-se de <strong>regressão supervisionada</strong> indexada pelo tempo. Para cada <em>t</em> define-se um escalar "
+        "<strong>Y</strong> (alvo) e um vetor <strong>X</strong> (preditores). A causalidade temporal exige que cada componente de "
+        "<strong>X</strong> seja função apenas de dados disponíveis até <em>t</em> (lags, médias móveis, indicadores de calendário, etc.)."
     )
-    st.latex(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
-    st.caption(
-        "Em que 𝒟ₜ,₇ é o conjunto (ordenado no tempo) dos até 7 primeiros dias da série estritamente posteriores a t."
+    _ix(
+        "<strong>Horizonte fixo H ∈ {3, 7, 30}.</strong> <strong>Y</strong> é a soma de vendas (qtd ou valor) nos "
+        "<strong>H</strong> primeiros dias da <em>série</em> imediatamente após <em>t</em> (dias efetivamente presentes no índice)."
+    )
+    _ix(
+        "<strong>Intervalo de calendário [d₁, d₂].</strong> <strong>Y</strong> soma vendas nos dias da série tais que "
+        "<em>t</em> &lt; data ≤ d₂ e d₁ ≤ data ≤ d₂ — útil para janelas fixas no calendário."
+    )
+    _ix(
+        "<strong>Deslocamentos k₁,…,kₘ.</strong> <strong>Y</strong> é a soma das observações nas posições <em>t + kⱼ</em> "
+        "(índice da série), não necessariamente os “primeiros H” dias consecutivos na grade."
+    )
+    _ix(
+        "<strong>Dias do mês.</strong> Escolhem-se dias D₁, D₂,… no <strong>mesmo mês</strong> que <em>t</em>, com dia do mês "
+        "&gt; dia(<em>t</em>), e somam-se as vendas nessas datas quando existirem na base."
+    )
+    _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
+    _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
+    _ix(
+        "𝒟<sub>t,7</sub>: até <strong>sete</strong> primeiros instantes da série <strong>estritamente posteriores</strong> a <em>t</em>, por ordem temporal."
     )
 
     st.markdown("#### 2 · Métricas de erro (regressão)")
-    st.markdown("No **conjunto de teste** cronológico (~30% final da série) reportam-se, entre outras:")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.latex(r"\mathrm{MAE} = \frac{1}{n}\sum_{i=1}^{n} \left| y_i - \hat{y}_i \right|")
-        st.caption("Erro médio absoluto — mesma unidade do alvo.")
-    with c2:
-        st.latex(r"\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{y}_i)^2}")
-        st.caption("Penaliza mais outliers que o MAE.")
-    with c3:
-        st.latex(
-            r"R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}"
-        )
-        st.caption("Variação explicada (referência: média de y no bloco).")
+    _ix(
+        "No <strong>conjunto de teste</strong> (≈ últimos 30% da série, ordem cronológica preservada), com <em>n</em> observações, "
+        "valor real <em>yᵢ</em> e previsão <em>ŷᵢ</em>:"
+    )
+    _lx(r"\mathrm{MAE} = \frac{1}{n}\sum_{i=1}^{n} \left| y_i - \hat{y}_i \right|")
+    _ix("MAE — erro médio absoluto; mesma unidade que o alvo.")
+    _lx(r"\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{y}_i)^2}")
+    _ix("RMSE — penaliza mais erros grandes (sensível a outliers).")
+    _lx(r"R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}")
+    _ix("R² — desempenho vs. predizer sempre a média <em>ȳ</em> do bloco de teste.")
 
     st.markdown("#### 3 · Acurácia direcional (auxiliar)")
-    st.markdown(
-        """
-Compara-se, em cada dia de teste, se a previsão está **acima ou abaixo** da **mediana de Y** calculada só no treino.
-É uma tarefa binária **ilustrativa**; o negócio principal continua a ser a regressão (MAE / RMSE / R²).
-""",
-        unsafe_allow_html=True,
+    _ix(
+        "Define-se a <strong>mediana de Y</strong> apenas no conjunto de <strong>treino</strong>. Em cada dia de teste compara-se "
+        "se <em>y</em> e <em>ŷ</em> ficam acima ou abaixo dessa mediana. É uma métrica <strong>binária ilustrativa</strong>; "
+        "decisões de negócio devem privilegiar MAE / RMSE / R²."
     )
-    st.latex(
+    _lx(
         r"\hat{b}_i = \mathbb{1}\left[ \hat{y}_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right],\quad"
         r" b_i = \mathbb{1}\left[ y_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right]"
     )
-    st.latex(r"\mathrm{Acc}_{\mathrm{dir}} = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}[\hat{b}_i = b_i]")
+    _lx(r"\mathrm{Acc}_{\mathrm{dir}} = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}[\hat{b}_i = b_i]")
 
     st.markdown("#### 4 · Pré-processamento e validação")
-    st.markdown(
-        """
-- **MinMaxScaler (0, 1)** com *clip* nas entradas numéricas dos *pipelines* (inclui modelos sensíveis à escala).
-- **Partição temporal:** ~**70%** treino / **30%** teste; dentro do treino, validação cruzada **TimeSeriesSplit** para Optuna.
-- **Optuna:** otimização de hiperparâmetros (TPE + *MedianPruner*), com objetivo que combina MAE e **estabilidade entre folds**.
-- **Pesos amostrais:** mais peso a observações recentes e a regimes extremos de volume, quando o algoritmo suporta.
-""",
-        unsafe_allow_html=True,
+    _ix(
+        "<strong>MinMaxScaler (0, 1)</strong> com <em>clip</em> nas entradas numéricas dos <em>pipelines</em> — alinha escalas para "
+        "SVR, k-NN e redes lineares."
+    )
+    _ix(
+        "<strong>Partição temporal:</strong> ~70% treino / 30% teste. No treino, <strong>TimeSeriesSplit</strong> para avaliar candidatos "
+        "sem baralhar ordem temporal."
+    )
+    _ix(
+        "<strong>Optuna</strong> (TPE + <em>MedianPruner</em>): procura hiperparâmetros minimizando MAE com penalização pela "
+        "<strong>variância entre folds</strong> (modelos mais estáveis no tempo)."
+    )
+    _ix(
+        "<strong>Pesos amostrais:</strong> onde o algoritmo permite, reforçam-se observações recentes e regimes de volume extremo "
+        "para refletir melhor o presente."
     )
 
     st.markdown("#### 5 · Famílias de modelos candidatas")
@@ -5855,12 +5901,17 @@ Compara-se, em cada dia de teste, se a previsão está **acima ou abaixo** da **
         },
     ]
     st.dataframe(pd.DataFrame(rows_mod), use_container_width=True, hide_index=True)
-    st.caption(
-        f"Os **{BLEND_TOP_K_FIXO}** melhores candidatos (por MAE de validação) podem entrar num **super-ensemble** com pesos "
-        r"∝ exp(−(MAE−MAEₘᵢₙ)/τ); se o *blend* não ganhar claramente, mantém-se o melhor modelo isolado."
+    _ix(
+        f"Competem dezenas de <em>pipelines</em>; os <strong>{BLEND_TOP_K_FIXO}</strong> melhores em MAE de validação podem integrar um "
+        r"<strong>super-ensemble</strong> com pesos proporcionais a exp(−(MAE−MAE<sub>min</sub>)/τ). "
+        "Se a combinação não superar claramente o melhor isolado, fica o modelo vencedor único."
     )
 
     st.markdown("#### 6 · Exemplo ilustrativo — hiperparâmetros LightGBM (nomes típicos)")
+    _ix(
+        "Na prática a Optuna varre intervalos de hiperparâmetros; a tabela abaixo resume o <strong>significado</strong> "
+        "dos mais citados no LightGBM (valores reais dependem dos dados e do orçamento de busca)."
+    )
     ex_hp = pd.DataFrame(
         [
             {"Parâmetro": "n_estimators", "Significado": "Número de árvores na sequência", "Exemplo": "200–2000"},
@@ -5874,41 +5925,54 @@ Compara-se, em cada dia de teste, se a previsão está **acima ou abaixo** da **
     st.dataframe(ex_hp, use_container_width=True, hide_index=True)
 
     st.markdown("#### 7 · Análises exploratórias (EDA) no dossiê")
+    _ix(
+        "Antes e independentemente do ajuste fino dos modelos, o <strong>Dossiê</strong> resume a qualidade e o comportamento "
+        "dos dados. Cada bloco responde a uma pergunta diferente (forma da distribuição, redundância, outliers, sazonalidade semanal)."
+    )
     st.markdown(
         """
-| Bloco | Conteúdo típico |
-|------|-----------------|
-| Descritivas | Média, mediana, moda, DP, quartis, percentis, curtose |
-| Outliers IQR | Limites Q1−1,5·IQR e Q3+1,5·IQR |
-| Correlação | Pearson entre *features* e alvos amostrados |
-| VIF | Indicador de redundância linear (subconjunto de colunas) |
-| Distribuições | Histogramas de qtd e VGV diários |
-| Perfil semanal | Médias por dia da semana |
-
-**Correlação de Pearson** (amostral):
-
+<div style="text-align:center;margin:0 auto 1rem auto;overflow-x:auto">
+<table style="margin:0 auto;border-collapse:collapse;font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:8px 12px;text-align:center">Bloco</th>
+<th style="padding:8px 12px;text-align:center">Conteúdo típico</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Descritivas</td>
+<td style="padding:8px;text-align:center">Média, mediana, moda, DP, quartis, percentis, curtose</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Outliers IQR</td>
+<td style="padding:8px;text-align:center">Limites Q1−1,5·IQR e Q3+1,5·IQR</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Correlação</td>
+<td style="padding:8px;text-align:center">Pearson entre <em>features</em> e alvos amostrados</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">VIF</td>
+<td style="padding:8px;text-align:center">Redundância linear (subconjunto de colunas)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center">Distribuições</td>
+<td style="padding:8px;text-align:center">Histogramas de qtd e VGV diários</td></tr>
+<tr><td style="padding:8px;text-align:center">Perfil semanal</td>
+<td style="padding:8px;text-align:center">Médias por dia da semana</td></tr>
+</tbody></table></div>
 """,
         unsafe_allow_html=True,
     )
-    st.latex(
+    _ix("<strong>Correlação de Pearson</strong> (amostral) entre variáveis <em>x</em> e <em>y</em>:")
+    _lx(
         r"r_{xy} = \frac{\sum_i (x_i - \bar{x})(y_i - \bar{y})}"
         r"{\sqrt{\sum_i (x_i-\bar{x})^2}\,\sqrt{\sum_i (y_i-\bar{y})^2}}"
     )
-    st.markdown(
-        """
-**VIF** para variável *j* (OLS):
-""",
-        unsafe_allow_html=True,
-    )
-    st.latex(r"\mathrm{VIF}_j = \frac{1}{1 - R^2_j}")
-    st.caption("R²ⱼ vem da regressão de xⱼ sobre as demais *features* do subconjunto.")
-    st.markdown("**Outliers (regra IQR):** quartis Q1, Q3 e amplitude interquartil IQR = Q3 − Q1.")
-    st.latex(
+    _ix("<strong>VIF</strong> da variável <em>j</em> (via regressão OLS de <em>xⱼ</em> nas demais colunas do subconjunto):")
+    _lx(r"\mathrm{VIF}_j = \frac{1}{1 - R^2_j}")
+    _ix("R²ⱼ é o coeficiente de determinação dessa regressão auxiliar — VIF alto (&gt; 5–10) sugere colinearidade.")
+    _ix("<strong>Outliers (regra IQR):</strong> IQR = Q3 − Q1; pontos fora de [L<sub>inf</sub>, L<sub>sup</sub>] são destacados (não são removidos automaticamente do alvo de negócio).")
+    _lx(
         r"L_{\mathrm{inf}} = Q_1 - 1.5 \cdot \mathrm{IQR},\quad "
         r"L_{\mathrm{sup}} = Q_3 + 1.5 \cdot \mathrm{IQR}"
     )
 
     st.markdown("#### 8 · Gráficos usados na aplicação (exemplos sintéticos)")
+    _ix(
+        "Na aba <strong>Análises</strong> verá funil empilhado, dispersão, médias por dia da semana, etc. Abaixo, três figuras "
+        "<strong>puramente ilustrativas</strong> (dados inventados) para familiarizar com o tipo de leitura."
+    )
     g1, g2 = st.columns(2)
     with g1:
         fig_ex = go.Figure(
@@ -5988,17 +6052,33 @@ Compara-se, em cada dia de teste, se a previsão está **acima ou abaixo** da **
     st.plotly_chart(fig_ser, use_container_width=True, config=_ipc)
 
     st.markdown("#### 9 · Onde ver cada coisa nesta app")
+    _ix("Mapa rápido das abas e do que precisa (ou não) de treino ML completo:")
     st.markdown(
         """
-| Secção | Conteúdo |
-|--------|----------|
-| **Introdução** | Este guia conceitual |
-| **Análises** | Indicadores, funil, dispersão, correlação na sua base (com ou sem treino) |
-| **Previsões** | Treino completo, tabela de previsões, relatório HTML |
-| **Dossiê** | EDA detalhada com dados carregados; métricas de modelos após **Previsões** |
-| **Apêndice** | Metodologia resumida com dados carregados; hiperparâmetros finais após **Previsões** |
+<div style="text-align:center;margin:0 auto 1.5rem auto;overflow-x:auto">
+<table style="margin:0 auto;border-collapse:collapse;font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:8px 14px;text-align:center">Secção</th>
+<th style="padding:8px 14px;text-align:center">Conteúdo</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Introdução</strong></td>
+<td style="padding:8px;text-align:center">Este guia conceitual (sempre disponível)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Análises</strong></td>
+<td style="padding:8px;text-align:center">Indicadores e gráficos sobre a sua base (carregar dados ou após previsões)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Previsões</strong></td>
+<td style="padding:8px;text-align:center">Treino Optuna, tabela de previsões, download HTML</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px;text-align:center"><strong>Dossiê</strong></td>
+<td style="padding:8px;text-align:center">EDA completa; métricas de modelos após <strong>Previsões</strong></td></tr>
+<tr><td style="padding:8px;text-align:center"><strong>Apêndice</strong></td>
+<td style="padding:8px;text-align:center">Metodologia resumida; hiperparâmetros finais após <strong>Previsões</strong></td></tr>
+</tbody></table></div>
 """,
         unsafe_allow_html=True,
+    )
+    _ix(
+        "Nas abas <strong>Análises</strong>, <strong>Dossiê</strong> e <strong>Apêndice</strong> o botão de carregar dados "
+        "permite explorar a base <strong>sem</strong> executar o treino completo dos modelos."
     )
 
 
@@ -6249,7 +6329,10 @@ def _render_streamlit_tab_analises(
         )
         st.plotly_chart(fig_h, use_container_width=True, config=_pc)
     else:
-        st.info("Correlação entre variáveis numéricas indisponível (poucas colunas ou dados).")
+        st.markdown(
+            '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">Correlação indisponível (poucas colunas ou dados).</p>',
+            unsafe_allow_html=True,
+        )
 
     macro = daily.get("macro") or {}
     if macro:
@@ -6346,9 +6429,10 @@ def _render_streamlit_tab_analises(
                 else:
                     st.caption("—")
     else:
-        st.info(
-            "Gráficos de **importância de *features*** por horizonte surgem após executar **Gerar previsões** "
-            "(aba Previsões). As análises exploratórias acima funcionam só com **Carregar dados para análises**."
+        st.markdown(
+            '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin-top:0.5rem">'
+            "Importância de <em>features</em> por horizonte: disponível após <strong>Gerar previsões</strong>.</p>",
+            unsafe_allow_html=True,
         )
 
 
@@ -6427,8 +6511,10 @@ O relatório HTML descarregável na aba **Previsões** contém curvas de teste, 
             )
             st.json({"volume (qtd)": bpc.get("qtd") or {}, "vgv": bpc.get("valor") or {}})
         else:
-            st.info(
-                "Não há cenário personalizado nesta execução. Use **Intervalo de previsão** na aba Previsões para treinar com intervalo de calendário ou dias combinados."
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem">'
+                "Sem cenário personalizado nesta execução.</p>",
+                unsafe_allow_html=True,
             )
 
 
@@ -6443,14 +6529,9 @@ def _render_streamlit_dossie_ml(
     _dpc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
 
     st.markdown(
-        '<p class="pv-section-title">Dossiê analítico e de modelagem</p>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div style='text-align:center;max-width:720px;margin:0 auto 1rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
-        "Documento técnico com <strong>estatísticas descritivas</strong>, <strong>outliers</strong> (IQR), "
-        "<strong>correlações</strong>, <strong>VIF</strong>, <strong>balanceamento</strong>, distribuições e notas sobre "
-        "<strong>tratamento de dados</strong> e <strong>mitigação de overfitting</strong>.</div>",
+        "<div style='text-align:center;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
+        "<strong>Análise e modelagem</strong> — estatísticas descritivas, outliers (IQR), correlações, VIF, "
+        "balanceamento, distribuições e notas sobre dados e <em>overfitting</em>.</div>",
         unsafe_allow_html=True,
     )
 
@@ -6546,7 +6627,10 @@ def _render_streamlit_dossie_ml(
             )
             st.plotly_chart(fig_h, use_container_width=True, config=_dpc)
         else:
-            st.info("Matriz de correlação indisponível (poucas variáveis ou dados).")
+            st.markdown(
+                '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">Matriz de correlação indisponível.</p>',
+                unsafe_allow_html=True,
+            )
         st.divider()
         if pares:
             st.markdown("##### Pares com |r| ≥ 0,85")
@@ -6722,9 +6806,10 @@ def _render_streamlit_dossie_ml(
         if _hay_metricas:
             st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
         else:
-            st.info(
-                "Ainda **não há métricas de modelos**: execute **Gerar previsões** na aba Previsões. "
-                "As outras abas do dossiê (dados, EDA, distribuições) já refletem a carga exploratória."
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin:0.5rem 0">'
+                "Métricas de modelos após <strong>Gerar previsões</strong>. O restante do dossiê reflete os dados já carregados.</p>",
+                unsafe_allow_html=True,
             )
         low_acc: list[dict[str, Any]] = []
         for r in rows_m:
@@ -6848,18 +6933,6 @@ def main() -> None:
     )
     st.markdown('<div class="pv-bar-wrap"><div class="pv-bar"></div></div>', unsafe_allow_html=True)
 
-    try:
-
-        sa_ok = gspread_client_from_streamlit() is not None
-    except Exception:
-        sa_ok = False
-
-    if sa_ok:
-        st.markdown(
-            '<div class="pv-status-pill pv-status-ok">Conta de serviço Google ativa · API com varredura de abas</div>',
-            unsafe_allow_html=True,
-        )
-
     if "resultado" not in st.session_state:
         st.session_state.resultado = None
     if "pv_custom_cfg" not in st.session_state:
@@ -6876,7 +6949,7 @@ def main() -> None:
 
     with tab_previsoes:
         st.markdown(
-            '<p class="pv-section-title">Previsão e relatório</p>',
+            '<p class="pv-section-title">Previsões e relatório</p>',
             unsafe_allow_html=True,
         )
         st.markdown(
@@ -6917,12 +6990,16 @@ def main() -> None:
                     f"Cenário ativo: **intervalo** {cfg.get('date_start')} → {cfg.get('date_end')}"
                 )
             elif cfg.get("values"):
-                st.info(
-                    f"Cenário ativo: **{cfg.get('mode')}** — {', '.join(str(x) for x in cfg['values'])}"
+                st.markdown(
+                    f"<div style='text-align:center;color:#0f172a;font-size:0.92rem'>Cenário ativo: "
+                    f"<strong>{cfg.get('mode')}</strong> — {', '.join(str(x) for x in cfg['values'])}</div>",
+                    unsafe_allow_html=True,
                 )
         else:
-            st.caption(
-                "Sem cenário opcional: apenas horizontes fixos 3 / 7 / 30 dias. Use **Intervalo de previsão** para acrescentar."
+            st.markdown(
+                "<p style='text-align:center;color:#64748b;font-size:0.88rem'>"
+                "Horizontes fixos 3 / 7 / 30 dias. Opcional: <strong>Intervalo de previsão</strong>.</p>",
+                unsafe_allow_html=True,
             )
 
         run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
@@ -6983,10 +7060,7 @@ def main() -> None:
 
         res = st.session_state.resultado
         if res is None:
-            st.info(
-                "Clique em **Gerar previsões** para treinar modelos e obter tabela de previsões e relatório HTML. "
-                "Para gráficos exploratórios **sem** treino, use **Carregar dados para análises** na aba **Análises**."
-            )
+            pass
         else:
             stats_base = res["stats_base"]
             ticket = res["ticket"]
@@ -7127,38 +7201,13 @@ def main() -> None:
             '<p class="pv-section-title">Análises exploratórias sobre os seus dados</p>',
             unsafe_allow_html=True,
         )
-        c_ld, c_cap = st.columns([1, 2])
-        with c_ld:
-            load_eda = st.button(
-                "Carregar dados para análises (sem treinar modelos)",
-                use_container_width=True,
-                key="pv_load_eda",
-            )
-        with c_cap:
-            st.caption(
-                "Lê as planilhas, constrói a matriz diária e atualiza **Análises** e **Dossiê** (parte EDA). "
-                "Não executa Optuna nem gera previsões — use **Gerar previsões** na aba **Previsões** para isso."
-            )
-        if load_eda:
-            with st.spinner("A carregar e consolidar dados…"):
-                dfs_e, sheet_e, used_e = build_data_bundle()
-            st.session_state["sheet_metas"] = sheet_e
-            st.session_state["used_service_account"] = used_e
-            try:
-                with st.spinner("A preparar indicadores e série diária…"):
-                    sb, tk, cv, dpk, dml = run_analytics_only_pipeline(dfs_e)
-                st.session_state.dados_exploratorios = {
-                    "stats_base": sb,
-                    "ticket": tk,
-                    "conv": cv,
-                    "daily_pack": dpk,
-                    "dossie_ml": dml,
-                    "sheet_metas": sheet_e,
-                }
-                st.success("Dados prontos para análises e dossiê (sem modelos treinados).")
-            except Exception as e:
-                st.error(f"Erro ao preparar análises: {e}")
-                st.exception(e)
+        if st.button(
+            "Carregar dados para análises (sem treinar modelos)",
+            type="primary",
+            use_container_width=True,
+            key="pv_load_eda",
+        ):
+            _streamlit_carregar_dados_exploratorios()
 
         res_a = st.session_state.resultado
         dex_a = st.session_state.get("dados_exploratorios")
@@ -7178,12 +7227,17 @@ def main() -> None:
                 fonte_a["conv"],
                 por_h_a,
             )
-        else:
-            st.info(
-                "Use **Carregar dados para análises** acima ou **Gerar previsões** (aba Previsões) para ver gráficos com a sua base."
-            )
 
     with tab_dossie:
+        st.markdown('<p class="pv-section-title">Dossiê</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados para análises (sem treinar modelos)",
+            type="primary",
+            use_container_width=True,
+            key="pv_load_eda_dossie",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
         res_d = st.session_state.resultado
         dex_d = st.session_state.get("dados_exploratorios")
         if res_d and res_d.get("dossie_ml") and res_d.get("daily_pack"):
@@ -7200,12 +7254,17 @@ def main() -> None:
                 dex_d["daily_pack"],
                 None,
             )
-        else:
-            st.info(
-                "Carregue dados na aba **Análises** ou gere previsões na aba **Previsões** para preencher o dossiê."
-            )
 
     with tab_apendice:
+        st.markdown('<p class="pv-section-title">Apêndice</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados para análises (sem treinar modelos)",
+            type="primary",
+            use_container_width=True,
+            key="pv_load_eda_apendice",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
         res_ap = st.session_state.resultado
         dex_ap = st.session_state.get("dados_exploratorios")
         if res_ap and res_ap.get("daily_pack"):
@@ -7226,10 +7285,6 @@ def main() -> None:
                 BLEND_TOP_K_FIXO,
                 RANDOM_SEED,
                 dex_ap["daily_pack"],
-            )
-        else:
-            st.info(
-                "Após **Carregar dados para análises** vê-se aqui a **metodologia** (hiperparâmetros finais surgem só após **Gerar previsões**)."
             )
 
     st.markdown(
