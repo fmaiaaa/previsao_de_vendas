@@ -1,0 +1,17 @@
+# Ambiente isolado: pip install -r requirements-previsao.txt
+pandas==2.3.3
+openpyxl==3.1.5
+numpy==2.3.5
+scikit-learn==1.8.0
+statsmodels>=0.14.0
+optuna==4.6.0
+plotly==6.5.0
+xgboost==3.1.2
+lightgbm==4.6.0
+catboost>=1.2.7
+ngboost>=0.5.0
+streamlit==1.55.0
+jinja2==3.1.6
+tqdm>=4.66.0
+gspread>=6.1.0
+google-auth>=2.29.0

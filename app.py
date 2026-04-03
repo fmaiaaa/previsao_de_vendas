@@ -185,7 +185,7 @@ html, body, [class*="css"] {{
   max-width: 1040px !important;
   margin-left: auto !important;
   margin-right: auto !important;
-  padding: 1.5rem 1.75rem 2rem 1.75px !important;
+  padding: 1.5rem 1.75rem 2rem 1.75rem !important;
   background: #ffffff !important;
   backdrop-filter: none;
   border-radius: 18px !important;
@@ -220,8 +220,8 @@ div[data-testid="stAlert"] {{
 div[data-testid="stAlert"] p, div[data-testid="stAlert"] div {{
   color: #1e293b !important;
 }}
-[data-testid="stSpinner"] + div, [data-testid="stSpinner"] {{
-  color: #0f172a !important;
+[data-testid="stDataFrame"], [data-testid="stDataFrame"] > div {{
+  background: #ffffff !important;
 }}
 .pv-logo-wrap {{
   text-align: center;
