@@ -8732,7 +8732,7 @@ def _render_streamlit_tab_analises(
             legend=_plotly_legend_bottom(),
             margin=dict(t=100, l=56, r=52, b=112),
         )
-    _xr_m = _plotly_xaxis_range_from_dates(dates)
+        _xr_m = _plotly_xaxis_range_from_dates(dates)
         if _xr_m:
             _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
         fig_m.update_layout(**_lo_m)
