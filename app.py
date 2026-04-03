@@ -1019,6 +1019,101 @@ def _safe_fit_pipeline(
         pipe.fit(X, y)
 
 
+def _fit_lgbm_with_early_stopping(
+    model: Any,
+    X_tr,
+    y_tr,
+    X_va,
+    y_va,
+    sample_weight,
+    *,
+    stopping_rounds: int = 48,
+) -> None:
+    """Treino LGBM com validação no fold e *early stopping* nas árvores (métrica MAE)."""
+    eval_set = [(X_va, np.asarray(y_va, dtype=float).ravel())]
+    try:
+        from lightgbm import early_stopping, log_evaluation
+
+        cbs = [
+            early_stopping(stopping_rounds=stopping_rounds, verbose=False),
+            log_evaluation(period=0),
+        ]
+        if sample_weight is not None:
+            model.fit(
+                X_tr,
+                y_tr,
+                sample_weight=sample_weight,
+                eval_set=eval_set,
+                eval_metric="mae",
+                callbacks=cbs,
+            )
+        else:
+            model.fit(X_tr, y_tr, eval_set=eval_set, eval_metric="mae", callbacks=cbs)
+    except (ImportError, TypeError, ValueError):
+        if sample_weight is not None:
+            model.fit(
+                X_tr,
+                y_tr,
+                sample_weight=sample_weight,
+                eval_set=eval_set,
+                eval_metric="mae",
+                early_stopping_rounds=stopping_rounds,
+                verbose=-1,
+            )
+        else:
+            model.fit(
+                X_tr,
+                y_tr,
+                eval_set=eval_set,
+                eval_metric="mae",
+                early_stopping_rounds=stopping_rounds,
+                verbose=-1,
+            )
+
+
+def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
+    """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
+    nt = max(8, int(n_trials))
+    min_tr = max(14, min(52, (2 * nt) // 5))
+    pat = max(10, min(40, nt // 5))
+    if min_tr >= nt:
+        min_tr = max(8, min(nt - 2, (2 * nt) // 5))
+    return pat, max(6, min_tr)
+
+
+def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
+    state: dict[str, float | int] = {"best": float("inf"), "no_improve": 0}
+
+    def _cb(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+        if trial.value is None:
+            return
+        if not math.isfinite(float(trial.value)):
+            return
+        n_ok = 0
+        for t in study.trials:
+            if t.state != optuna.trial.TrialState.COMPLETE or t.value is None:
+                continue
+            if not math.isfinite(float(t.value)):
+                continue
+            n_ok += 1
+        bv = float(study.best_value)
+        if n_ok < min_trials:
+            state["best"] = bv
+            state["no_improve"] = 0
+            return
+        if bv < float(state["best"]) - 1e-9:
+            state["best"] = bv
+            state["no_improve"] = 0
+        else:
+            state["no_improve"] = int(state["no_improve"]) + 1
+        if int(state["no_improve"]) >= patience:
+            study.stop()
+
+    return _cb
+
+
 def _optuna_objective_lgbm(
     trial: optuna.Trial,
     X_train: pd.DataFrame,
@@ -1093,7 +1188,17 @@ def _optuna_objective_lgbm(
             model = LGBMRegressor(**param)
             y_tr = y_train.iloc[tr_idx]
             sw = sample_weights(y_tr, True, target_name, horizon)
-            model.fit(X_train.iloc[tr_idx], y_tr, sample_weight=sw)
+            y_va_fold = y_train.iloc[va_idx]
+            es_rounds = 56 if long_h else 44
+            _fit_lgbm_with_early_stopping(
+                model,
+                X_train.iloc[tr_idx],
+                y_tr,
+                X_train.iloc[va_idx],
+                y_va_fold,
+                sw,
+                stopping_rounds=es_rounds,
+            )
             p = model.predict(X_train.iloc[va_idx])
             fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
             scores.append(fold_mae)
@@ -1698,10 +1803,17 @@ def train_one_target(
             ),
         )
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+        es_patience, es_min_trials = _optuna_patience_cfg(nt)
         study.optimize(
             objective,
             n_trials=nt,
             show_progress_bar=show_progress,
+            callbacks=[
+                _make_optuna_patience_stopping_callback(
+                    patience=es_patience,
+                    min_trials=es_min_trials,
+                )
+            ],
         )
         completed = [
             t
@@ -6793,12 +6905,231 @@ def _render_tab_introducao() -> None:
             "Notas": "Mediana, médias móveis, *stacks* simples para comparação.",
         },
     ]
-    st.dataframe(pd.DataFrame(rows_mod), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows_mod), width="stretch", hide_index=True)
     _ix(
         f"Os <strong>{BLEND_TOP_K_FIXO}</strong> modelos com menor MAE na validação interna integram um <strong>ensemble</strong> "
         r"cujos pesos seguem ∝ exp(−(MAE−MAE<sub>min</sub>)/τ). Contudo, caso não exista ganho estatístico claro, "
         f"preserva-se unicamente o melhor modelo individual."
     )
+
+    st.markdown("##### Ilustrações por tipo de modelo (dados sintéticos, 1D)")
+    _ix(
+        "Para cada família, mostra-se uma relação fictícia entre uma variável <em>x</em> e um alvo <em>y</em> ruidoso. "
+        "Na prática, o vetor <strong>X</strong> tem muitas dimensões; estes painéis servem apenas para <strong>intuir a forma</strong> "
+        "da função que cada método aprende (reta, degraus, curva suave, média de árvores, etc.)."
+    )
+    try:
+        from sklearn.ensemble import (
+            GradientBoostingRegressor,
+            RandomForestRegressor,
+        )
+        from sklearn.linear_model import LinearRegression
+        from sklearn.neighbors import KNeighborsRegressor
+        from sklearn.svm import SVR
+        from sklearn.tree import DecisionTreeRegressor
+
+        rng = np.random.default_rng(42)
+        n_pt = 55
+        xs = np.sort(rng.uniform(0, 10, n_pt))
+        y_true = 2.0 + 0.82 * xs
+        ys = y_true + rng.normal(0, 1.05, n_pt)
+        x_col = xs.reshape(-1, 1)
+        x_grid = np.linspace(0, 10, 200).reshape(-1, 1)
+
+        def _lo_intro(title: str, *, yl: str = "y", xl: str = "x") -> dict[str, Any]:
+            return _plotly_layout_direcional(
+                title=title,
+                height=300,
+                xaxis_title=f"Eixo X — {xl}",
+                yaxis_title=f"Eixo Y — {yl}",
+                margin=dict(t=88, l=48, r=28, b=44),
+                legend=_plotly_legend_top(),
+            )
+
+        sc_d = dict(size=7, color=PLOT_MUTED, opacity=0.72, line=dict(width=0.5, color="#fff"))
+
+        lr = LinearRegression().fit(x_col, ys)
+        y_lin = lr.predict(x_grid)
+        fig_lin = go.Figure()
+        fig_lin.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_lin.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_lin,
+                mode="lines",
+                name="ŷ = β₀ + β₁x",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_lin.update_layout(**_lo_intro("Regressão linear (ideia Ridge / ElasticNet)"))
+
+        knn = KNeighborsRegressor(n_neighbors=5, weights="distance").fit(x_col, ys)
+        y_knn = knn.predict(x_grid)
+        fig_knn = go.Figure()
+        fig_knn.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_knn.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_knn,
+                mode="lines",
+                name="Média local (vizinhos)",
+                line=dict(color=PLOT_VERMELHO, width=2.8),
+            )
+        )
+        fig_knn.update_layout(**_lo_intro("k-NN — média ponderada por distância"))
+
+        dt = DecisionTreeRegressor(max_depth=3, random_state=42).fit(x_col, ys)
+        y_dt = dt.predict(x_grid)
+        fig_dt = go.Figure()
+        fig_dt.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_dt.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_dt,
+                mode="lines",
+                name="Predição em degraus",
+                line=dict(color=PLOT_AZUL, width=2.5),
+            )
+        )
+        fig_dt.update_layout(**_lo_intro("Árvore de decisão — partições constantes por troço"))
+
+        rf = RandomForestRegressor(
+            n_estimators=60, max_depth=4, random_state=42, n_jobs=-1
+        ).fit(x_col, ys)
+        y_rf = rf.predict(x_grid)
+        fig_rf = go.Figure()
+        fig_rf.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        for est in rf.estimators_[:12]:
+            yt = est.predict(x_grid)
+            fig_rf.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=yt,
+                    mode="lines",
+                    line=dict(width=0.9, color="rgba(100,116,139,0.28)"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_rf,
+                mode="lines",
+                name="Média das árvores",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_rf.update_layout(**_lo_intro("Random Forest — várias árvores e agregação"))
+
+        gbr = GradientBoostingRegressor(
+            n_estimators=14,
+            max_depth=2,
+            learning_rate=0.45,
+            subsample=0.9,
+            random_state=42,
+        ).fit(x_col, ys)
+        staged = list(gbr.staged_predict(x_grid))
+        fig_gb = go.Figure()
+        fig_gb.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        show_st = [0, 3, 7, len(staged) - 1]
+        dash_c = ["dot", "dash", "longdash", "solid"]
+        for i, si in enumerate(show_st):
+            lab = f"Após árvore {si + 1}" if si < len(staged) - 1 else "Modelo completo"
+            fig_gb.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=staged[si],
+                    mode="lines",
+                    name=lab,
+                    line=dict(
+                        width=2.4 if i == len(show_st) - 1 else 1.6,
+                        color=PLOT_VERMELHO if i == len(show_st) - 1 else PLOT_ACCENT,
+                        dash=dash_c[i],
+                    ),
+                )
+            )
+        fig_gb.update_layout(**_lo_intro("Gradient boosting — soma progressiva de árvores fracas"))
+
+        svr = SVR(kernel="rbf", C=12.0, epsilon=0.2, gamma=0.28).fit(x_col, ys)
+        y_svr = svr.predict(x_grid)
+        fig_svr = go.Figure()
+        fig_svr.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_svr.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_svr,
+                mode="lines",
+                name="Kernel RBF (curva suave)",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_svr.update_layout(**_lo_intro("SVR — fronteira suave via kernel"))
+
+        r1a, r1b = st.columns(2)
+        with r1a:
+            st.plotly_chart(fig_lin, width="stretch", config=_ipc)
+            st.caption("**Lineares:** ajustam um hiperplano; com regularização, coeficientes encolhem (L2/L1).")
+        with r1b:
+            st.plotly_chart(fig_knn, width="stretch", config=_ipc)
+            st.caption("**k-NN:** o valor previsto depende dos vizinhos mais próximos no espaço das *features*.")
+
+        r2a, r2b = st.columns(2)
+        with r2a:
+            st.plotly_chart(fig_dt, width="stretch", config=_ipc)
+            st.caption("**Árvore única:** divide o espaço em regiões; em cada folha, predição aproximadamente constante.")
+        with r2b:
+            st.plotly_chart(fig_rf, width="stretch", config=_ipc)
+            st.caption("**Bagging (ex.: RF):** muitas árvores em subamostras; a linha espessa é a média das predições.")
+
+        r3a, r3b = st.columns(2)
+        with r3a:
+            st.plotly_chart(fig_gb, width="stretch", config=_ipc)
+            st.caption(
+                "**Boosting (LightGBM / XGBoost / CatBoost seguem a mesma lógica):** cada nova árvore corrige resíduos; "
+                "a curva final aproxima-se dos dados."
+            )
+        with r3b:
+            st.plotly_chart(fig_svr, width="stretch", config=_ipc)
+            st.caption("**SVR:** o kernel RBF permite relações não lineares suaves sem particionar em degraus.")
+
+        med_y = float(np.median(ys))
+        fig_base = go.Figure()
+        fig_base.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_base.add_trace(
+            go.Scatter(
+                x=[0, 10],
+                y=[med_y, med_y],
+                mode="lines",
+                name="Baseline mediana",
+                line=dict(color=PLOT_VERMELHO, width=2.8, dash="dash"),
+            )
+        )
+        fig_base.update_layout(**_lo_intro("Baseline — predição constante (mediana)"))
+        st.plotly_chart(fig_base, width="stretch", config=_ipc)
+        st.caption(
+            "**Stack / ensemble:** combina predições de vários modelos (por média ponderada ou meta-modelo); "
+            "a mediana é a referência ingénua mais simples."
+        )
+    except Exception as _e_intro_viz:
+        st.caption(
+            f"Não foi possível gerar as ilustrações automáticas (dependências ou ambiente: {_e_intro_viz!s}). "
+            "Instale `scikit-learn` e confirme a versão compatível com o projeto."
+        )
 
     st.markdown("#### 6 · LightGBM — parâmetros (referência)")
     _ix(
@@ -6815,7 +7146,7 @@ def _render_tab_introducao() -> None:
             {"Parâmetro": "reg_alpha / reg_lambda", "Significado": "Regularização L1 / L2", "Exemplo": "1e-8–10"},
         ]
     )
-    st.dataframe(ex_hp, use_container_width=True, hide_index=True)
+    st.dataframe(ex_hp, width="stretch", hide_index=True)
 
     st.markdown("#### 7 · Dossiê (EDA)")
     _ix(
@@ -6899,7 +7230,7 @@ def _render_tab_introducao() -> None:
                 xaxis_title="Peso relativo",
             ),
         )
-        st.plotly_chart(fig_ex, use_container_width=True, config=_ipc)
+        st.plotly_chart(fig_ex, width="stretch", config=_ipc)
     with g2:
         lbl = ["A", "B", "C", "D"]
         z = [[1.0, 0.35, -0.12, 0.08], [0.35, 1.0, 0.22, -0.05], [-0.12, 0.22, 1.0, 0.41], [0.08, -0.05, 0.41, 1.0]]
@@ -6921,7 +7252,7 @@ def _render_tab_introducao() -> None:
                 margin=dict(l=48, r=48, t=52, b=48),
             ),
         )
-        st.plotly_chart(fig_c, use_container_width=True, config=_ipc)
+        st.plotly_chart(fig_c, width="stretch", config=_ipc)
 
     fig_ser = go.Figure()
     fig_ser.add_trace(
@@ -6946,11 +7277,11 @@ def _render_tab_introducao() -> None:
             height=340,
             xaxis_title="Eixo X — ordem no tempo",
             yaxis_title="Eixo Y — valor",
+            legend=_plotly_legend_top(),
+            margin=dict(t=100, l=56, r=48, b=52),
         ),
-        legend=_plotly_legend_top(),
-        margin=dict(t=100, l=56, r=48, b=52),
     )
-    st.plotly_chart(fig_ser, use_container_width=True, config=_ipc)
+    st.plotly_chart(fig_ser, width="stretch", config=_ipc)
 
     st.markdown("#### 9 · Abas")
     _ix("Segue-se um resumo orientativo das secções da aplicação:")
@@ -7026,7 +7357,7 @@ def _render_streamlit_ml_feature_importance(
                             showlegend=False,
                         ),
                     )
-                    st.plotly_chart(fig_i, use_container_width=True, config=plot_config)
+                    st.plotly_chart(fig_i, width="stretch", config=plot_config)
                 else:
                     st.caption("—")
             with c2:
@@ -7052,7 +7383,7 @@ def _render_streamlit_ml_feature_importance(
                             showlegend=False,
                         ),
                     )
-                    st.plotly_chart(fig_iv, use_container_width=True, config=plot_config)
+                    st.plotly_chart(fig_iv, width="stretch", config=plot_config)
                 else:
                     st.caption("—")
         st.divider()
@@ -7182,7 +7513,12 @@ def _render_streamlit_tab_analises(
             hovertemplate="%{x}<br>Valor: %{y:.3f} mi R$<extra></extra>",
         )
     )
-    _lo_f = _plotly_layout_direcional(title="Funil diário (empilhado) e alvos", height=500)
+    _lo_f = _plotly_layout_direcional(
+        title="Funil diário (empilhado) e alvos",
+        height=500,
+        legend=_plotly_legend_top(),
+        margin=dict(t=108, l=58, r=62, b=60),
+    )
     _xr_f = _plotly_xaxis_range_from_dates(dates)
     if _xr_f:
         _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
@@ -7190,8 +7526,6 @@ def _render_streamlit_tab_analises(
         **_lo_f,
         xaxis_title="Eixo X — data",
         yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
-        legend=_plotly_legend_top(),
-        margin=dict(t=108, l=58, r=62, b=60),
         yaxis2=dict(
             overlaying="y",
             side="right",
@@ -7215,7 +7549,7 @@ def _render_streamlit_tab_analises(
             tickfont=dict(size=11),
         ),
     )
-    st.plotly_chart(fig_f, use_container_width=True, config=_pc)
+    st.plotly_chart(fig_f, width="stretch", config=_pc)
     _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
     tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
@@ -7242,16 +7576,14 @@ def _render_streamlit_tab_analises(
         height=380,
         xaxis_title="Eixo X — data",
         yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+        legend=_plotly_legend_top(),
+        margin=dict(t=100, l=56, r=52, b=58),
     )
     _xr_roll = _plotly_xaxis_range_from_dates(dates)
     if _xr_roll:
         _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
-    fig_roll.update_layout(
-        **_lo_roll,
-        legend=_plotly_legend_top(),
-        margin=dict(t=100, l=56, r=52, b=58),
-    )
-    st.plotly_chart(fig_roll, use_container_width=True, config=_pc)
+    fig_roll.update_layout(**_lo_roll)
+    st.plotly_chart(fig_roll, width="stretch", config=_pc)
     _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
 
     fig_sc = go.Figure()
@@ -7272,7 +7604,7 @@ def _render_streamlit_tab_analises(
             yaxis_title="Eixo Y — quantidade vendida (/ dia)",
         ),
     )
-    st.plotly_chart(fig_sc, use_container_width=True, config=_pc)
+    st.plotly_chart(fig_sc, width="stretch", config=_pc)
     _st_interpretacao_grafico("Leads × vendas (mesmo dia)", _interpret_text_leads_vendas(daily))
 
     dl = daily.get("dow_labels") or []
@@ -7297,21 +7629,24 @@ def _render_streamlit_tab_analises(
         )
     )
     fig_d.update_layout(
-        **_plotly_layout_direcional(title="Perfil por dia da semana (média histórica)", height=420),
-        barmode="group",
-        xaxis_title="Eixo X — dia da semana",
-        yaxis_title="Eixo Y₁ — média de quantidade (/ dia)",
-        legend=_plotly_legend_top(),
-        margin=dict(t=100, l=56, r=52, b=56),
-        yaxis2=dict(
-            overlaying="y",
-            side="right",
-            title="Eixo Y₂ — média de VGV (mi R$ / dia)",
-            showgrid=False,
-            tickfont=dict(size=11),
+        **_plotly_layout_direcional(
+            title="Perfil por dia da semana (média histórica)",
+            height=420,
+            barmode="group",
+            xaxis_title="Eixo X — dia da semana",
+            yaxis_title="Eixo Y₁ — média de quantidade (/ dia)",
+            legend=_plotly_legend_top(),
+            margin=dict(t=100, l=56, r=52, b=56),
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                title="Eixo Y₂ — média de VGV (mi R$ / dia)",
+                showgrid=False,
+                tickfont=dict(size=11),
+            ),
         ),
     )
-    st.plotly_chart(fig_d, use_container_width=True, config=_pc)
+    st.plotly_chart(fig_d, width="stretch", config=_pc)
     _st_interpretacao_grafico("Média por dia da semana", _interpret_text_dow(daily))
 
     cl = daily.get("corr_labels") or []
@@ -7340,7 +7675,7 @@ def _render_streamlit_tab_analises(
                 margin=dict(l=130, r=48, t=56, b=130),
             ),
         )
-        st.plotly_chart(fig_h, use_container_width=True, config=_pc)
+        st.plotly_chart(fig_h, width="stretch", config=_pc)
         _st_interpretacao_grafico("Matriz de correlação (Pearson)", _interpret_text_correlation_matrix(cl, cz))
         st.caption(
             "A matriz resume associações lineares entre pares de variáveis; para ver a nuvem de pontos entre **quaisquer duas** "
@@ -7441,7 +7776,7 @@ def _render_streamlit_tab_analises(
                         ),
                         margin=dict(t=56, l=56, r=48, b=56),
                     )
-                    st.plotly_chart(fig_pair, use_container_width=True, config=_pc)
+                    st.plotly_chart(fig_pair, width="stretch", config=_pc)
                     _txt_r = (
                         f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
                         if r_xy is not None
@@ -7492,7 +7827,7 @@ def _render_streamlit_tab_analises(
         if _xr_m:
             _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
         fig_m.update_layout(**_lo_m)
-        st.plotly_chart(fig_m, use_container_width=True, config=_pc)
+        st.plotly_chart(fig_m, width="stretch", config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
     st.divider()
@@ -7666,13 +8001,13 @@ def _render_streamlit_dossie_ml(
             st.caption(
                 "A curtose reportada corresponde ao excesso (definição *pandas*); a moda corresponde ao primeiro valor modal encontrado."
             )
-            st.dataframe(pd.DataFrame(desc), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(desc), width="stretch", hide_index=True)
         else:
             st.caption("Não há tabela descritiva disponível para o conjunto atual.")
         st.divider()
         if oi:
             st.markdown("##### Outliers (regra IQR — 1,5×IQR)")
-            st.dataframe(pd.DataFrame(oi), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(oi), width="stretch", hide_index=True)
         else:
             st.caption("Não foi possível gerar o resumo de outliers para estes dados.")
 
@@ -7706,7 +8041,7 @@ def _render_streamlit_dossie_ml(
                     margin=dict(l=130, r=48, t=56, b=130),
                 ),
             )
-            st.plotly_chart(fig_h, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig_h, width="stretch", config=_dpc)
             _st_interpretacao_grafico(
                 "Correlações (leitura automática)",
                 _interpret_text_correlation_matrix(cl, cz),
@@ -7774,18 +8109,18 @@ def _render_streamlit_dossie_ml(
             fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=2)
             fig_td3.update_yaxes(title_text="Eixo Y₁ — qtd vendida (/ dia)", row=1, col=1)
             fig_td3.update_yaxes(title_text="Eixo Y₂ — VGV (mi R$ / dia)", row=1, col=2)
-            st.plotly_chart(fig_td3, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig_td3, width="stretch", config=_dpc)
 
         st.divider()
         if pares:
             st.markdown("##### Pares com |r| ≥ 0,85")
-            st.dataframe(pd.DataFrame(pares), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pares), width="stretch", hide_index=True)
         if vifs:
             st.markdown("##### VIF (subconjunto de *features*)")
             st.caption(
                 "Valores de VIF superiores a 5–10 sugerem possível redundância linear entre *features*; interprete-as em conjunto com a matriz de correlação."
             )
-            st.dataframe(pd.DataFrame(vifs), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(vifs), width="stretch", hide_index=True)
             _st_interpretacao_grafico("VIF (leitura automática)", _interpret_text_vif_rows(vifs))
         if not pares and not vifs:
             st.caption("Não há tabelas de multicolinearidade para apresentar nesta execução.")
@@ -7845,7 +8180,7 @@ def _render_streamlit_dossie_ml(
                     title="Partilha de dias por regime de volume", height=420, showlegend=False
                 ),
             )
-            st.plotly_chart(fig_p, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig_p, width="stretch", config=_dpc)
         if hq.get("counts") and hq.get("edges"):
             st.markdown("##### Histograma — vendas diárias (qtd)")
             edges = hq["edges"]
@@ -7866,7 +8201,7 @@ def _render_streamlit_dossie_ml(
                     yaxis_title="Frequência",
                 ),
             )
-            st.plotly_chart(fig, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig, width="stretch", config=_dpc)
         if hv.get("counts") and hv.get("edges"):
             st.markdown("##### Histograma — VGV diário")
             edges = hv["edges"]
@@ -7887,7 +8222,7 @@ def _render_streamlit_dossie_ml(
                     yaxis_title="Frequência",
                 ),
             )
-            st.plotly_chart(figv, use_container_width=True, config=_dpc)
+            st.plotly_chart(figv, width="stretch", config=_dpc)
         if len(dates) == len(vl) == len(tq) and len(dates) > 5:
             st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
             fig_s = go.Figure(
@@ -7910,7 +8245,7 @@ def _render_streamlit_dossie_ml(
                     yaxis_title="Eixo Y — quantidade vendida (/ dia)",
                 ),
             )
-            st.plotly_chart(fig_s, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig_s, width="stretch", config=_dpc)
         if dow_lbl and dow_q:
             st.markdown("##### Média de volume por dia da semana")
             fig_b = go.Figure(
@@ -7927,7 +8262,7 @@ def _render_streamlit_dossie_ml(
                     yaxis_title="Qtd média",
                 ),
             )
-            st.plotly_chart(fig_b, use_container_width=True, config=_dpc)
+            st.plotly_chart(fig_b, width="stretch", config=_dpc)
 
     with td5:
         _render_streamlit_ml_feature_importance(por_h, _dpc)
@@ -7966,7 +8301,7 @@ def _render_streamlit_dossie_ml(
                 )
         _hay_metricas = any(r.get("MAE") is not None for r in rows_m)
         if _hay_metricas:
-            st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
         else:
             st.markdown(
                 '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin:0.5rem 0">'
@@ -8079,7 +8414,7 @@ def main() -> None:
                 "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
             )
 
-        run_btn = st.button("Gerar previsões", type="primary", use_container_width=True, key="pv_gerar")
+        run_btn = st.button("Gerar previsões", type="primary", width="stretch", key="pv_gerar")
 
         if run_btn:
             if (d_ini is None) ^ (d_fim is None):
@@ -8160,7 +8495,7 @@ def main() -> None:
                             "Pontuação": m.get("score", "—"),
                         }
                     )
-                st.dataframe(pd.DataFrame(rows_m), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
 
             c1, c2 = st.columns(2)
             c3, c4 = st.columns(2)
@@ -8236,7 +8571,7 @@ def main() -> None:
                         "Modelo VGV": vc.get("model_label", "—"),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             acc_warn = False
             for h in (3, 7, 30):
                 for part in ("qtd", "valor"):
@@ -8261,7 +8596,7 @@ def main() -> None:
                 data=html_out.encode("utf-8"),
                 file_name="dashboard_previsao_vendas.html",
                 mime="text/html; charset=utf-8",
-                use_container_width=True,
+                width="stretch",
             )
 
             st.caption(
@@ -8272,7 +8607,7 @@ def main() -> None:
         st.divider()
         if st.button(
             "Limpar cenário opcional",
-            use_container_width=True,
+            width="stretch",
             key="pv_clear_cfg",
         ):
             for _k in ("pv_interval_start", "pv_interval_end"):
@@ -8281,7 +8616,7 @@ def main() -> None:
             st.rerun()
         if st.button(
             "Limpar cache das planilhas",
-            use_container_width=True,
+            width="stretch",
             key="pv_clear_cache",
         ):
             _load_one_role_cached.clear()
@@ -8295,7 +8630,7 @@ def main() -> None:
         if st.button(
             "Carregar dados (sem treino)",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="pv_load_eda",
         ):
             _streamlit_carregar_dados_exploratorios()
@@ -8320,7 +8655,7 @@ def main() -> None:
         if st.button(
             "Carregar dados (sem treino)",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="pv_load_eda_dossie",
         ):
             _streamlit_carregar_dados_exploratorios()
@@ -8347,7 +8682,7 @@ def main() -> None:
         if st.button(
             "Carregar dados (sem treino)",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="pv_load_eda_apendice",
         ):
             _streamlit_carregar_dados_exploratorios()
