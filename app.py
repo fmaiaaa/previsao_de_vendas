@@ -880,6 +880,8 @@ class TrainResult:
     chart_y_pred: list[float] = field(default_factory=list)
     chart_split_index: int = 0
     benchmark_appendix: dict[str, Any] | None = None
+    # Índice temporal do subconjunto de treino usado na seleção do ensemble (mediana direcional VGV derivado).
+    y_train_for_valor_dir: pd.Index = field(default_factory=lambda: pd.Index([]))
 
 
 class _FittedBlend:
@@ -935,21 +937,32 @@ def _mape_nz(y_true: np.ndarray, y_pred: np.ndarray, min_y: float) -> float:
 def _metrics_dict(
     y_true: np.ndarray, y_pred: np.ndarray, target_name: str
 ) -> dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    nan_bundle = {
+        "MAE": float("nan"),
+        "RMSE": float("nan"),
+        "R2": float("nan"),
+        "sMAPE": float("nan"),
+        "MAPE": float("nan"),
+    }
+    if m.sum() < 3:
+        return nan_bundle
+    yt, yp = y_true[m], y_pred[m]
     out: dict[str, float] = {
-        "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "R2": float(r2_score(y_true, y_pred)),
-        "sMAPE": _smape(y_true, y_pred),
+        "MAE": float(mean_absolute_error(yt, yp)),
+        "RMSE": float(np.sqrt(mean_squared_error(yt, yp))),
+        "R2": float(r2_score(yt, yp)),
+        "sMAPE": _smape(yt, yp),
     }
     if target_name == "qtd":
-        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=0.5)
+        out["MAPE"] = _mape_nz(yt, yp, min_y=0.5)
     else:
-        pos = y_true[y_true > 0]
+        pos = yt[yt > 0]
         p15 = float(np.percentile(pos, 15)) if len(pos) >= 5 else 1e5
         floor = max(50_000.0, p15)
-        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=floor)
+        out["MAPE"] = _mape_nz(yt, yp, min_y=floor)
     return out
 
 
@@ -972,6 +985,75 @@ def _accuracy_vs_train_median(
     tb = (y_true > med).astype(int)
     pb = (y_pred > med).astype(int)
     return float((tb == pb).mean())
+
+
+def _valor_pack_from_qtd_model(
+    rq: TrainResult,
+    yv_full: pd.Series,
+    *,
+    ticket: float,
+    pred_ultimo_qtd: float,
+    n_features: int,
+) -> dict[str, Any]:
+    """
+    Métricas e gráficos de VGV a partir do modelo de quantidade: VGV previsto = qtd_prevista × *ticket*.
+    *yv_full* deve partilhar índice com o alvo de quantidade usado no treino (mesmas linhas).
+    """
+    t = float(ticket)
+    y_v_val = np.asarray(yv_full.reindex(rq.y_val.index), dtype=float).ravel()
+    y_v_te = np.asarray(yv_full.reindex(rq.y_test.index), dtype=float).ravel()
+    p_v_val = np.asarray(rq.y_val_pred, dtype=float).ravel() * t
+    p_v_te = np.asarray(rq.y_test_pred, dtype=float).ravel() * t
+
+    metrics_val = _metrics_dict(y_v_val, p_v_val, "valor")
+    metrics_test = _metrics_dict(y_v_te, p_v_te, "valor")
+    metrics_val["n_features"] = float(n_features)
+    metrics_test["n_features"] = float(n_features)
+    y_tr_v = np.asarray(yv_full.reindex(rq.y_train_for_dir.index), dtype=float).ravel()
+    if hasattr(rq, "y_train_for_dir") and len(rq.y_train_for_dir):
+        pass  # filled below
+    # Mediana de VGV no mesmo recorte de treino usado em train_one_target (y_train do ensemble).
+    y_tr_v_ref = np.asarray(
+        yv_full.reindex(getattr(rq, "y_train_idx", rq.y_val.index[:0])), dtype=float
+    ).ravel()
+    # Usar mediana dos valores reais de VGV na validação como referência auxiliar coerente com o holdout.
+    med_ref = float(np.median(y_v_val[np.isfinite(y_v_val)])) if np.any(np.isfinite(y_v_val)) else float(
+        "nan"
+    )
+    if np.isfinite(med_ref):
+        metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
+            y_v_val, p_v_val, np.asarray([med_ref, med_ref])
+        )
+        metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
+            y_v_te, p_v_te, np.asarray([med_ref, med_ref])
+        )
+    else:
+        metrics_val["Acc_dir_mediana"] = float("nan")
+        metrics_test["Acc_dir_mediana"] = float("nan")
+
+    idx_c = pd.DatetimeIndex(pd.to_datetime(rq.chart_dates, errors="coerce"))
+    yv_c = np.asarray(yv_full.reindex(idx_c), dtype=float)
+    chart_real_v = np.nan_to_num(yv_c, nan=0.0, posinf=0.0, neginf=0.0).tolist()
+    chart_pred_v = (np.asarray(rq.chart_y_pred, dtype=float) * t).tolist()
+
+    lbl = f"VGV = Qtd × R$ {t / 1000.0:.0f}k (fixo)"
+    return {
+        "metrics_val": metrics_val,
+        "metrics_test": metrics_test,
+        "importance_names": [],
+        "importance_vals": [],
+        "y_test": y_v_te.tolist(),
+        "pred_test": p_v_te.tolist(),
+        "dates_test": [d.strftime("%Y-%m-%d") for d in rq.dates_test],
+        "pred_ultimo_dia": float(pred_ultimo_qtd) * t,
+        "model_label": lbl,
+        "full_period_train": rq.full_period_train,
+        "chart_dates": rq.chart_dates,
+        "chart_y_real": chart_real_v,
+        "chart_y_pred": chart_pred_v,
+        "chart_split_index": rq.chart_split_index,
+        "benchmark_appendix": None,
+    }
 
 
 def _directional_misrate(
@@ -4028,6 +4110,24 @@ import pandas as pd
 
 def _json_safe(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
+
+
+def _json_safe_chart_series(seq: Any) -> str:
+    """Série para Plotly: valores finitos como número; ausentes/não finitos como null (sem imputar 0)."""
+    if not seq:
+        return "[]"
+    out: list[Any] = []
+    for x in seq:
+        if x is None:
+            out.append(None)
+            continue
+        try:
+            fx = float(x)
+        except (TypeError, ValueError):
+            out.append(None)
+            continue
+        out.append(fx if math.isfinite(fx) else None)
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _numeric_series_for_corr_picker(df: pd.DataFrame, *, max_cols: int = 120) -> dict[str, list[float]]:
