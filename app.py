@@ -1074,11 +1074,11 @@ def _fit_lgbm_with_early_stopping(
 def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
     """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
     nt = max(8, int(n_trials))
-    min_tr = max(14, min(52, (2 * nt) // 5))
-    pat = max(10, min(40, nt // 5))
+    min_tr = max(6, min(22, (2 * nt) // 5))
+    pat = max(4, min(16, max(3, nt // 5)))
     if min_tr >= nt:
-        min_tr = max(8, min(nt - 2, (2 * nt) // 5))
-    return pat, max(6, min_tr)
+        min_tr = max(5, min(nt - 2, (2 * nt) // 5))
+    return pat, max(4, min_tr)
 
 
 def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
@@ -1189,7 +1189,7 @@ def _optuna_objective_lgbm(
             y_tr = y_train.iloc[tr_idx]
             sw = sample_weights(y_tr, True, target_name, horizon)
             y_va_fold = y_train.iloc[va_idx]
-            es_rounds = 56 if long_h else 44
+            es_rounds = 36 if long_h else 28
             _fit_lgbm_with_early_stopping(
                 model,
                 X_train.iloc[tr_idx],
@@ -1516,11 +1516,34 @@ def _score_val_mae(
 
 
 def _collect_candidate_specs(
-    target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
+    target_name: str,
+    best_params: dict[str, Any],
+    rs: int,
+    horizon: int = 7,
+    *,
+    lean_benchmark: bool | None = None,
 ) -> list[tuple[str, Pipeline, bool]]:
-    """Nome, pipeline (template), usar sample_weight recency."""
-    out: list[tuple[str, Pipeline, bool]] = []
+    """Nome, pipeline (template), usar sample_weight recency.
+
+    Com *lean_benchmark* True (~6 modelos leves), o benchmark fica muito mais rápido.
+    None usa o valor global (por defeito enxuto; ver ``PREVISAO_ML_THOROUGH``).
+    """
+    if lean_benchmark is None:
+        lean_benchmark = LEAN_BENCHMARK_DEFAULT
+
+    if lean_benchmark:
+        out_lean: list[tuple[str, Pipeline, bool]] = []
+        out_lean.append(("Ridge", build_ridge_pipe(rs), False))
+        out_lean.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
+        if LGBMRegressor is not None:
+            out_lean.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
+            out_lean.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
+        out_lean.append(("HGB", build_hgb_pipe(rs, target_name), False))
+        out_lean.append(("Baseline mediana", build_dummy_median_pipe(), False))
+        return out_lean
+
     long_h = int(horizon) >= 21
+    out: list[tuple[str, Pipeline, bool]] = []
 
     out.append(("Ridge", build_ridge_pipe(rs), False))
     out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
@@ -1605,9 +1628,12 @@ def _pick_super_ensemble(
     blend_top_k: int,
     show_progress: bool = True,
     horizon: int = 7,
+    lean_benchmark: bool | None = None,
 ) -> tuple[list[Pipeline], np.ndarray, list[bool], str]:
     long_h = int(horizon) >= 21
-    specs = _collect_candidate_specs(target_name, best_params, rs, horizon)
+    specs = _collect_candidate_specs(
+        target_name, best_params, rs, horizon, lean_benchmark=lean_benchmark
+    )
     scored: list[tuple[float, str, Pipeline, bool]] = []
     it = specs
     if show_progress:
@@ -1691,10 +1717,10 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
-    # Escala com teto mais baixo que antes (~72) para acelerar; TPE + pruner compensam.
-    base = int(max(32, min(72, int(15 * np.log1p(n_samples)))))
+    # Teto ~26 trials; pruner + patience. Horizontes longos: pouco extra.
+    base = int(max(12, min(26, int(7 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(110, base + 18)
+        base = min(34, base + 6)
     return base
 
 
@@ -1711,7 +1737,10 @@ def train_one_target(
     show_progress: bool = True,
     full_period_train: bool = False,
     train_frac: float = 0.7,
+    lean_benchmark: bool | None = None,
 ) -> TrainResult:
+    if lean_benchmark is None:
+        lean_benchmark = LEAN_BENCHMARK_DEFAULT
     n = len(X)
     hz = int(horizon)
 
@@ -1789,13 +1818,13 @@ def train_one_target(
                 horizon=hz,
             )
 
-        n_startup = max(12, min(32, nt // 3))
+        n_startup = max(6, min(18, nt // 4))
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
                 multivariate=False,
-                n_startup_trials=max(10, min(28, nt // 4)),
+                n_startup_trials=max(6, min(14, nt // 5)),
             ),
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=n_startup,
@@ -1852,7 +1881,9 @@ def train_one_target(
                 }
             )
 
-    specs_bm = _collect_candidate_specs(target_name, best_params, random_state, hz)
+    specs_bm = _collect_candidate_specs(
+        target_name, best_params, random_state, hz, lean_benchmark=lean_benchmark
+    )
 
     def _fit_bm(pipe: Any, X: pd.DataFrame, y: pd.Series, sw: bool) -> None:
         _safe_fit_pipeline(pipe, X, y, sw, target_name, hz)
@@ -1902,6 +1933,7 @@ def train_one_target(
             blend_top_k=blend_top_k,
             show_progress=show_progress,
             horizon=hz,
+            lean_benchmark=lean_benchmark,
         )
 
     pipe_val = _make_fitted_blend(
@@ -2866,34 +2898,50 @@ def _inject_ts_and_stl_features(
             out[f"ts_stl_seasamp_{short}"] = 0.0
         return pd.DataFrame(out, index=idx)
 
+    if _previsao_env_truthy("PREVISAO_SKIP_STL"):
+        for short in ("vgv", "qtd"):
+            out[f"ts_stl_trend_{short}"] = 0.0
+            out[f"ts_stl_seasamp_{short}"] = 0.0
+        return pd.DataFrame(out, index=idx)
+
     win, period = 91, 7
+    st_stride = max(1, int(STL_STRIDE_DEFAULT))
     for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
         s = df_master[col].astype(float)
         n = len(s)
         arr = s.to_numpy(dtype=float)
         trend = np.zeros(n)
         seas_amp = np.zeros(n)
-        idx_iter = range(win, n)
+        idx_points = list(range(win, n, st_stride))
+        td: dict[int, float] = {}
+        sd: dict[int, float] = {}
+        it = idx_points
         if show_progress:
-            idx_iter = _pv_tqdm(
-                idx_iter,
+            it = _pv_tqdm(
+                idx_points,
                 desc=f"STL {short}",
                 leave=False,
                 unit="dia",
             )
-        for i in idx_iter:
+        for i in it:
             seg = arr[i - win : i]
             if np.nanmax(seg) - np.nanmin(seg) < 1e-11:
-                trend[i] = seg[-1]
-                seas_amp[i] = 0.0
+                td[i] = float(seg[-1])
+                sd[i] = 0.0
                 continue
             try:
-                r = STL(seg, period=period, robust=True).fit()
-                trend[i] = float(r.trend[-1])
-                seas_amp[i] = float(np.std(r.seasonal))
+                r = STL(seg, period=period, robust=STL_ROBUST_DEFAULT).fit()
+                td[i] = float(r.trend[-1])
+                sd[i] = float(np.std(r.seasonal))
             except Exception:
-                trend[i] = float(np.nanmean(seg[-period:]))
-                seas_amp[i] = 0.0
+                td[i] = float(np.nanmean(seg[-period:]))
+                sd[i] = 0.0
+        if idx_points:
+            idx_r = pd.RangeIndex(start=win, stop=n, step=1)
+            ser_t = pd.Series(td, dtype=float).reindex(idx_r).ffill().bfill().fillna(0.0)
+            ser_s = pd.Series(sd, dtype=float).reindex(idx_r).ffill().bfill().fillna(0.0)
+            trend[win:] = ser_t.to_numpy(dtype=float)
+            seas_amp[win:] = ser_s.to_numpy(dtype=float)
         out[f"ts_stl_trend_{short}"] = trend
         out[f"ts_stl_seasamp_{short}"] = seas_amp
 
@@ -5714,13 +5762,13 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
-# Folds em TimeSeriesSplit durante Optuna (5 ≈ bom equilíbrio rapidez vs. estabilidade temporal).
-OPTUNA_TSS_SPLITS = 5
+# Folds em TimeSeriesSplit durante Optuna (3 acelera bastante vs. 5; mais folds = mais estável).
+OPTUNA_TSS_SPLITS = 3
 # Um horizonte por execução de «Gerar previsões» quando o UI não envia lista.
 HORIZONTE_TREINO_PADRAO = 7
 HORIZONTES_FIXOS_DISPONIVEIS: tuple[int, ...] = (3, 7, 30)
-# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
-BLEND_TOP_K_FIXO = 6
+# Top-K no super-ensemble (menor = menos modelos a pontuar após o benchmark).
+BLEND_TOP_K_FIXO = 4
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
@@ -5732,6 +5780,22 @@ SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in
     "true",
     "yes",
 )
+
+
+def _previsao_env_truthy(key: str) -> bool:
+    return str(os.environ.get(key, "0")).lower() in ("1", "true", "yes")
+
+
+# Benchmark enxuto (~10 modelos) por defeito. PREVISAO_ML_THOROUGH=1 = lista completa (mais lenta).
+LEAN_BENCHMARK_DEFAULT = not _previsao_env_truthy("PREVISAO_ML_THOROUGH")
+# STL com robust=False é muito mais rápido; PREVISAO_STL_ROBUST=1 usa robust=True (mais pesado).
+STL_ROBUST_DEFAULT = _previsao_env_truthy("PREVISAO_STL_ROBUST")
+# Um STL a cada N dias (interpolado com ffill); 1 = diário (lento). PREVISAO_SKIP_STL=1 zera as colunas STL.
+try:
+    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "7")).strip())
+except Exception:
+    _stl_stride_raw = 7
+STL_STRIDE_DEFAULT = max(1, min(31, _stl_stride_raw))
 
 
 def _configure_streamlit_progress() -> None:
