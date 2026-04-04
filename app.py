@@ -1565,6 +1565,10 @@ def _collect_candidate_specs(
         if LGBMRegressor is not None:
             out_lean.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
             out_lean.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
+            if target_name == "valor":
+                out_lean.append(
+                    ("LGBM+log1p", build_lgbm_only_pipe(best_params, True, rs), True)
+                )
         out_lean.append(("HGB", build_hgb_pipe(rs, target_name), False))
         out_lean.append(("Baseline mediana", build_dummy_median_pipe(), False))
         return out_lean
@@ -1740,7 +1744,13 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
     return fix(d)
 
 
-def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
+def _resolve_n_trials(
+    n_trials: int,
+    n_samples: int,
+    horizon: int = 7,
+    *,
+    target_name: str | None = None,
+) -> int:
     """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
@@ -1748,6 +1758,8 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     base = int(max(32, min(88, int(16 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
         base = min(108, base + 20)
+    if target_name == "valor" and _vgv_fast_profile_enabled():
+        base = max(20, min(48, int(round(base * 0.52))))
     return base
 
 
@@ -1767,7 +1779,13 @@ def train_one_target(
     lean_benchmark: bool | None = None,
 ) -> TrainResult:
     if lean_benchmark is None:
-        lean_benchmark = LEAN_BENCHMARK_DEFAULT
+        if target_name == "valor" and _vgv_fast_profile_enabled():
+            lean_benchmark = True
+        else:
+            lean_benchmark = LEAN_BENCHMARK_DEFAULT
+    blend_eff = int(blend_top_k)
+    if target_name == "valor" and _vgv_fast_profile_enabled():
+        blend_eff = min(blend_eff, 4)
     n = len(X)
     hz = int(horizon)
 
@@ -1801,9 +1819,12 @@ def train_one_target(
         X_imp = X
         y_imp = y
 
-    n_splits = min(n_splits_tss, max(3, len(X_opt) // 22))
+    tss_cap = int(n_splits_tss)
+    if target_name == "valor" and _vgv_fast_profile_enabled():
+        tss_cap = min(tss_cap, 3)
+    n_splits = min(tss_cap, max(3, len(X_opt) // 22))
     n_splits = max(3, n_splits)
-    nt = _resolve_n_trials(n_trials, len(X_opt), hz)
+    nt = _resolve_n_trials(n_trials, len(X_opt), hz, target_name=target_name)
 
     med_dir_ref = float(np.median(np.asarray(y_train, dtype=float)))
     if not np.isfinite(med_dir_ref):
@@ -1962,7 +1983,7 @@ def train_one_target(
             target_name,
             best_params,
             random_state,
-            blend_top_k=blend_top_k,
+            blend_top_k=blend_eff,
             show_progress=show_progress,
             horizon=hz,
             lean_benchmark=lean_benchmark,
@@ -5834,6 +5855,11 @@ SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in
 
 def _previsao_env_truthy(key: str) -> bool:
     return str(os.environ.get(key, "0")).lower() in ("1", "true", "yes")
+
+
+def _vgv_fast_profile_enabled() -> bool:
+    """VGV (target_valor) mais rápido por defeito: menos Optuna, benchmark enxuto, menos folds/blend."""
+    return not _previsao_env_truthy("PREVISAO_VGV_FULL")
 
 
 # Benchmark completo por defeito (melhor acurácia direcional). PREVISAO_ML_LEAN=1 = lista curta (rápida).
