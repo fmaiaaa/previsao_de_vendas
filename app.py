@@ -1087,11 +1087,11 @@ def _fit_lgbm_with_early_stopping(
 def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
     """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
     nt = max(8, int(n_trials))
-    min_tr = max(14, min(48, (2 * nt) // 5))
-    pat = max(9, min(32, max(5, nt // 4)))
+    min_tr = max(4, min(16, (2 * nt) // 5))
+    pat = max(3, min(9, max(2, nt // 8)))
     if min_tr >= nt:
-        min_tr = max(10, min(nt - 2, (2 * nt) // 5))
-    return pat, max(8, min_tr)
+        min_tr = max(4, min(nt - 2, (2 * nt) // 5))
+    return pat, max(4, min_tr)
 
 
 def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
@@ -1205,7 +1205,7 @@ def _optuna_objective_lgbm(
             y_tr = y_train.iloc[tr_idx]
             sw = sample_weights(y_tr, True, target_name, horizon)
             y_va_fold = y_train.iloc[va_idx]
-            es_rounds = 52 if long_h else 42
+            es_rounds = 16 if long_h else 12
             _fit_lgbm_with_early_stopping(
                 model,
                 X_train.iloc[tr_idx],
@@ -1552,8 +1552,8 @@ def _collect_candidate_specs(
 ) -> list[tuple[str, Pipeline, bool]]:
     """Nome, pipeline (template), usar sample_weight recency.
 
-    Com *lean_benchmark* True (~6 modelos), o benchmark é mais rápido e menos rico.
-    None usa o valor global (benchmark completo por defeito; ``PREVISAO_ML_LEAN=1`` encurta).
+    Com *lean_benchmark* True (~5 modelos), o benchmark é mais rápido e menos rico.
+    None usa o valor global (enxuto por defeito; ``PREVISAO_ML_FULL=1`` usa lista completa).
     """
     if lean_benchmark is None:
         lean_benchmark = LEAN_BENCHMARK_DEFAULT
@@ -1564,11 +1564,6 @@ def _collect_candidate_specs(
         out_lean.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
         if LGBMRegressor is not None:
             out_lean.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
-            out_lean.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
-            if target_name == "valor":
-                out_lean.append(
-                    ("LGBM+log1p", build_lgbm_only_pipe(best_params, True, rs), True)
-                )
         out_lean.append(("HGB", build_hgb_pipe(rs, target_name), False))
         out_lean.append(("Baseline mediana", build_dummy_median_pipe(), False))
         return out_lean
@@ -1754,12 +1749,13 @@ def _resolve_n_trials(
     """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
-    # Mais trials → melhor MAE/acurácia direcional; pruner e patience limitam custo.
-    base = int(max(32, min(88, int(16 * np.log1p(n_samples)))))
+    base = int(max(10, min(28, int(6 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(108, base + 20)
+        base = min(34, base + 5)
+    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
+        base = max(8, min(18, int(round(base * 0.55))))
     if target_name == "valor" and _vgv_fast_profile_enabled():
-        base = max(20, min(48, int(round(base * 0.52))))
+        base = max(6, min(14, int(round(base * 0.62))))
     return base
 
 
@@ -1779,13 +1775,19 @@ def train_one_target(
     lean_benchmark: bool | None = None,
 ) -> TrainResult:
     if lean_benchmark is None:
-        if target_name == "valor" and _vgv_fast_profile_enabled():
+        if (
+            target_name == "valor"
+            and _vgv_fast_profile_enabled()
+            and not _previsao_env_truthy("PREVISAO_ML_FULL")
+        ):
             lean_benchmark = True
         else:
             lean_benchmark = LEAN_BENCHMARK_DEFAULT
     blend_eff = int(blend_top_k)
+    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
+        blend_eff = min(blend_eff, 2)
     if target_name == "valor" and _vgv_fast_profile_enabled():
-        blend_eff = min(blend_eff, 4)
+        blend_eff = min(blend_eff, 1)
     n = len(X)
     hz = int(horizon)
 
@@ -1820,10 +1822,14 @@ def train_one_target(
         y_imp = y
 
     tss_cap = int(n_splits_tss)
-    if target_name == "valor" and _vgv_fast_profile_enabled():
-        tss_cap = min(tss_cap, 3)
-    n_splits = min(tss_cap, max(3, len(X_opt) // 22))
-    n_splits = max(3, n_splits)
+    _tss_floor = 3
+    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
+        tss_cap = min(tss_cap, 2)
+        _tss_floor = 2
+    else:
+        tss_cap = max(tss_cap, 3)
+    n_splits = min(tss_cap, max(_tss_floor, len(X_opt) // 30))
+    n_splits = max(_tss_floor, n_splits)
     nt = _resolve_n_trials(n_trials, len(X_opt), hz, target_name=target_name)
 
     med_dir_ref = float(np.median(np.asarray(y_train, dtype=float)))
@@ -1871,13 +1877,13 @@ def train_one_target(
                 median_dir_ref=med_dir_ref,
             )
 
-        n_startup = max(12, min(32, nt // 3))
+        n_startup = max(3, min(8, nt // 6))
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
                 multivariate=False,
-                n_startup_trials=max(10, min(26, nt // 4)),
+                n_startup_trials=max(3, min(7, nt // 6)),
             ),
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=n_startup,
@@ -5828,18 +5834,18 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
-# Folds na Optuna: 5 melhora estabilidade temporal (acurácia direcional). PREVISAO_OPTUNA_SPLITS=3 acelera.
+# Folds na Optuna (2–7; fora de ML_FULL o código limita a 2). PREVISAO_ML_FULL=1 usa até 3+ conforme abaixo.
 try:
-    OPTUNA_TSS_SPLITS = max(3, min(7, int(str(os.environ.get("PREVISAO_OPTUNA_SPLITS", "5")).strip())))
+    OPTUNA_TSS_SPLITS = max(2, min(7, int(str(os.environ.get("PREVISAO_OPTUNA_SPLITS", "2")).strip())))
 except Exception:
-    OPTUNA_TSS_SPLITS = 5
+    OPTUNA_TSS_SPLITS = 2
 # Série diária (leads/vendas/…) usada no treino e nas análises: desta data até ao dia corrente (inclusive).
 SERIE_DIARIA_INICIO = pd.Timestamp("2025-01-01")
 # Um horizonte por execução de «Gerar previsões» quando o UI não envia lista.
 HORIZONTE_TREINO_PADRAO = 7
 HORIZONTES_FIXOS_DISPONIVEIS: tuple[int, ...] = (3, 7, 30)
-# Top-K no super-ensemble (mais modelos → blend mais expressivo).
-BLEND_TOP_K_FIXO = 6
+# Top-K no super-ensemble (``PREVISAO_ML_FULL=1`` aumenta trials/folds e o teto efetivo de blend).
+BLEND_TOP_K_FIXO = 3
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
@@ -5862,15 +5868,15 @@ def _vgv_fast_profile_enabled() -> bool:
     return not _previsao_env_truthy("PREVISAO_VGV_FULL")
 
 
-# Benchmark completo por defeito (melhor acurácia direcional). PREVISAO_ML_LEAN=1 = lista curta (rápida).
-LEAN_BENCHMARK_DEFAULT = _previsao_env_truthy("PREVISAO_ML_LEAN")
-# STL robust=True por defeito (melhor sinal sazonal). PREVISAO_STL_FAST=1 usa robust=False (mais rápido).
-STL_ROBUST_DEFAULT = not _previsao_env_truthy("PREVISAO_STL_FAST")
-# STL diário (stride 1) por defeito. PREVISAO_STL_STRIDE=N para amostrar 1 em N dias (mais rápido).
+# Benchmark enxuto por defeito (rápido). PREVISAO_ML_FULL=1 = lista completa + mais trials/folds.
+LEAN_BENCHMARK_DEFAULT = not _previsao_env_truthy("PREVISAO_ML_FULL")
+# STL robust=False por defeito (rápido). PREVISAO_STL_ROBUST=1 ativa robust=True.
+STL_ROBUST_DEFAULT = _previsao_env_truthy("PREVISAO_STL_ROBUST")
+# STL a cada N dias (ffill entre pontos). 1 = diário (lento). PREVISAO_STL_STRIDE altera.
 try:
-    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "1")).strip())
+    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "10")).strip())
 except Exception:
-    _stl_stride_raw = 1
+    _stl_stride_raw = 10
 STL_STRIDE_DEFAULT = max(1, min(31, _stl_stride_raw))
 
 
