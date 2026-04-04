@@ -880,8 +880,6 @@ class TrainResult:
     chart_y_pred: list[float] = field(default_factory=list)
     chart_split_index: int = 0
     benchmark_appendix: dict[str, Any] | None = None
-    # Índice temporal do subconjunto de treino usado na seleção do ensemble (mediana direcional VGV derivado).
-    y_train_for_valor_dir: pd.Index = field(default_factory=lambda: pd.Index([]))
 
 
 class _FittedBlend:
@@ -937,32 +935,21 @@ def _mape_nz(y_true: np.ndarray, y_pred: np.ndarray, min_y: float) -> float:
 def _metrics_dict(
     y_true: np.ndarray, y_pred: np.ndarray, target_name: str
 ) -> dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float).ravel()
-    y_pred = np.asarray(y_pred, dtype=float).ravel()
-    m = np.isfinite(y_true) & np.isfinite(y_pred)
-    nan_bundle = {
-        "MAE": float("nan"),
-        "RMSE": float("nan"),
-        "R2": float("nan"),
-        "sMAPE": float("nan"),
-        "MAPE": float("nan"),
-    }
-    if m.sum() < 3:
-        return nan_bundle
-    yt, yp = y_true[m], y_pred[m]
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
     out: dict[str, float] = {
-        "MAE": float(mean_absolute_error(yt, yp)),
-        "RMSE": float(np.sqrt(mean_squared_error(yt, yp))),
-        "R2": float(r2_score(yt, yp)),
-        "sMAPE": _smape(yt, yp),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "R2": float(r2_score(y_true, y_pred)),
+        "sMAPE": _smape(y_true, y_pred),
     }
     if target_name == "qtd":
-        out["MAPE"] = _mape_nz(yt, yp, min_y=0.5)
+        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=0.5)
     else:
-        pos = yt[yt > 0]
+        pos = y_true[y_true > 0]
         p15 = float(np.percentile(pos, 15)) if len(pos) >= 5 else 1e5
         floor = max(50_000.0, p15)
-        out["MAPE"] = _mape_nz(yt, yp, min_y=floor)
+        out["MAPE"] = _mape_nz(y_true, y_pred, min_y=floor)
     return out
 
 
@@ -985,88 +972,6 @@ def _accuracy_vs_train_median(
     tb = (y_true > med).astype(int)
     pb = (y_pred > med).astype(int)
     return float((tb == pb).mean())
-
-
-def _valor_pack_from_qtd_model(
-    rq: TrainResult,
-    yv_full: pd.Series,
-    *,
-    ticket: float,
-    pred_ultimo_qtd: float,
-    n_features: int,
-) -> dict[str, Any]:
-    """
-    Métricas e gráficos de VGV a partir do modelo de quantidade: VGV previsto = qtd_prevista × *ticket*.
-    *yv_full* deve partilhar índice com o alvo de quantidade usado no treino (mesmas linhas).
-    """
-    t = float(ticket)
-    y_v_val = np.asarray(yv_full.reindex(rq.y_val.index), dtype=float).ravel()
-    y_v_te = np.asarray(yv_full.reindex(rq.y_test.index), dtype=float).ravel()
-    p_v_val = np.asarray(rq.y_val_pred, dtype=float).ravel() * t
-    p_v_te = np.asarray(rq.y_test_pred, dtype=float).ravel() * t
-
-    metrics_val = _metrics_dict(y_v_val, p_v_val, "valor")
-    metrics_test = _metrics_dict(y_v_te, p_v_te, "valor")
-    metrics_val["n_features"] = float(n_features)
-    metrics_test["n_features"] = float(n_features)
-    y_tr_v = np.asarray(yv_full.reindex(rq.y_train_for_dir.index), dtype=float).ravel()
-    if hasattr(rq, "y_train_for_dir") and len(rq.y_train_for_dir):
-        pass  # filled below
-    # Mediana de VGV no mesmo recorte de treino usado em train_one_target (y_train do ensemble).
-    y_tr_v_ref = np.asarray(
-        yv_full.reindex(getattr(rq, "y_train_idx", rq.y_val.index[:0])), dtype=float
-    ).ravel()
-    # Usar mediana dos valores reais de VGV na validação como referência auxiliar coerente com o holdout.
-    med_ref = float(np.median(y_v_val[np.isfinite(y_v_val)])) if np.any(np.isfinite(y_v_val)) else float(
-        "nan"
-    )
-    if np.isfinite(med_ref):
-        metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
-            y_v_val, p_v_val, np.asarray([med_ref, med_ref])
-        )
-        metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
-            y_v_te, p_v_te, np.asarray([med_ref, med_ref])
-        )
-    else:
-        metrics_val["Acc_dir_mediana"] = float("nan")
-        metrics_test["Acc_dir_mediana"] = float("nan")
-
-    idx_c = pd.DatetimeIndex(pd.to_datetime(rq.chart_dates, errors="coerce"))
-    yv_c = np.asarray(yv_full.reindex(idx_c), dtype=float)
-    chart_real_v = np.nan_to_num(yv_c, nan=0.0, posinf=0.0, neginf=0.0).tolist()
-    chart_pred_v = (np.asarray(rq.chart_y_pred, dtype=float) * t).tolist()
-
-    lbl = f"VGV = Qtd × R$ {t / 1000.0:.0f}k (fixo)"
-    return {
-        "metrics_val": metrics_val,
-        "metrics_test": metrics_test,
-        "importance_names": [],
-        "importance_vals": [],
-        "y_test": y_v_te.tolist(),
-        "pred_test": p_v_te.tolist(),
-        "dates_test": [d.strftime("%Y-%m-%d") for d in rq.dates_test],
-        "pred_ultimo_dia": float(pred_ultimo_qtd) * t,
-        "model_label": lbl,
-        "full_period_train": rq.full_period_train,
-        "chart_dates": rq.chart_dates,
-        "chart_y_real": chart_real_v,
-        "chart_y_pred": chart_pred_v,
-        "chart_split_index": rq.chart_split_index,
-        "benchmark_appendix": None,
-    }
-
-
-def _directional_misrate(
-    y_true: np.ndarray, y_pred: np.ndarray, med: float
-) -> float:
-    """Proporção de pontos em que real e predito ficam em lados opostos a *med* (0–1)."""
-    yt = np.asarray(y_true, dtype=float).ravel()
-    yp = np.asarray(y_pred, dtype=float).ravel()
-    if len(yt) < 2 or not np.isfinite(med):
-        return 0.5
-    tb = (yt > med).astype(int)
-    pb = (yp > med).astype(int)
-    return float((tb != pb).mean())
 
 
 def temporal_train_test_indices(n: int, train_frac: float = 0.7) -> tuple[slice, slice]:
@@ -1169,11 +1074,11 @@ def _fit_lgbm_with_early_stopping(
 def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
     """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
     nt = max(8, int(n_trials))
-    min_tr = max(4, min(16, (2 * nt) // 5))
-    pat = max(3, min(9, max(2, nt // 8)))
+    min_tr = max(14, min(52, (2 * nt) // 5))
+    pat = max(10, min(40, nt // 5))
     if min_tr >= nt:
-        min_tr = max(4, min(nt - 2, (2 * nt) // 5))
-    return pat, max(4, min_tr)
+        min_tr = max(8, min(nt - 2, (2 * nt) // 5))
+    return pat, max(6, min_tr)
 
 
 def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
@@ -1217,8 +1122,6 @@ def _optuna_objective_lgbm(
     random_state: int,
     target_name: str,
     horizon: int = 7,
-    *,
-    median_dir_ref: float | None = None,
 ) -> float:
     """
     Otimização orientada à generalização temporal:
@@ -1278,7 +1181,6 @@ def _optuna_objective_lgbm(
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     scores: list[float] = []
-    dir_miss: list[float] = []
     try:
         for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
             sys.stderr.write(f"\r[Optuna] trial {trial.number + 1} • fold {step + 1}/{n_splits}…\033[K")
@@ -1287,7 +1189,7 @@ def _optuna_objective_lgbm(
             y_tr = y_train.iloc[tr_idx]
             sw = sample_weights(y_tr, True, target_name, horizon)
             y_va_fold = y_train.iloc[va_idx]
-            es_rounds = 16 if long_h else 12
+            es_rounds = 56 if long_h else 44
             _fit_lgbm_with_early_stopping(
                 model,
                 X_train.iloc[tr_idx],
@@ -1300,14 +1202,6 @@ def _optuna_objective_lgbm(
             p = model.predict(X_train.iloc[va_idx])
             fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
             scores.append(fold_mae)
-            if median_dir_ref is not None and np.isfinite(median_dir_ref):
-                dir_miss.append(
-                    _directional_misrate(
-                        np.asarray(y_va_fold, dtype=float),
-                        np.asarray(p, dtype=float),
-                        float(median_dir_ref),
-                    )
-                )
             trial.report(float(np.mean(scores)), step)
             if step >= 1 and trial.should_prune():
                 raise optuna.TrialPruned()
@@ -1317,10 +1211,7 @@ def _optuna_objective_lgbm(
         spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
         pen_std = 0.12 if long_h else 0.15
         pen_sp = 0.09 if long_h else 0.105
-        mean_dir_mis = float(np.mean(dir_miss)) if dir_miss else 0.0
-        # Penaliza erros «acima/abaixo da mediana do treino» (alinhado à métrica Acc_dir_mediana).
-        dir_pen = 0.38 * mean_mae * mean_dir_mis if dir_miss else 0.0
-        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6) + dir_pen
+        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
     finally:
         sys.stderr.write("\n")
         sys.stderr.flush()
@@ -1625,33 +1516,11 @@ def _score_val_mae(
 
 
 def _collect_candidate_specs(
-    target_name: str,
-    best_params: dict[str, Any],
-    rs: int,
-    horizon: int = 7,
-    *,
-    lean_benchmark: bool | None = None,
+    target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
 ) -> list[tuple[str, Pipeline, bool]]:
-    """Nome, pipeline (template), usar sample_weight recency.
-
-    Com *lean_benchmark* True (~5 modelos), o benchmark é mais rápido e menos rico.
-    None usa o valor global (enxuto por defeito; ``PREVISAO_ML_FULL=1`` usa lista completa).
-    """
-    if lean_benchmark is None:
-        lean_benchmark = LEAN_BENCHMARK_DEFAULT
-
-    if lean_benchmark:
-        out_lean: list[tuple[str, Pipeline, bool]] = []
-        out_lean.append(("Ridge", build_ridge_pipe(rs), False))
-        out_lean.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
-        if LGBMRegressor is not None:
-            out_lean.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
-        out_lean.append(("HGB", build_hgb_pipe(rs, target_name), False))
-        out_lean.append(("Baseline mediana", build_dummy_median_pipe(), False))
-        return out_lean
-
-    long_h = int(horizon) >= 21
+    """Nome, pipeline (template), usar sample_weight recency."""
     out: list[tuple[str, Pipeline, bool]] = []
+    long_h = int(horizon) >= 21
 
     out.append(("Ridge", build_ridge_pipe(rs), False))
     out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
@@ -1736,12 +1605,9 @@ def _pick_super_ensemble(
     blend_top_k: int,
     show_progress: bool = True,
     horizon: int = 7,
-    lean_benchmark: bool | None = None,
 ) -> tuple[list[Pipeline], np.ndarray, list[bool], str]:
     long_h = int(horizon) >= 21
-    specs = _collect_candidate_specs(
-        target_name, best_params, rs, horizon, lean_benchmark=lean_benchmark
-    )
+    specs = _collect_candidate_specs(target_name, best_params, rs, horizon)
     scored: list[tuple[float, str, Pipeline, bool]] = []
     it = specs
     if show_progress:
@@ -1821,23 +1687,13 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
     return fix(d)
 
 
-def _resolve_n_trials(
-    n_trials: int,
-    n_samples: int,
-    horizon: int = 7,
-    *,
-    target_name: str | None = None,
-) -> int:
-    """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
+def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
+    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
     if n_trials > 0:
         return n_trials
-    base = int(max(10, min(28, int(6 * np.log1p(n_samples)))))
+    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(34, base + 5)
-    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
-        base = max(8, min(18, int(round(base * 0.55))))
-    if target_name == "valor" and _vgv_fast_profile_enabled():
-        base = max(6, min(14, int(round(base * 0.62))))
+        base = min(178, base + 28)
     return base
 
 
@@ -1847,29 +1703,14 @@ def train_one_target(
     horizon: int,
     target_name: str,
     n_trials: int = 0,
-    n_splits_tss: int = 5,
+    n_splits_tss: int = 7,
     random_state: int = 42,
     optuna_seed: int = 42,
     blend_top_k: int = 5,
     show_progress: bool = True,
     full_period_train: bool = False,
     train_frac: float = 0.7,
-    lean_benchmark: bool | None = None,
 ) -> TrainResult:
-    if lean_benchmark is None:
-        if (
-            target_name == "valor"
-            and _vgv_fast_profile_enabled()
-            and not _previsao_env_truthy("PREVISAO_ML_FULL")
-        ):
-            lean_benchmark = True
-        else:
-            lean_benchmark = LEAN_BENCHMARK_DEFAULT
-    blend_eff = int(blend_top_k)
-    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
-        blend_eff = min(blend_eff, 2)
-    if target_name == "valor" and _vgv_fast_profile_enabled():
-        blend_eff = min(blend_eff, 1)
     n = len(X)
     hz = int(horizon)
 
@@ -1903,20 +1744,9 @@ def train_one_target(
         X_imp = X
         y_imp = y
 
-    tss_cap = int(n_splits_tss)
-    _tss_floor = 3
-    if not _previsao_env_truthy("PREVISAO_ML_FULL"):
-        tss_cap = min(tss_cap, 2)
-        _tss_floor = 2
-    else:
-        tss_cap = max(tss_cap, 3)
-    n_splits = min(tss_cap, max(_tss_floor, len(X_opt) // 30))
-    n_splits = max(_tss_floor, n_splits)
-    nt = _resolve_n_trials(n_trials, len(X_opt), hz, target_name=target_name)
-
-    med_dir_ref = float(np.median(np.asarray(y_train, dtype=float)))
-    if not np.isfinite(med_dir_ref):
-        med_dir_ref = None
+    n_splits = min(n_splits_tss, max(3, len(X_opt) // 22))
+    n_splits = max(3, n_splits)
+    nt = _resolve_n_trials(n_trials, len(X_opt), hz)
 
     if LGBMRegressor is None:
         if hz >= 21:
@@ -1956,16 +1786,15 @@ def train_one_target(
                 random_state=random_state,
                 target_name=target_name,
                 horizon=hz,
-                median_dir_ref=med_dir_ref,
             )
 
-        n_startup = max(3, min(8, nt // 6))
+        n_startup = max(12, min(32, nt // 3))
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
-                multivariate=False,
-                n_startup_trials=max(3, min(7, nt // 6)),
+                multivariate=True,
+                n_startup_trials=max(10, min(28, nt // 4)),
             ),
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=n_startup,
@@ -2022,9 +1851,7 @@ def train_one_target(
                 }
             )
 
-    specs_bm = _collect_candidate_specs(
-        target_name, best_params, random_state, hz, lean_benchmark=lean_benchmark
-    )
+    specs_bm = _collect_candidate_specs(target_name, best_params, random_state, hz)
 
     def _fit_bm(pipe: Any, X: pd.DataFrame, y: pd.Series, sw: bool) -> None:
         _safe_fit_pipeline(pipe, X, y, sw, target_name, hz)
@@ -2071,10 +1898,9 @@ def train_one_target(
             target_name,
             best_params,
             random_state,
-            blend_top_k=blend_eff,
+            blend_top_k=blend_top_k,
             show_progress=show_progress,
             horizon=hz,
-            lean_benchmark=lean_benchmark,
         )
 
     pipe_val = _make_fitted_blend(
@@ -2565,6 +2391,437 @@ def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     return out, c_data, c_val
 
 
+# --- Agregações diárias por dimensão (corretor, imobiliária, etc.) + interações do funil ---
+_DIM_TOPK_DEFAULT = 12
+
+
+def _dim_feat_slug(s: str, max_len: int = 36) -> str:
+    import re as _re
+
+    t = _re.sub(r"[^a-z0-9]+", "_", str(s).lower().strip())[:max_len].strip("_")
+    return t or "x"
+
+
+def _dim_pivot_counts(
+    fn: pd.DataFrame,
+    date_col: str | None,
+    cat_col: str | None,
+    prefix: str,
+    master_index: pd.DatetimeIndex,
+    *,
+    top_k: int = _DIM_TOPK_DEFAULT,
+) -> pd.DataFrame | None:
+    if (
+        not date_col
+        or not cat_col
+        or date_col not in fn.columns
+        or cat_col not in fn.columns
+    ):
+        return None
+    sub = fn[[date_col, cat_col]].copy()
+    sub["_d"] = _to_day(sub[date_col])
+    sub = sub.loc[sub["_d"].notna()]
+    if sub.empty:
+        return None
+    sub["_c"] = (
+        sub[cat_col]
+        .fillna("(vazio)")
+        .astype(str)
+        .str.strip()
+        .str.slice(0, 72)
+    )
+    vc = sub["_c"].value_counts()
+    top_set = set(vc.head(int(top_k)).index)
+    sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
+    pt = sub.groupby(["_d", "_ck"], observed=True).size().unstack(fill_value=0)
+    pt.columns = [f"{prefix}_n_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
+    return pt.reindex(master_index).fillna(0.0).astype(np.float64)
+
+
+def _dim_pivot_sums(
+    fn: pd.DataFrame,
+    date_col: str | None,
+    cat_col: str | None,
+    val_col: str | None,
+    prefix: str,
+    master_index: pd.DatetimeIndex,
+    *,
+    top_k: int = _DIM_TOPK_DEFAULT,
+) -> pd.DataFrame | None:
+    if (
+        not date_col
+        or not cat_col
+        or not val_col
+        or date_col not in fn.columns
+        or cat_col not in fn.columns
+        or val_col not in fn.columns
+    ):
+        return None
+    sub = fn[[date_col, cat_col, val_col]].copy()
+    sub["_d"] = _to_day(sub[date_col])
+    sub = sub.loc[sub["_d"].notna()]
+    if sub.empty:
+        return None
+    sub["_v"] = _winsorize_positive_series(sub[val_col])
+    sub["_c"] = (
+        sub[cat_col]
+        .fillna("(vazio)")
+        .astype(str)
+        .str.strip()
+        .str.slice(0, 72)
+    )
+    vc = sub["_c"].value_counts()
+    top_set = set(vc.head(int(top_k)).index)
+    sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
+    pt = sub.groupby(["_d", "_ck"], observed=True)["_v"].sum().unstack(fill_value=0)
+    pt.columns = [f"{prefix}_v_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
+    return pt.reindex(master_index).fillna(0.0).astype(np.float64)
+
+
+def _inject_dim_features_and_funnel_interactions(
+    df_master: pd.DataFrame,
+    dict_dfs: dict[str, pd.DataFrame],
+) -> list[str]:
+    """
+    Acrescenta, por dia: contagens (e somas VGV quando aplicável) por corretor / imobiliária /
+    empreendimento / origem, com top-K + «outros»; concentração (HHI); produtos do funil;
+    interações polinomiais (grau 2, só cruzamentos) sobre volumes defasados.
+
+    Devolve os nomes das colunas criadas (para lags e médias móveis).
+    """
+    idx = df_master.index
+    created: list[str] = []
+    fn_l = normalize_dataframe_columns(dict_dfs["leads"].copy())
+    fn_a = normalize_dataframe_columns(dict_dfs["agendamentos"].copy())
+    fn_p = normalize_dataframe_columns(dict_dfs["pastas"].copy())
+    fn_v = normalize_dataframe_columns(dict_dfs["vendas"].copy())
+
+    d_le = find_column_any(
+        fn_l,
+        [
+            ["data", "criacao"],
+            ["data", "criacao", "lead"],
+            ["data", "atendimento"],
+        ],
+    )
+    d_ag = find_column_any(fn_a, [["data", "agendamento"]])
+    d_vi = find_column_any(fn_a, [["data", "visita"]])
+    d_pa = find_column_any(
+        fn_p,
+        [["data", "criacao", "pasta"], ["data", "criacao"]],
+    )
+    d_ve = find_column_any(
+        fn_v,
+        [
+            ["data", "venda"],
+            ["data", "fechamento"],
+            ["contrato", "gerado"],
+        ],
+    )
+    v_val = find_column_any(
+        fn_v,
+        [
+            ["valor", "real", "venda"],
+            ["valor", "real"],
+            ["vgv", "real"],
+            ["valor", "venda"],
+        ],
+    )
+
+    tables: list[pd.DataFrame] = []
+
+    def _add(tab: pd.DataFrame | None) -> None:
+        if tab is not None and not tab.empty:
+            tables.append(tab)
+
+    # Leads — proprietário / origem / tipo
+    _add(
+        _dim_pivot_counts(
+            fn_l,
+            d_le,
+            find_column_any(
+                fn_l,
+                [
+                    ["proprietario", "lead"],
+                    ["proprietario"],
+                    ["criado", "por"],
+                ],
+            ),
+            "dim_lead_prop",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_l,
+            d_le,
+            find_column_any(fn_l, [["origem", "lead"], ["origem"]]),
+            "dim_lead_origem",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_l,
+            d_le,
+            find_column_any(
+                fn_l,
+                [["tipo", "registro", "lead"], ["tipo", "lead"], ["classificacao"]],
+            ),
+            "dim_lead_tipo",
+            idx,
+        )
+    )
+
+    # Vendas — corretor / ranking / imobiliária / empreendimento (contagem + VGV por corretor)
+    _add(
+        _dim_pivot_counts(
+            fn_v,
+            d_ve,
+            find_column_any(
+                fn_v,
+                [
+                    ["contato", "corretor"],
+                    ["corretor", "proprietario"],
+                    ["corretor"],
+                ],
+            ),
+            "dim_venda_cor",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_sums(
+            fn_v,
+            d_ve,
+            find_column_any(
+                fn_v,
+                [
+                    ["contato", "corretor"],
+                    ["corretor", "proprietario"],
+                    ["corretor"],
+                ],
+            ),
+            v_val,
+            "dim_venda_cor",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_v,
+            d_ve,
+            find_column_any(fn_v, [["ranking"], ["rank"]]),
+            "dim_venda_rank",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_v,
+            d_ve,
+            find_column_any(fn_v, [["imobiliaria"], ["nome", "imobiliaria"]]),
+            "dim_venda_imob",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_v,
+            d_ve,
+            find_column_any(fn_v, [["empreendimento"], ["empreed"]]),
+            "dim_venda_emp",
+            idx,
+        )
+    )
+
+    # Pastas — empreendimento / correspondente
+    _add(
+        _dim_pivot_counts(
+            fn_p,
+            d_pa,
+            find_column_any(fn_p, [["empreendimento"], ["empreed"]]),
+            "dim_pasta_emp",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_p,
+            d_pa,
+            find_column_any(
+                fn_p,
+                [["correspondente"], ["corretor"], ["avaliacao", "credito"]],
+            ),
+            "dim_pasta_corr",
+            idx,
+        )
+    )
+
+    # Agendamentos / visitas — na data da visita realizada
+    _add(
+        _dim_pivot_counts(
+            fn_a,
+            d_vi,
+            find_column_any(fn_a, [["tipo", "visita"], ["tipo"]]),
+            "dim_visit_tipo",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_a,
+            d_vi,
+            find_column_any(
+                fn_a,
+                [["corretor", "nome"], ["corretor"], ["nome", "completo"]],
+            ),
+            "dim_visit_cor",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_a,
+            d_vi,
+            find_column_any(fn_a, [["imobiliaria"], ["nome", "imobiliaria"]]),
+            "dim_visit_imob",
+            idx,
+        )
+    )
+    _add(
+        _dim_pivot_counts(
+            fn_a,
+            d_vi,
+            find_column_any(
+                fn_a,
+                [["gerente", "regional"], ["gerente"], ["regional"]],
+            ),
+            "dim_visit_gerente",
+            idx,
+        )
+    )
+    # Agendamentos criados (data de criação do agendamento)
+    _add(
+        _dim_pivot_counts(
+            fn_a,
+            d_ag,
+            find_column_any(
+                fn_a,
+                [["corretor", "nome"], ["corretor"], ["nome", "completo"]],
+            ),
+            "dim_agend_cor",
+            idx,
+        )
+    )
+
+    for tab in tables:
+        for c in tab.columns:
+            df_master[c] = tab[c].astype(np.float64)
+            created.append(str(c))
+
+    # Concentração (HHI) nos corretores de vendas do dia
+    cor_n = [c for c in df_master.columns if c.startswith("dim_venda_cor_n_")]
+    if len(cor_n) >= 2:
+        M = df_master[cor_n].to_numpy(dtype=float)
+        s = M.sum(axis=1, keepdims=True)
+        p = np.divide(M, s + 1e-9, out=np.zeros_like(M), where=s.flatten() > 1e-12)
+        df_master["dim_venda_cor_hhi"] = np.sum(p * p, axis=1)
+        created.append("dim_venda_cor_hhi")
+
+    visit_cor = [c for c in df_master.columns if c.startswith("dim_visit_cor_n_")]
+    if len(visit_cor) >= 2:
+        M = df_master[visit_cor].to_numpy(dtype=float)
+        s = M.sum(axis=1, keepdims=True)
+        p = np.divide(M, s + 1e-9, out=np.zeros_like(M), where=s.flatten() > 1e-12)
+        df_master["dim_visit_cor_hhi"] = np.sum(p * p, axis=1)
+        created.append("dim_visit_cor_hhi")
+
+    # Datas comerciais (efeitos sazonais de varejo / imobiliário)
+    dser = pd.Series(idx)
+    dm = dser.dt.month.to_numpy()
+    dw = dser.dt.dayofweek.to_numpy()
+    dd = dser.dt.day.to_numpy()
+    mae_m = (dm == 5) & (dw == 6) & (dd >= 8) & (dd <= 14)
+    pai_m = (dm == 8) & (dw == 6) & (dd >= 8) & (dd <= 14)
+    nam = (dm == 6) & (dd == 12)
+    bf = (dm == 11) & (dw == 4) & (dd >= 22) & (dd <= 28)
+    nat = (dm == 12) & (dd == 25)
+    for _nm, _ar in (
+        ("cal_dia_maes", mae_m),
+        ("cal_dia_pais", pai_m),
+        ("cal_dia_namorados", nam),
+        ("cal_black_friday", bf),
+        ("cal_natal", nat),
+    ):
+        df_master[_nm] = _ar.astype(np.float64)
+        created.append(_nm)
+
+    # Produtos cruzados do funil (defasagem 1 dia para alinhar a «informação até t»)
+    def _l1(c: str) -> pd.Series:
+        return df_master[c].shift(1).fillna(0.0)
+
+    if all(c in df_master.columns for c in ("vol_leads", "vol_pastas")):
+        df_master["ix_l1_leads_x_pastas"] = _l1("vol_leads") * _l1("vol_pastas")
+        created.append("ix_l1_leads_x_pastas")
+    if all(c in df_master.columns for c in ("vol_visit", "vol_agend")):
+        df_master["ix_l1_visit_x_agend"] = _l1("vol_visit") * _l1("vol_agend")
+        created.append("ix_l1_visit_x_agend")
+    if all(c in df_master.columns for c in ("vol_pastas", "vol_visit")):
+        df_master["ix_l1_pastas_x_visit"] = _l1("vol_pastas") * _l1("vol_visit")
+        created.append("ix_l1_pastas_x_visit")
+    if all(c in df_master.columns for c in ("vol_leads", "vol_visit")):
+        df_master["ix_l1_leads_x_visit"] = _l1("vol_leads") * _l1("vol_visit")
+        created.append("ix_l1_leads_x_visit")
+    if all(c in df_master.columns for c in ("vol_agend", "vol_leads")):
+        df_master["ix_l1_agend_x_leads"] = _l1("vol_agend") * _l1("vol_leads")
+        created.append("ix_l1_agend_x_leads")
+
+    # Razões móveis 7d (interação temporal)
+    if all(c in df_master.columns for c in ("vol_leads", "vol_visit", "vol_pastas")):
+        rl7 = df_master["vol_leads"].shift(1).rolling(7, min_periods=1).sum()
+        rv7 = df_master["vol_visit"].shift(1).rolling(7, min_periods=1).sum()
+        rp7 = df_master["vol_pastas"].shift(1).rolling(7, min_periods=1).sum()
+        df_master["ix_r7_visit_over_leads"] = rv7 / (rl7 + 1e-5)
+        df_master["ix_r7_pastas_over_visit"] = rp7 / (rv7 + 1e-5)
+        created.extend(["ix_r7_visit_over_leads", "ix_r7_pastas_over_visit"])
+
+    # PolynomialFeatures: apenas termos cruzados entre volumes defasados (funil agregado)
+    try:
+        from sklearn.preprocessing import PolynomialFeatures
+
+        core_cols = ["vol_leads", "vol_agend", "vol_visit", "vol_pastas"]
+        if all(c in df_master.columns for c in core_cols):
+            core_mat = (
+                df_master[core_cols]
+                .shift(1)
+                .fillna(0.0)
+                .astype(np.float32)
+                .to_numpy()
+            )
+            poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+            Z = poly.fit_transform(core_mat)
+            names = list(poly.get_feature_names_out(core_cols))
+            used_slugs: set[str] = set()
+            for j, name in enumerate(names):
+                nm = str(name)
+                if " " not in nm:
+                    continue
+                base_slug = "ix_poly_" + _dim_feat_slug(nm.replace(" ", "_x_"))[:40]
+                slug = base_slug
+                u = 0
+                while slug in used_slugs:
+                    u += 1
+                    slug = f"{base_slug}_{u}"
+                used_slugs.add(slug)
+                df_master[slug] = Z[:, j].astype(np.float64)
+                created.append(slug)
+    except Exception:
+        pass
+
+    return created
+
+
 def forward_calendar_features(index: pd.DatetimeIndex, horizon: int) -> pd.DataFrame:
     """
     Por cada dia t: contagens no calendário dos dias t+1..t+H.
@@ -2998,95 +3255,70 @@ def predict_last_row_custom_date_range(
 
 def _inject_ts_and_stl_features(
     df_master: pd.DataFrame, show_progress: bool = False
-) -> pd.DataFrame:
-    """Picos, quantis, eco semanal, ticket e STL rolante (statsmodels) — só passado.
-
-    Retorna apenas as colunas novas; o chamador faz ``pd.concat`` uma vez para evitar
-    fragmentação do DataFrame (PerformanceWarning do pandas).
-    """
-    idx = df_master.index
-    out: dict[str, Any] = {}
-
+) -> None:
+    """Picos, quantis, eco semanal, ticket e STL rolante (statsmodels) — só passado."""
     for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
         s = df_master[col].astype(float)
-        out[f"ts_rollmax7_{short}"] = s.shift(1).rolling(7, min_periods=1).max()
-        out[f"ts_rollmax30_{short}"] = s.shift(1).rolling(30, min_periods=1).max()
-        out[f"ts_q85_30_{short}"] = (
+        df_master[f"ts_rollmax7_{short}"] = s.shift(1).rolling(7, min_periods=1).max()
+        df_master[f"ts_rollmax30_{short}"] = s.shift(1).rolling(30, min_periods=1).max()
+        df_master[f"ts_q85_30_{short}"] = (
             s.shift(1).rolling(30, min_periods=10).quantile(0.85)
         )
-        out[f"ts_q90_60_{short}"] = (
+        df_master[f"ts_q90_60_{short}"] = (
             s.shift(1).rolling(60, min_periods=15).quantile(0.90)
         )
-        out[f"ts_ewm_short_{short}"] = s.shift(1).ewm(span=5, adjust=False).mean()
+        df_master[f"ts_ewm_short_{short}"] = s.shift(1).ewm(span=5, adjust=False).mean()
         roll_m = s.shift(1).rolling(14, min_periods=3).mean()
-        out[f"ts_burst_{short}"] = (s.shift(1) / (roll_m + 1e-6)).fillna(0.0)
+        df_master[f"ts_burst_{short}"] = (s.shift(1) / (roll_m + 1e-6)).fillna(0.0)
 
     tv = df_master["target_valor"]
     tq = df_master["target_qtd"]
-    out["ts_weekly_echo_vgv"] = (
+    df_master["ts_weekly_echo_vgv"] = (
         0.45 * tv.shift(7) + 0.30 * tv.shift(14) + 0.25 * tv.shift(21)
     ).fillna(0.0)
-    out["ts_weekly_echo_qtd"] = (
+    df_master["ts_weekly_echo_qtd"] = (
         0.45 * tq.shift(7) + 0.30 * tq.shift(14) + 0.25 * tq.shift(21)
     ).fillna(0.0)
-    out["ts_ticket_lag1"] = (tv.shift(1) / (tq.shift(1) + 1e-6)).fillna(0.0)
+    df_master["ts_ticket_lag1"] = (tv.shift(1) / (tq.shift(1) + 1e-6)).fillna(0.0)
 
     try:
         from statsmodels.tsa.seasonal import STL
     except ImportError:
         for short in ("vgv", "qtd"):
-            out[f"ts_stl_trend_{short}"] = 0.0
-            out[f"ts_stl_seasamp_{short}"] = 0.0
-        return pd.DataFrame(out, index=idx)
-
-    if _previsao_env_truthy("PREVISAO_SKIP_STL"):
-        for short in ("vgv", "qtd"):
-            out[f"ts_stl_trend_{short}"] = 0.0
-            out[f"ts_stl_seasamp_{short}"] = 0.0
-        return pd.DataFrame(out, index=idx)
+            df_master[f"ts_stl_trend_{short}"] = 0.0
+            df_master[f"ts_stl_seasamp_{short}"] = 0.0
+        return
 
     win, period = 91, 7
-    st_stride = max(1, int(STL_STRIDE_DEFAULT))
     for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
         s = df_master[col].astype(float)
         n = len(s)
         arr = s.to_numpy(dtype=float)
         trend = np.zeros(n)
         seas_amp = np.zeros(n)
-        idx_points = list(range(win, n, st_stride))
-        td: dict[int, float] = {}
-        sd: dict[int, float] = {}
-        it = idx_points
+        idx_iter = range(win, n)
         if show_progress:
-            it = _pv_tqdm(
-                idx_points,
+            idx_iter = _pv_tqdm(
+                idx_iter,
                 desc=f"STL {short}",
                 leave=False,
                 unit="dia",
             )
-        for i in it:
+        for i in idx_iter:
             seg = arr[i - win : i]
             if np.nanmax(seg) - np.nanmin(seg) < 1e-11:
-                td[i] = float(seg[-1])
-                sd[i] = 0.0
+                trend[i] = seg[-1]
+                seas_amp[i] = 0.0
                 continue
             try:
-                r = STL(seg, period=period, robust=STL_ROBUST_DEFAULT).fit()
-                td[i] = float(r.trend[-1])
-                sd[i] = float(np.std(r.seasonal))
+                r = STL(seg, period=period, robust=True).fit()
+                trend[i] = float(r.trend[-1])
+                seas_amp[i] = float(np.std(r.seasonal))
             except Exception:
-                td[i] = float(np.nanmean(seg[-period:]))
-                sd[i] = 0.0
-        if idx_points:
-            idx_r = pd.RangeIndex(start=win, stop=n, step=1)
-            ser_t = pd.Series(td, dtype=float).reindex(idx_r).ffill().bfill().fillna(0.0)
-            ser_s = pd.Series(sd, dtype=float).reindex(idx_r).ffill().bfill().fillna(0.0)
-            trend[win:] = ser_t.to_numpy(dtype=float)
-            seas_amp[win:] = ser_s.to_numpy(dtype=float)
-        out[f"ts_stl_trend_{short}"] = trend
-        out[f"ts_stl_seasamp_{short}"] = seas_amp
-
-    return pd.DataFrame(out, index=idx)
+                trend[i] = float(np.nanmean(seg[-period:]))
+                seas_amp[i] = 0.0
+        df_master[f"ts_stl_trend_{short}"] = trend
+        df_master[f"ts_stl_seasamp_{short}"] = seas_amp
 
 
 def _find_formulario_vgv_col(
@@ -3363,19 +3595,6 @@ def build_daily_master(
     if df_master.index.duplicated().any():
         df_master = df_master[~df_master.index.duplicated(keep="last")]
 
-    from datetime import date as _date_today
-
-    _d_min = SERIE_DIARIA_INICIO.normalize()
-    _d_max = pd.Timestamp(_date_today.today()).normalize()
-    df_master = df_master.loc[
-        (df_master.index >= _d_min) & (df_master.index <= _d_max)
-    ]
-    if df_master.empty:
-        raise ValueError(
-            f"Sem observações diárias entre {_d_min.date()} e {_d_max.date()} (inclusive); "
-            "verifique as planilhas ou o intervalo configurado."
-        )
-
     df_form = dict_dfs.get("formulario_previsao")
     if df_form is not None and len(df_form) > 0:
         try:
@@ -3384,6 +3603,8 @@ def build_daily_master(
         except Exception as e:
             if show_progress:
                 print(f"Aviso: não integrei o formulário de previsão: {e}")
+
+    colunas_dim_extra = _inject_dim_features_and_funnel_interactions(df_master, dict_dfs)
 
     colunas_base = [
         "vol_leads",
@@ -3395,6 +3616,20 @@ def build_daily_master(
     ]
     colunas_fb = [c for c in df_master.columns if c.startswith("fb_")]
     for col in colunas_base + colunas_fb:
+        s = df_master[col]
+        for lag in (1, 3, 7, 14, 30):
+            df_master[f"{col}_lag_{lag}"] = s.shift(lag)
+        df_master[f"{col}_ma_7d"] = s.shift(1).rolling(7, min_periods=1).mean()
+        df_master[f"{col}_ma_15d"] = s.shift(1).rolling(15, min_periods=1).mean()
+        df_master[f"{col}_ma_30d"] = s.shift(1).rolling(30, min_periods=1).mean()
+        df_master[f"{col}_std_15d"] = s.shift(1).rolling(15, min_periods=1).std()
+        df_master[f"{col}_momentum"] = df_master[f"{col}_ma_7d"] / (
+            df_master[f"{col}_ma_30d"] + 1e-5
+        )
+
+    for col in colunas_dim_extra:
+        if col not in df_master.columns:
+            continue
         s = df_master[col]
         for lag in (1, 3, 7, 14, 30):
             df_master[f"{col}_lag_{lag}"] = s.shift(lag)
@@ -3443,8 +3678,7 @@ def build_daily_master(
 
     merge_macro_bcb_into_daily(df_master, show_progress=show_progress)
 
-    _ts_stl_extra = _inject_ts_and_stl_features(df_master, show_progress=show_progress)
-    df_master = pd.concat([df_master, _ts_stl_extra], axis=1)
+    _inject_ts_and_stl_features(df_master, show_progress=show_progress)
 
     df_master.replace([np.inf, -np.inf], np.nan, inplace=True)
     bad_tgt = df_master["target_qtd"].isna() | df_master["target_valor"].isna()
@@ -4110,24 +4344,6 @@ import pandas as pd
 
 def _json_safe(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
-
-
-def _json_safe_chart_series(seq: Any) -> str:
-    """Série para Plotly: valores finitos como número; ausentes/não finitos como null (sem imputar 0)."""
-    if not seq:
-        return "[]"
-    out: list[Any] = []
-    for x in seq:
-        if x is None:
-            out.append(None)
-            continue
-        try:
-            fx = float(x)
-        except (TypeError, ValueError):
-            out.append(None)
-            continue
-        out.append(fx if math.isfinite(fx) else None)
-    return json.dumps(out, ensure_ascii=False)
 
 
 def _numeric_series_for_corr_picker(df: pd.DataFrame, *, max_cols: int = 120) -> dict[str, list[float]]:
@@ -5718,176 +5934,84 @@ def _formulario_nf_pair_cols(fn: pd.DataFrame) -> tuple[str | None, str | None]:
 
 
 def _formulario_map_columns(fn: pd.DataFrame) -> dict[str, Any]:
+    """
+    Colunas do Esboço após `normalize_header`: nomes canónicos em minúsculas,
+    sem acentos (ex.: «vendas facilitadas previstas», «data de referencia (...)»).
+    """
+    cols = set(fn.columns)
+
+    def _req(exact: str) -> str | None:
+        return exact if exact in cols else None
+
+    def _ref_col() -> str | None:
+        exact = "data de referencia (indicar sempre o sabado da semana)"
+        if exact in cols:
+            return exact
+        for c in fn.columns:
+            sc = str(c)
+            if sc.startswith("data de referencia"):
+                return sc
+        return find_column_any(
+            fn,
+            [
+                ["data", "referencia", "sabado"],
+                ["referencia", "sabado"],
+                ["data", "referencia"],
+            ],
+        )
+
     m: dict[str, Any] = {}
-    m["ref"] = find_column_any(
-        fn,
-        [
-            ["data", "referencia", "sabado"],
-            ["referencia", "sabado"],
-            ["data", "referencia"],
-        ],
-    )
-    m["empreendimento"] = find_column_any(
-        fn,
-        [["empreendimento", "previsto"], ["empreendimento"], ["previsto", "ter", "venda"]],
-    )
-    m["regional"] = find_column_any(fn, [["regional", "imob"], ["regional"]])
-    m["canal"] = find_column(fn, ["canal"])
-    m["regiao"] = find_column(fn, ["regiao"])
-    m["imobiliaria"] = find_column(fn, ["imobiliaria"])
+    m["ref"] = _ref_col()
+    m["v_fp"] = _req("vendas facilitadas previstas")
+    m["v_fr"] = _req("vendas facilitadas reais")
+    m["v_np"] = _req("vendas normais previstas")
+    m["v_nr"] = _req("vendas normais reais")
+    m["q_fp"] = _req("qtd vendas facilitadas previstas")
+    m["q_fr"] = _req("qtd vendas facilitadas reais")
+    m["q_np"] = _req("qtd vendas normais previstas")
+    m["q_nr"] = _req("qtd vendas normais reais")
+    m["regiao"] = _req("regiao")
+    m["canal"] = _req("canal")
+    m["nf"] = _req("normal ou facilitada")
+    m["imobiliaria"] = _req("imobiliaria")
+    m["regional"] = _req("regional ou imob")
+    m["empreendimento"] = _req("empreendimento (previsto para ter venda)")
+    # Compatibilidade com gráficos antigos / agregações
+    m["q_fac_p"], m["q_fac_r"] = m["q_fp"], m["q_fr"]
+    m["q_norm_p"], m["q_norm_r"] = m["q_np"], m["q_nr"]
+    m["vgv_prev"] = m["v_fp"]
+    m["vgv_real"] = m["v_fr"]
+    m["vendas_prev"], m["vendas_real"] = m["v_np"], m["v_nr"]
+    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
     m["gerente"] = find_column(fn, ["gerente"])
     m["erro"] = find_column(fn, ["erro", "previs"])
-    m["vendas_prev"] = None
-    for c in fn.columns:
-        lc = str(c).lower()
-        if (
-            "vendas" in lc
-            and ("previs" in lc or "previst" in lc)
-            and "real" not in lc
-            and "qtd" not in lc
-            and "vgv" not in lc
-        ):
-            m["vendas_prev"] = c
-            break
-    m["vendas_real"] = None
-    for c in fn.columns:
-        lc = str(c).lower()
-        if "vendas" in lc and "real" in lc and "qtd" not in lc and "vgv" not in lc:
-            m["vendas_real"] = c
-            break
-    m["vgv_prev"] = None
-    for c in fn.columns:
-        lc = str(c).lower()
-        if "vgv" in lc and ("previs" in lc or "previst" in lc) and "real" not in lc:
-            m["vgv_prev"] = c
-            break
-    m["vgv_real"] = None
-    for c in fn.columns:
-        lc = str(c).lower()
-        if "vgv" in lc and "real" in lc:
-            m["vgv_real"] = c
-            break
-    used_q: set[str] = set()
-    m["q_fac_p"] = _find_formulario_qtd_col(
-        fn, [["facilitadas", "previstas"], ["facilitada", "prevista"]], used=used_q
-    )
-    m["q_fac_r"] = _find_formulario_qtd_col(
-        fn,
-        [["facilitadas", "reais"], ["facilitadas", "real"], ["facilitada", "real"]],
-        used=used_q,
-    )
-    m["q_norm_p"] = _find_formulario_qtd_col(
-        fn, [["normais", "previstas"], ["normal", "prevista"]], used=used_q
-    )
-    m["q_norm_r"] = _find_formulario_qtd_col(
-        fn, [["normais", "reais"], ["normais", "real"], ["normal", "real"]], used=used_q
-    )
-    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
     m["visitas"] = find_column_any(fn, [["visitas", "totais", "esperadas"], ["visitas"]])
     return m
 
 
-def _formulario_resolve_oito_metricas(fn: pd.DataFrame) -> dict[str, str | None]:
-    """
-    Oito colunas numéricas do Esboço (VGV e QTD, facilitadas/normais, previsto/real),
-    sem misturar com colunas genéricas de «vendas» ou «vgv» soltas.
-    """
-    used_v: set[str] = set()
-    used_q: set[str] = set()
-    out: dict[str, str | None] = {}
-    out["v_fac_p"] = _find_formulario_vgv_col(
-        fn,
-        [
-            ["vendas", "facilitadas", "previstas"],
-            ["vgv", "facilitadas", "previstas"],
-            ["valor", "facilitadas", "previstas"],
-            ["facilitadas", "previstas", "vgv"],
-            ["facilitadas", "previstas"],
-        ],
-        used=used_v,
-    )
-    out["v_norm_p"] = _find_formulario_vgv_col(
-        fn,
-        [
-            ["vendas", "normais", "previstas"],
-            ["vgv", "normais", "previstas"],
-            ["valor", "normais", "previstas"],
-            ["normais", "previstas", "vgv"],
-            ["normais", "previstas"],
-        ],
-        used=used_v,
-    )
-    out["v_fac_r"] = _find_formulario_vgv_col(
-        fn,
-        [
-            ["vendas", "facilitadas", "reais"],
-            ["vendas", "facilitadas", "real"],
-            ["vgv", "facilitadas", "reais"],
-            ["facilitadas", "reais", "vgv"],
-            ["facilitadas", "reais"],
-            ["facilitadas", "realizado"],
-            ["facilitadas", "realizada"],
-        ],
-        used=used_v,
-    )
-    out["v_norm_r"] = _find_formulario_vgv_col(
-        fn,
-        [
-            ["vendas", "normais", "reais"],
-            ["vendas", "normais", "real"],
-            ["vgv", "normais", "reais"],
-            ["normais", "reais", "vgv"],
-            ["normais", "reais"],
-            ["normais", "realizado"],
-            ["normais", "realizada"],
-        ],
-        used=used_v,
-    )
-    out["q_fac_p"] = _find_formulario_qtd_col(
-        fn,
-        [
-            ["qtd", "facilitadas", "previstas"],
-            ["qtd", "facilitada", "prevista"],
-            ["facilitadas", "previstas"],
-            ["facilitada", "prevista"],
-        ],
-        used=used_q,
-    )
-    out["q_norm_p"] = _find_formulario_qtd_col(
-        fn,
-        [
-            ["qtd", "normais", "previstas"],
-            ["qtd", "normal", "prevista"],
-            ["normais", "previstas"],
-            ["normal", "prevista"],
-        ],
-        used=used_q,
-    )
-    out["q_fac_r"] = _find_formulario_qtd_col(
-        fn,
-        [
-            ["qtd", "facilitadas", "reais"],
-            ["qtd", "facilitadas", "real"],
-            ["qtd", "facilitada", "real"],
-            ["facilitadas", "reais"],
-            ["facilitadas", "real"],
-            ["facilitada", "real"],
-        ],
-        used=used_q,
-    )
-    out["q_norm_r"] = _find_formulario_qtd_col(
-        fn,
-        [
-            ["qtd", "normais", "reais"],
-            ["qtd", "normais", "real"],
-            ["qtd", "normal", "real"],
-            ["normais", "reais"],
-            ["normais", "real"],
-            ["normal", "real"],
-        ],
-        used=used_q,
-    )
-    return out
+def _formulario_colunas_obrigatorias_ok(mc: dict[str, Any]) -> tuple[bool, list[str]]:
+    faltam: list[str] = []
+    need = [
+        ("ref", "Data de referência (sábado)"),
+        ("v_fp", "Vendas Facilitadas Previstas"),
+        ("v_fr", "Vendas Facilitadas Reais"),
+        ("v_np", "Vendas Normais Previstas"),
+        ("v_nr", "Vendas Normais Reais"),
+        ("q_fp", "QTD Vendas Facilitadas Previstas"),
+        ("q_fr", "QTD Vendas Facilitadas Reais"),
+        ("q_np", "QTD Vendas Normais Previstas"),
+        ("q_nr", "QTD Vendas Normais Reais"),
+        ("regiao", "Região"),
+        ("canal", "Canal"),
+        ("nf", "Normal ou Facilitada"),
+        ("imobiliaria", "Imobiliária"),
+        ("regional", "Regional ou IMOB"),
+        ("empreendimento", "Empreendimento (Previsto para ter venda)"),
+    ]
+    for key, label in need:
+        if not mc.get(key):
+            faltam.append(label)
+    return (not faltam, faltam)
 
 
 def _formulario_canon_canal(x: Any) -> str:
@@ -5934,18 +6058,8 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
-# Folds na Optuna (2–7; fora de ML_FULL o código limita a 2). PREVISAO_ML_FULL=1 usa até 3+ conforme abaixo.
-try:
-    OPTUNA_TSS_SPLITS = max(2, min(7, int(str(os.environ.get("PREVISAO_OPTUNA_SPLITS", "2")).strip())))
-except Exception:
-    OPTUNA_TSS_SPLITS = 2
-# Série diária (leads/vendas/…) usada no treino e nas análises: desta data até ao dia corrente (inclusive).
-SERIE_DIARIA_INICIO = pd.Timestamp("2025-01-01")
-# Um horizonte por execução de «Gerar previsões» quando o UI não envia lista.
-HORIZONTE_TREINO_PADRAO = 7
-HORIZONTES_FIXOS_DISPONIVEIS: tuple[int, ...] = (3, 7, 30)
-# Top-K no super-ensemble (``PREVISAO_ML_FULL=1`` aumenta trials/folds e o teto efetivo de blend).
-BLEND_TOP_K_FIXO = 3
+# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
+BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
@@ -5957,27 +6071,6 @@ SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in
     "true",
     "yes",
 )
-
-
-def _previsao_env_truthy(key: str) -> bool:
-    return str(os.environ.get(key, "0")).lower() in ("1", "true", "yes")
-
-
-def _vgv_fast_profile_enabled() -> bool:
-    """VGV (target_valor) mais rápido por defeito: menos Optuna, benchmark enxuto, menos folds/blend."""
-    return not _previsao_env_truthy("PREVISAO_VGV_FULL")
-
-
-# Benchmark enxuto por defeito (rápido). PREVISAO_ML_FULL=1 = lista completa + mais trials/folds.
-LEAN_BENCHMARK_DEFAULT = not _previsao_env_truthy("PREVISAO_ML_FULL")
-# STL robust=False por defeito (rápido). PREVISAO_STL_ROBUST=1 ativa robust=True.
-STL_ROBUST_DEFAULT = _previsao_env_truthy("PREVISAO_STL_ROBUST")
-# STL a cada N dias (ffill entre pontos). 1 = diário (lento). PREVISAO_STL_STRIDE altera.
-try:
-    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "10")).strip())
-except Exception:
-    _stl_stride_raw = 10
-STL_STRIDE_DEFAULT = max(1, min(31, _stl_stride_raw))
 
 
 def _configure_streamlit_progress() -> None:
@@ -6999,7 +7092,8 @@ def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
 def run_training_pipeline(
     dfs: dict[str, pd.DataFrame],
     custom_previsao: dict[str, Any] | None = None,
-    horizontes_fixos: list[int] | None = None,
+    *,
+    horizontes: list[int] | None = None,
 ) -> tuple[
     dict[str, float],
     float,
@@ -7010,7 +7104,6 @@ def run_training_pipeline(
     dict[str, Any],
     dict[str, Any],
     dict[str, Any] | None,
-    list[int],
 ]:
     df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
     dossie_ml = _build_ml_dossie_pack(df_master)
@@ -7026,12 +7119,6 @@ def run_training_pipeline(
     ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
     conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
 
-    if horizontes_fixos is None:
-        horizontes = [HORIZONTE_TREINO_PADRAO]
-    else:
-        horizontes = [int(h) for h in horizontes_fixos if int(h) in HORIZONTES_FIXOS_DISPONIVEIS]
-        if not horizontes:
-            horizontes = [HORIZONTE_TREINO_PADRAO]
     por_horizonte: dict[Any, dict[str, Any]] = {}
     best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
 
@@ -7066,11 +7153,12 @@ def run_training_pipeline(
     vals_ok = isinstance(custom_previsao, dict) and not range_mode and bool(cvals)
     have_custom = range_ok or vals_ok
     extra_custom = 2 if have_custom else 0
+    horizontes_run: list[int] = [] if have_custom else list(horizontes or [7])
     progress = st.progress(0, text="A preparar modelos…")
-    total_steps = len(horizontes) * 2 + extra_custom
+    total_steps = len(horizontes_run) * 2 + extra_custom
     step = 0
 
-    for h in horizontes:
+    for h in horizontes_run:
         Xq, yq = build_xy_for_horizon(df_master, "target_qtd", h)
         Xv, yv = build_xy_for_horizon(df_master, "target_valor", h)
 
@@ -7084,7 +7172,6 @@ def run_training_pipeline(
             horizon=h,
             target_name="qtd",
             n_trials=OPTUNA_TRIALS_AUTO,
-            n_splits_tss=OPTUNA_TSS_SPLITS,
             random_state=RANDOM_SEED,
             optuna_seed=RANDOM_SEED,
             blend_top_k=BLEND_TOP_K_FIXO,
@@ -7101,7 +7188,6 @@ def run_training_pipeline(
             horizon=h,
             target_name="valor",
             n_trials=OPTUNA_TRIALS_AUTO,
-            n_splits_tss=OPTUNA_TSS_SPLITS,
             random_state=RANDOM_SEED,
             optuna_seed=RANDOM_SEED + 1,
             blend_top_k=BLEND_TOP_K_FIXO,
@@ -7165,7 +7251,6 @@ def run_training_pipeline(
                 horizon=hz_eff,
                 target_name="qtd",
                 n_trials=OPTUNA_TRIALS_AUTO,
-                n_splits_tss=OPTUNA_TSS_SPLITS,
                 random_state=RANDOM_SEED,
                 optuna_seed=RANDOM_SEED + 7,
                 blend_top_k=BLEND_TOP_K_FIXO,
@@ -7181,7 +7266,6 @@ def run_training_pipeline(
                 horizon=hz_eff,
                 target_name="valor",
                 n_trials=OPTUNA_TRIALS_AUTO,
-                n_splits_tss=OPTUNA_TSS_SPLITS,
                 random_state=RANDOM_SEED,
                 optuna_seed=RANDOM_SEED + 8,
                 blend_top_k=BLEND_TOP_K_FIXO,
@@ -7244,7 +7328,6 @@ def run_training_pipeline(
         daily_pack,
         dossie_ml,
         por_custom,
-        list(horizontes),
     )
 
 
@@ -7324,106 +7407,84 @@ def _render_tab_formulario_previsao_humano() -> None:
 
     fn = normalize_dataframe_columns(df_raw.copy())
     mc = _formulario_map_columns(fn)
-    om = _formulario_resolve_oito_metricas(fn)
+    ok_cols, faltam = _formulario_colunas_obrigatorias_ok(mc)
+    if not ok_cols:
+        st.error(
+            "O cabeçalho do formulário não coincide com o **Esboço** esperado. "
+            "Ajuste os nomes das colunas na planilha (após normalização: minúsculas, sem acentos)."
+        )
+        st.markdown("**Colunas em falta:**\n- " + "\n- ".join(faltam))
+        return
 
     def _ref_series() -> pd.Series:
-        if not mc.get("ref") or mc["ref"] not in fn.columns:
+        rc = mc.get("ref")
+        if not rc or rc not in fn.columns:
             return pd.Series(pd.NaT, index=fn.index)
-        return pd.to_datetime(fn[mc["ref"]], errors="coerce")
+        return pd.to_datetime(fn[rc], errors="coerce")
 
     rs = _ref_series()
     fn["_ref_d"] = rs.dt.normalize()
 
-    emp_c = mc.get("empreendimento")
-    reg_c = mc.get("regional")
-    canal_c = mc.get("canal")
-    regiao_c = mc.get("regiao")
-    imob_c = mc.get("imobiliaria")
-    nf_prev_c = mc.get("nf_prev")
-    nf_real_c = mc.get("nf_real")
+    ref_c = mc["ref"]
+    regiao_c = mc["regiao"]
+    canal_c = mc["canal"]
+    nf_c = mc["nf"]
+    imob_c = mc["imobiliaria"]
+    reg_c = mc["regional"]
+    emp_c = mc["empreendimento"]
 
     st.markdown("##### Filtros")
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        emp_opts: list[str] = []
-        if emp_c and emp_c in fn.columns:
-            emp_opts = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
-        sel_emp = st.multiselect(
-            "Empreendimento (previsto para ter venda)",
-            options=emp_opts,
-            default=[],
-            key="pv_ff_emp",
-        )
-    with f2:
+    r1a, r1b, r1c, r1d = st.columns(4)
+    with r1a:
         dlist = sorted({_ for _ in fn["_ref_d"].dropna().unique()})
         d_labels = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dlist]
         sel_d = st.multiselect(
-            "Data de referência (sábado da semana)",
+            "Data de referência (sábado)",
             options=d_labels,
             default=[],
             key="pv_ff_dt",
         )
-    with f3:
-        canal_opts: list[str] = []
-        if canal_c and canal_c in fn.columns:
-            canal_opts = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
-        sel_canal = st.multiselect("Canal", options=canal_opts, default=[], key="pv_ff_canal")
-    with f4:
-        reg_opts: list[str] = []
-        if reg_c and reg_c in fn.columns:
-            reg_opts = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
-        sel_reg = st.multiselect("Regional ou IMOB", options=reg_opts, default=[], key="pv_ff_reg")
-
-    g1, g2, g3, g4 = st.columns(4)
-    with g1:
-        regiao_opts: list[str] = []
-        if regiao_c and regiao_c in fn.columns:
-            regiao_opts = sorted({str(x).strip() for x in fn[regiao_c].dropna().unique() if str(x).strip()})
-        sel_regiao = st.multiselect("Região", options=regiao_opts, default=[], key="pv_ff_regiao")
-    with g2:
-        imob_opts: list[str] = []
-        if imob_c and imob_c in fn.columns:
-            imob_opts = sorted({str(x).strip() for x in fn[imob_c].dropna().unique() if str(x).strip()})
-        sel_imob = st.multiselect("Imobiliária", options=imob_opts, default=[], key="pv_ff_imob")
-    with g3:
-        nf_p_opts: list[str] = []
-        if nf_prev_c and nf_prev_c in fn.columns:
-            nf_p_opts = sorted({str(x).strip() for x in fn[nf_prev_c].dropna().unique() if str(x).strip()})
-        sel_nf_p = st.multiselect(
-            "Normal ou Facilitada — previsto",
-            options=nf_p_opts,
+    with r1b:
+        ro = sorted({str(x).strip() for x in fn[regiao_c].dropna().unique() if str(x).strip()})
+        sel_regiao = st.multiselect("Região", options=ro, default=[], key="pv_ff_regiao")
+    with r1c:
+        co = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
+        sel_canal = st.multiselect("Canal", options=co, default=[], key="pv_ff_canal")
+    with r1d:
+        no = sorted({str(x).strip() for x in fn[nf_c].dropna().unique() if str(x).strip()})
+        sel_nf = st.multiselect("Normal ou Facilitada", options=no, default=[], key="pv_ff_nf")
+    r2a, r2b, r2c = st.columns(3)
+    with r2a:
+        io = sorted({str(x).strip() for x in fn[imob_c].dropna().unique() if str(x).strip()})
+        sel_imob = st.multiselect("Imobiliária", options=io, default=[], key="pv_ff_imob")
+    with r2b:
+        rrg = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
+        sel_regional = st.multiselect("Regional ou IMOB", options=rrg, default=[], key="pv_ff_reg")
+    with r2c:
+        eo = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
+        sel_emp = st.multiselect(
+            "Empreendimento (Previsto para ter venda)",
+            options=eo,
             default=[],
-            key="pv_ff_nf_p",
-        )
-    with g4:
-        nf_r_opts: list[str] = []
-        if nf_real_c and nf_real_c in fn.columns:
-            nf_r_opts = sorted({str(x).strip() for x in fn[nf_real_c].dropna().unique() if str(x).strip()})
-        sel_nf_r = st.multiselect(
-            "Normal ou Facilitada — real",
-            options=nf_r_opts,
-            default=[],
-            key="pv_ff_nf_r",
+            key="pv_ff_emp",
         )
 
     dff = fn.copy()
-    if sel_emp and emp_c and emp_c in dff.columns:
-        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
     if sel_d:
         pick = {pd.Timestamp(s).normalize() for s in sel_d}
         dff = dff[dff["_ref_d"].isin(pick)]
-    if sel_canal and canal_c and canal_c in dff.columns:
-        dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
-    if sel_reg and reg_c and reg_c in dff.columns:
-        dff = dff[dff[reg_c].astype(str).isin(sel_reg)]
-    if sel_regiao and regiao_c and regiao_c in dff.columns:
+    if sel_regiao:
         dff = dff[dff[regiao_c].astype(str).isin(sel_regiao)]
-    if sel_imob and imob_c and imob_c in dff.columns:
+    if sel_canal:
+        dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
+    if sel_nf:
+        dff = dff[dff[nf_c].astype(str).isin(sel_nf)]
+    if sel_imob:
         dff = dff[dff[imob_c].astype(str).isin(sel_imob)]
-    if sel_nf_p and nf_prev_c and nf_prev_c in dff.columns:
-        dff = dff[dff[nf_prev_c].astype(str).isin(sel_nf_p)]
-    if sel_nf_r and nf_real_c and nf_real_c in dff.columns:
-        dff = dff[dff[nf_real_c].astype(str).isin(sel_nf_r)]
+    if sel_regional:
+        dff = dff[dff[reg_c].astype(str).isin(sel_regional)]
+    if sel_emp:
+        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
 
     if dff.empty:
         st.warning("Sem linhas após aplicar os filtros.")
@@ -7431,295 +7492,144 @@ def _render_tab_formulario_previsao_humano() -> None:
 
     st.caption(f"**{len(dff):,}** linhas (após filtros).")
 
-    qfp, qfr = om.get("q_fac_p"), om.get("q_fac_r")
-    qnp, qnr = om.get("q_norm_p"), om.get("q_norm_r")
-    vfp, vfr = om.get("v_fac_p"), om.get("v_fac_r")
-    vnp, vnr = om.get("v_norm_p"), om.get("v_norm_r")
+    s_vfp = _formulario_num_series(dff, mc["v_fp"])
+    s_vfr = _formulario_num_series(dff, mc["v_fr"])
+    s_vnp = _formulario_num_series(dff, mc["v_np"])
+    s_vnr = _formulario_num_series(dff, mc["v_nr"])
+    s_qfp = _formulario_num_series(dff, mc["q_fp"])
+    s_qfr = _formulario_num_series(dff, mc["q_fr"])
+    s_qnp = _formulario_num_series(dff, mc["q_np"])
+    s_qnr = _formulario_num_series(dff, mc["q_nr"])
 
-    s_qfp = _formulario_num_series(dff, qfp)
-    s_qfr = _formulario_num_series(dff, qfr)
-    s_qnp = _formulario_num_series(dff, qnp)
-    s_qnr = _formulario_num_series(dff, qnr)
-    s_vfp = _formulario_num_series(dff, vfp)
-    s_vfr = _formulario_num_series(dff, vfr)
-    s_vnp = _formulario_num_series(dff, vnp)
-    s_vnr = _formulario_num_series(dff, vnr)
-
-    _om_labels = {
-        "q_fac_p": "QTD Vendas Facilitadas Previstas",
-        "q_fac_r": "QTD Vendas Facilitadas Reais",
-        "q_norm_p": "QTD Vendas Normais Previstas",
-        "q_norm_r": "QTD Vendas Normais Reais",
-        "v_fac_p": "Vendas Facilitadas Previstas",
-        "v_fac_r": "Vendas Facilitadas Reais",
-        "v_norm_p": "Vendas Normais Previstas",
-        "v_norm_r": "Vendas Normais Reais",
-    }
-    _missing = [f"{_om_labels[k]} (`{k}`)" for k in _om_labels if not om.get(k) or om[k] not in dff.columns]
-    if _missing:
-        st.warning("Não encontrei coluna na planilha para: " + " · ".join(_missing))
-
-    r1a, r1b, r1c, r1d = st.columns(4)
-    with r1a:
-        st.metric(_om_labels["v_fac_p"], f"R$ {float(s_vfp.sum())/1e6:,.2f} mi")
-    with r1b:
-        st.metric(_om_labels["v_fac_r"], f"R$ {float(s_vfr.sum())/1e6:,.2f} mi")
-    with r1c:
-        st.metric(_om_labels["v_norm_p"], f"R$ {float(s_vnp.sum())/1e6:,.2f} mi")
-    with r1d:
-        st.metric(_om_labels["v_norm_r"], f"R$ {float(s_vnr.sum())/1e6:,.2f} mi")
-    r2a, r2b, r2c, r2d = st.columns(4)
-    with r2a:
-        st.metric(_om_labels["q_fac_p"], f"{float(s_qfp.sum()):,.0f}")
-    with r2b:
-        st.metric(_om_labels["q_fac_r"], f"{float(s_qfr.sum()):,.0f}")
-    with r2c:
-        st.metric(_om_labels["q_norm_p"], f"{float(s_qnp.sum()):,.0f}")
-    with r2d:
-        st.metric(_om_labels["q_norm_r"], f"{float(s_qnr.sum()):,.0f}")
+    st.markdown("##### Totais filtrados")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        st.metric("Vendas Facilitadas Previstas", f"R$ {float(s_vfp.sum())/1e6:,.2f} mi")
+        st.metric("Vendas Facilitadas Reais", f"R$ {float(s_vfr.sum())/1e6:,.2f} mi")
+    with a2:
+        st.metric("Vendas Normais Previstas", f"R$ {float(s_vnp.sum())/1e6:,.2f} mi")
+        st.metric("Vendas Normais Reais", f"R$ {float(s_vnr.sum())/1e6:,.2f} mi")
+    with a3:
+        st.metric("QTD Facilitadas Previstas", f"{float(s_qfp.sum()):,.0f}")
+        st.metric("QTD Facilitadas Reais", f"{float(s_qfr.sum()):,.0f}")
+    with a4:
+        st.metric("QTD Normais Previstas", f"{float(s_qnp.sum()):,.0f}")
+        st.metric("QTD Normais Reais", f"{float(s_qnr.sum()):,.0f}")
 
     _ipc = {"displayModeBar": True, "displaylogo": False}
 
-    def _group_prev_real(
-        title: str,
-        x_labels: pd.Series,
-        s_pre: pd.Series,
-        s_re: pd.Series,
-        lab_p: str,
-        lab_r: str,
-        *,
-        height: int = 360,
-        money: bool = False,
-        sort_dates: bool = False,
-        max_cats: int = 32,
-    ) -> go.Figure | None:
-        sub = pd.DataFrame({"_x": x_labels.astype(str), "_p": s_pre.fillna(0), "_r": s_re.fillna(0)})
-        g = sub.groupby("_x", as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
-        if g.empty:
-            return None
-        if sort_dates:
-            g["_ord"] = pd.to_datetime(g["_x"], errors="coerce")
-            g = g.sort_values("_ord", na_position="last")
-        else:
-            g = g.sort_values("_p", ascending=False).head(max_cats)
-        xcats = g["_x"].tolist()
-        if money:
-
-            def _tx(v: float) -> str:
-                av = abs(float(v))
-                if av >= 1e6:
-                    return f"{v/1e6:.2f} mi"
-                if av >= 1e3:
-                    return f"{v/1e3:.0f} k"
-                return f"{v:.0f}"
-
-            tp = [_tx(float(v)) for v in g["_p"]]
-            tr = [_tx(float(v)) for v in g["_r"]]
-        else:
-            tp = [f"{float(v):.0f}" for v in g["_p"]]
-            tr = [f"{float(v):.0f}" for v in g["_r"]]
-        fig = go.Figure()
-        fig.add_trace(
-            go.Bar(
-                name=lab_p[:56],
-                x=xcats,
-                y=g["_p"],
-                marker_color=PLOT_AZUL,
-                text=tp,
-                textposition="outside",
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                name=lab_r[:56],
-                x=xcats,
-                y=g["_r"],
-                marker_color=PLOT_ACCENT,
-                text=tr,
-                textposition="outside",
-            )
-        )
-        extra: dict[str, Any] = {}
-        if money:
-            extra["yaxis_title"] = "R$"
-        fig.update_layout(
-            _plotly_layout_direcional(
-                title=title,
-                height=height,
-                barmode="group",
-                legend=_plotly_legend_bottom(),
-                xaxis_tickangle=-34,
-                margin=dict(
-                    t=100,
-                    l=52,
-                    r=36,
-                    b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0))),
-                ),
-                **extra,
-            )
-        )
-        return fig
-
-    def _xl_for_dim(_dim_title: str, col: str | None, *, canon_canal: bool) -> pd.Series | None:
-        if col == "__ref_d__":
-            if "_ref_d" not in dff.columns:
-                return None
-            return dff["_ref_d"].map(
-                lambda t: pd.Timestamp(t).strftime("%Y-%m-%d") if pd.notna(t) else "(sem data)"
-            )
-        if col is None or col not in dff.columns:
-            return None
-        if canon_canal:
-            return dff[col].map(_formulario_canon_canal)
-        return dff[col].astype(str)
-
-    _dim_specs: list[tuple[str, str | None, bool, bool]] = [
-        ("Data de referência (sábado da semana)", "__ref_d__", False, True),
-        ("Região", regiao_c, False, False),
-        ("Canal", canal_c, True, False),
-        ("Regional ou IMOB", reg_c, False, False),
-        ("Imobiliária", imob_c, False, False),
-        ("Empreendimento (previsto para ter venda)", emp_c, False, False),
-        ("Normal ou Facilitada — previsto", nf_prev_c, False, False),
-        ("Normal ou Facilitada — real", nf_real_c, False, False),
+    metric_specs: list[tuple[str, pd.Series, bool]] = [
+        ("Vendas Facilitadas Previstas (R$)", s_vfp, True),
+        ("Vendas Facilitadas Reais (R$)", s_vfr, True),
+        ("Vendas Normais Previstas (R$)", s_vnp, True),
+        ("Vendas Normais Reais (R$)", s_vnr, True),
+        ("QTD Vendas Facilitadas Previstas", s_qfp, False),
+        ("QTD Vendas Facilitadas Reais", s_qfr, False),
+        ("QTD Vendas Normais Previstas", s_qnp, False),
+        ("QTD Vendas Normais Reais", s_qnr, False),
     ]
 
-    st.markdown("##### Análises — previsto × real por dimensão")
-    for i_dim, (dim_title, col_key, canon_canal, sort_dates) in enumerate(_dim_specs):
-        xl = _xl_for_dim(dim_title, col_key, canon_canal=canon_canal)
-        if xl is None:
-            continue
-        st.markdown(f"###### {dim_title}")
-        g1, g2 = st.columns(2)
-        with g1:
-            fg = _group_prev_real(
-                f"{dim_title} — QTD facilitadas",
-                xl,
-                s_qfp,
-                s_qfr,
-                _om_labels["q_fac_p"],
-                _om_labels["q_fac_r"],
-                sort_dates=sort_dates,
-            )
-            if fg:
-                st.plotly_chart(fg, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-        with g2:
-            fg = _group_prev_real(
-                f"{dim_title} — QTD normais",
-                xl,
-                s_qnp,
-                s_qnr,
-                _om_labels["q_norm_p"],
-                _om_labels["q_norm_r"],
-                sort_dates=sort_dates,
-            )
-            if fg:
-                st.plotly_chart(fg, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-        g3, g4 = st.columns(2)
-        with g3:
-            fg = _group_prev_real(
-                f"{dim_title} — Vendas facilitadas (R$)",
-                xl,
-                s_vfp,
-                s_vfr,
-                _om_labels["v_fac_p"],
-                _om_labels["v_fac_r"],
-                money=True,
-                sort_dates=sort_dates,
-            )
-            if fg:
-                st.plotly_chart(fg, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-        with g4:
-            fg = _group_prev_real(
-                f"{dim_title} — Vendas normais (R$)",
-                xl,
-                s_vnp,
-                s_vnr,
-                _om_labels["v_norm_p"],
-                _om_labels["v_norm_r"],
-                money=True,
-                sort_dates=sort_dates,
-            )
-            if fg:
-                st.plotly_chart(fg, width="stretch", config=_ipc)
-            else:
-                st.caption("—")
-        if i_dim < len(_dim_specs) - 1:
-            st.divider()
+    dim_specs: list[tuple[str, str]] = [
+        ("Data de referência (sábado)", "__ref_label__"),
+        ("Região", regiao_c),
+        ("Canal", canal_c),
+        ("Normal ou Facilitada", nf_c),
+        ("Imobiliária", imob_c),
+        ("Regional ou IMOB", reg_c),
+        ("Empreendimento (Previsto para ter venda)", emp_c),
+    ]
 
-    st.markdown("##### Tabelas — **Região** × **Canal** (oito métricas)")
-    if regiao_c and regiao_c in dff.columns and canal_c and canal_c in dff.columns:
+    def _x_labels_for_dim(dim_key: str) -> pd.Series:
+        if dim_key == "__ref_label__":
+            return dff["_ref_d"].apply(
+                lambda t: pd.Timestamp(t).strftime("%Y-%m-%d") if pd.notna(t) else "(vazio)"
+            )
+        return dff[dim_key].map(lambda x: str(x).strip() if pd.notna(x) and str(x).strip() else "(vazio)")
 
-        def _add_total_row(tab: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
-            if tab.empty:
-                return tab
-            row = {tab.columns[0]: "Total geral"}
-            for c in num_cols:
-                if c in tab.columns:
-                    row[c] = pd.to_numeric(tab[c], errors="coerce").fillna(0).sum()
-            return pd.concat([tab, pd.DataFrame([row])], ignore_index=True)
+    def _bar_agg(title: str, xlabs: pd.Series, yser: pd.Series, *, money: bool) -> go.Figure | None:
+        sub = pd.DataFrame({"_x": xlabs, "_y": yser})
+        g = sub.groupby("_x", as_index=False)["_y"].sum().sort_values("_y", ascending=False)
+        if g.empty or not np.isfinite(g["_y"].sum()) or float(g["_y"].sum()) == 0.0:
+            return None
+        xv = g["_x"].tolist()
+        yv = g["_y"].tolist()
+        if money:
+            ydisp = [float(v) / 1e6 for v in yv]
+            txt = [f"{v:.2f} mi" if v > 0 else "" for v in ydisp]
+            ylab = "R$ (mi)"
+        else:
+            ydisp = [float(v) for v in yv]
+            txt = [f"{v:,.0f}" if v > 0 else "" for v in ydisp]
+            ylab = "Quantidade"
+        fig = go.Figure(
+            go.Bar(
+                x=xv,
+                y=ydisp,
+                marker_color=PLOT_AZUL,
+                text=txt,
+                textposition="outside",
+            )
+        )
+        lo = _plotly_layout_direcional(
+            title=title,
+            height=320,
+            xaxis_tickangle=-38,
+            yaxis_title=ylab,
+            margin=dict(t=72, l=52, r=36, b=max(100, min(220, 24 + 6 * max((len(str(x)) for x in xv), default=0)))),
+        )
+        fig.update_layout(**lo)
+        return fig
 
-        def _pivot_vals(vals: pd.Series) -> pd.DataFrame:
-            dpx = dff[[regiao_c, canal_c]].copy()
-            dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
-            dpx["_v"] = vals
-            pt = dpx.pivot_table(
-                index=regiao_c,
-                columns="_can",
-                values="_v",
-                aggfunc="sum",
-                fill_value=0,
-            ).reset_index()
-            pt.columns = [str(c) if c != regiao_c else "Região" for c in pt.columns]
-            return pt
+    st.markdown("##### Análises por dimensão")
+    st.caption(
+        "Para cada dimensão do formulário, somas da métrica escolhida ao longo das linhas filtradas "
+        "(uma barra por valor distinto da dimensão)."
+    )
+    for dim_title, dim_col in dim_specs:
+        with st.expander(f"Por **{dim_title}**", expanded=False):
+            if dim_col == "__ref_label__":
+                xlabs = _x_labels_for_dim("__ref_label__")
+            else:
+                if dim_col not in dff.columns:
+                    st.caption("—")
+                    continue
+                xlabs = _x_labels_for_dim(dim_col)
+                if dim_col == canal_c:
+                    xlabs = dff[canal_c].map(_formulario_canon_canal).astype(str)
 
-        _tab_pairs: list[tuple[str, pd.Series, pd.Series]] = [
-            (_om_labels["q_fac_p"] + " × " + _om_labels["q_fac_r"], s_qfp, s_qfr),
-            (_om_labels["q_norm_p"] + " × " + _om_labels["q_norm_r"], s_qnp, s_qnr),
-            (_om_labels["v_fac_p"] + " × " + _om_labels["v_fac_r"], s_vfp, s_vfr),
-            (_om_labels["v_norm_p"] + " × " + _om_labels["v_norm_r"], s_vnp, s_vnr),
-        ]
-        for pair_title, sp, sr in _tab_pairs:
-            st.caption(pair_title + " (previsto | realizado)")
-            pv, pr = _pivot_vals(sp), _pivot_vals(sr)
-            num_p = [c for c in pv.columns if c != "Região"]
-            num_r = [c for c in pr.columns if c != "Região"]
-            t1, t2 = st.columns(2)
-            with t1:
-                st.markdown("**Previsto**")
-                st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
-            with t2:
-                st.markdown("**Realizado**")
-                st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
-    else:
-        st.caption("Defina colunas **Região** e **Canal** na planilha para ver as tabelas cruzadas.")
+            for i in range(0, len(metric_specs), 2):
+                c_left, c_right = st.columns(2)
+                for j, col_slot in enumerate((c_left, c_right)):
+                    idx = i + j
+                    if idx >= len(metric_specs):
+                        break
+                    mname, mser, money = metric_specs[idx]
+                    fig = _bar_agg(f"{mname} · {dim_title}", xlabs, mser, money=money)
+                    with col_slot:
+                        if fig:
+                            st.plotly_chart(fig, width="stretch", config=_ipc)
+                        else:
+                            st.caption("—")
 
     with st.expander("Pré-visualização dos dados filtrados (primeiras linhas)", expanded=False):
         show_cols = [
             c
             for c in [
-                mc.get("ref"),
-                emp_c,
-                reg_c,
-                canal_c,
+                ref_c,
                 regiao_c,
+                canal_c,
+                nf_c,
                 imob_c,
-                nf_prev_c,
-                nf_real_c,
-                qfp,
-                qfr,
-                qnp,
-                qnr,
-                vfp,
-                vfr,
-                vnp,
-                vnr,
+                reg_c,
+                emp_c,
+                mc["v_fp"],
+                mc["v_fr"],
+                mc["v_np"],
+                mc["v_nr"],
+                mc["q_fp"],
+                mc["q_fr"],
+                mc["q_np"],
+                mc["q_nr"],
             ]
             if c and c in dff.columns
         ]
@@ -8402,27 +8312,21 @@ def _render_tab_introducao() -> None:
 def _render_streamlit_ml_feature_importance(
     por_h: dict[Any, dict[str, Any]],
     plot_config: dict[str, Any],
-    horizontes: list[int] | None = None,
 ) -> None:
     """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
     import plotly.graph_objects as go
 
-    hz_list = (
-        list(horizontes)
-        if horizontes
-        else sorted(h for h in por_h if isinstance(h, int))
-    )
     _tem_imp = any(
         (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
         or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
-        for h in hz_list
+        for h in (3, 7, 30)
     )
     if _tem_imp:
         st.markdown(
             '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
             unsafe_allow_html=True,
         )
-        for h in hz_list:
+        for h in (3, 7, 30):
             sub = por_h.get(h) or {}
             c1, c2 = st.columns(2)
             with c1:
@@ -8948,14 +8852,8 @@ def _render_streamlit_tab_apendice(
     blend_top_k: int,
     random_seed: int,
     daily: dict[str, Any],
-    horizontes: list[int] | None = None,
 ) -> None:
-    hz_use = (
-        list(horizontes)
-        if horizontes
-        else sorted(h for h in por_h if isinstance(h, int))
-    )
-    hz_txt = ", ".join(str(x) for x in hz_use) if hz_use else "3, 7 ou 30 (um por execução)"
+    hz_txt = ", ".join(str(x) for x in (3, 7, 30))
     modo = (
         "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
         "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
@@ -8968,17 +8866,15 @@ def _render_streamlit_tab_apendice(
         '<p class="pv-section-title">Apêndice</p>',
         unsafe_allow_html=True,
     )
-    _tab_labels = ["Metodologia"] + [f"H = {h} dias" for h in hz_use] + ["Personalizado"]
-    _tabs = st.tabs(_tab_labels)
-    tab_met = _tabs[0]
-    tab_cust = _tabs[-1]
-    tab_h_blocks = _tabs[1:-1]
+    tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
+        ["Metodologia", "H = 3 dias", "H = 7 dias", "H = 30 dias", "Personalizado"]
+    )
     with tab_met:
         st.markdown(
             f"""
 #### Resumo
 
-- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*; em cada execução treina-se **um** *H* entre {{{hz_txt}}} (conforme seleção na aba **Previsões**). Um intervalo entre datas define, adicionalmente, um alvo complementar.
+- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*, com *H* ∈ {{{hz_txt}}}; o vetor *X* incorpora apenas informação até *t*. Além disso, na aba **Previsões**, um intervalo entre datas de início e fim define um alvo complementar.
 - **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Optuna:** algoritmo TPE, **TimeSeriesSplit** e **MedianPruner**; a função objetivo penaliza a variância entre *folds*, promovendo estabilidade. Semente: **{random_seed}**.
@@ -9010,9 +8906,12 @@ O relatório HTML exportável na aba **Previsões** reúne, entre outros element
         st.markdown("**Hiperparâmetros LightGBM (VGV)**")
         st.json(bp.get("valor") or {})
 
-    for _ti, _h in enumerate(hz_use):
-        with tab_h_blocks[_ti]:
-            _ap_horizon_block(_h)
+    with tab3:
+        _ap_horizon_block(3)
+    with tab7:
+        _ap_horizon_block(7)
+    with tab30:
+        _ap_horizon_block(30)
 
     with tab_cust:
         bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
@@ -9035,7 +8934,6 @@ def _render_streamlit_dossie_ml(
     por_h: dict[Any, dict[str, Any]],
     daily_pack: dict[str, Any],
     por_custom: dict[str, Any] | None,
-    horizontes: list[int] | None = None,
 ) -> None:
     import plotly.graph_objects as go
 
@@ -9365,19 +9263,14 @@ def _render_streamlit_dossie_ml(
             st.plotly_chart(fig_b, width="stretch", config=_dpc)
 
     with td5:
-        _hz_d = (
-            list(horizontes)
-            if horizontes
-            else sorted(h for h in por_h if isinstance(h, int))
-        )
-        _render_streamlit_ml_feature_importance(por_h, _dpc, horizontes=_hz_d)
+        _render_streamlit_ml_feature_importance(por_h, _dpc)
         st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
         st.markdown(
             "**Acurácia dir.:** no conjunto de teste, corresponde à percentagem de dias em que o valor real e a previsão "
             "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
         )
         rows_m = []
-        for h in _hz_d:
+        for h in (3, 7, 30):
             sub = por_h.get(h) or {}
             for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
                 m = (sub.get(alvo) or {}).get("metrics_test") or {}
@@ -9422,11 +9315,11 @@ def _render_streamlit_dossie_ml(
                 adf = float(ad)
             except (TypeError, ValueError):
                 continue
-            if np.isfinite(adf) and adf < 0.85:
+            if np.isfinite(adf) and adf < 0.8:
                 low_acc.append(r)
         if _hay_metricas and low_acc:
             st.warning(
-                "A acurácia direcional é inferior a 85% em, pelo menos, um horizonte ou alvo; analise o conjunto de métricas "
+                "A acurácia direcional é inferior a 80% em, pelo menos, um horizonte ou alvo; analise o conjunto de métricas "
                 "antes de utilizar as previsões como único critério de decisão."
             )
         st.divider()
@@ -9465,7 +9358,7 @@ def main() -> None:
     st.markdown(
         '<div class="pv-hero-block">'
         '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
-        '<p class="pv-hero-sub">Consolidação da matriz diária, treino de <strong>um horizonte</strong> por execução (3, 7 ou 30 dias) e exportação de relatório HTML.</p>'
+        '<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -9495,20 +9388,9 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "A série diária consolidada considera <strong>1 de janeiro de 2025</strong> como data inicial e "
-            "<strong>o dia de hoje</strong> como data final (inclusive). "
-            "Cada execução de <strong>Gerar previsões</strong> treina <strong>apenas um</strong> horizonte fixo (3, 7 ou 30 dias), "
-            "para reduzir tempo de CPU; execute novamente com outro horizonte se precisar de outro <em>H</em>. "
-            "Opcionalmente, um intervalo de datas abaixo acrescenta um par de modelos com alvo de soma nesse calendário.</div>",
+            "Por padrão, estimam-se sempre os horizontes de <strong>3, 7 e 30</strong> dias. Adicionalmente, caso indique "
+            "um intervalo opcional nas datas abaixo, treina-se um par de modelos cuja soma-alvo corresponde ao calendário entre essas datas.</div>",
             unsafe_allow_html=True,
-        )
-        hz_pick = st.radio(
-            "Horizonte a treinar nesta execução",
-            options=list(HORIZONTES_FIXOS_DISPONIVEIS),
-            index=list(HORIZONTES_FIXOS_DISPONIVEIS).index(HORIZONTE_TREINO_PADRAO),
-            format_func=lambda x: f"{x} dias",
-            horizontal=True,
-            key="pv_horizon_pick",
         )
         ic1, ic2 = st.columns(2)
         with ic1:
@@ -9526,7 +9408,7 @@ def main() -> None:
         if d_ini is not None and d_fim is not None:
             a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
             st.info(
-                f"Intervalo adicional **{a.isoformat()}** → **{b.isoformat()}** (além do horizonte **{hz_pick}** dias)."
+                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
             )
         elif d_ini is None and d_fim is None:
             pass
@@ -9565,12 +9447,7 @@ def main() -> None:
                             daily_pack,
                             dossie_ml,
                             por_custom,
-                            hz_done,
-                        ) = run_training_pipeline(
-                            dfs,
-                            custom_previsao=custom_previsao,
-                            horizontes_fixos=[hz_pick],
-                        )
+                        ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
                     st.session_state.resultado = {
                         "stats_base": stats_base,
                         "ticket": ticket,
@@ -9581,7 +9458,6 @@ def main() -> None:
                         "daily_pack": daily_pack,
                         "dossie_ml": dossie_ml,
                         "por_custom": por_custom,
-                        "horizontes": hz_done,
                         "full_train": FULL_PERIOD_TRAIN_FIXO,
                         "sheet_metas": sheet_metas,
                         "used_sa": used_sa,
@@ -9654,13 +9530,9 @@ def main() -> None:
             )
             rows = []
             lbl = "In-sample" if full_train else "Holdout 30%"
-            _hz_show = res.get("horizontes") or sorted(k for k in por_h if isinstance(k, int))
-            for h in _hz_show:
-                ph = por_h.get(h)
-                if not ph:
-                    continue
-                q = ph["qtd"]
-                v = ph["valor"]
+            for h in (3, 7, 30):
+                q = por_h[h]["qtd"]
+                v = por_h[h]["valor"]
                 acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
                 acc_v = v.get("metrics_test", {}).get("Acc_dir_mediana")
                 rows.append(
@@ -9705,21 +9577,21 @@ def main() -> None:
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             acc_warn = False
-            for h in _hz_show:
+            for h in (3, 7, 30):
                 for part in ("qtd", "valor"):
                     m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
-                    if a is not None and np.isfinite(float(a)) and float(a) < 0.85:
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
                         acc_warn = True
             if pc:
                 for part in ("qtd", "valor"):
                     m = (pc.get(part) or {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
-                    if a is not None and np.isfinite(float(a)) and float(a) < 0.85:
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
                         acc_warn = True
             if acc_warn:
                 st.warning(
-                    "A acurácia direcional situa-se abaixo de 85% em, pelo menos, um horizonte ou alvo; recomenda-se "
+                    "A acurácia direcional situa-se abaixo de 80% em, pelo menos, um horizonte ou alvo; recomenda-se "
                     "cruzar este sinal com MAE, RMSE e estabilidade temporal antes de decisões operacionais."
                 )
 
@@ -9800,7 +9672,6 @@ def main() -> None:
                 res_d["por_h"],
                 res_d["daily_pack"],
                 res_d.get("por_custom"),
-                horizontes=res_d.get("horizontes"),
             )
         elif isinstance(dex_d, dict) and dex_d.get("dossie_ml") and dex_d.get("daily_pack"):
             _render_streamlit_dossie_ml(
@@ -9808,7 +9679,6 @@ def main() -> None:
                 {},
                 dex_d["daily_pack"],
                 None,
-                horizontes=[],
             )
 
     with tab_apendice:
@@ -9832,7 +9702,6 @@ def main() -> None:
                 BLEND_TOP_K_FIXO,
                 RANDOM_SEED,
                 res_ap["daily_pack"],
-                horizontes=res_ap.get("horizontes"),
             )
         elif isinstance(dex_ap, dict) and dex_ap.get("daily_pack"):
             _render_streamlit_tab_apendice(
@@ -9842,7 +9711,6 @@ def main() -> None:
                 BLEND_TOP_K_FIXO,
                 RANDOM_SEED,
                 dex_ap["daily_pack"],
-                horizontes=[],
             )
 
     st.markdown(
