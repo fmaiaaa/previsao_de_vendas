@@ -1691,8 +1691,8 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
-    # Menos trials que a escala antiga (~−35 %), mantendo teto alto para séries grandes.
-    base = int(max(40, min(96, int(18 * np.log1p(n_samples)))))
+    # Escala com teto mais baixo que antes (~72) para acelerar; TPE + pruner compensam.
+    base = int(max(32, min(72, int(15 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
         base = min(110, base + 18)
     return base
@@ -1794,7 +1794,7 @@ def train_one_target(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
-                multivariate=True,
+                multivariate=False,
                 n_startup_trials=max(10, min(28, nt // 4)),
             ),
             pruner=optuna.pruners.MedianPruner(
@@ -2825,39 +2825,46 @@ def predict_last_row_custom_date_range(
 
 def _inject_ts_and_stl_features(
     df_master: pd.DataFrame, show_progress: bool = False
-) -> None:
-    """Picos, quantis, eco semanal, ticket e STL rolante (statsmodels) — só passado."""
+) -> pd.DataFrame:
+    """Picos, quantis, eco semanal, ticket e STL rolante (statsmodels) — só passado.
+
+    Retorna apenas as colunas novas; o chamador faz ``pd.concat`` uma vez para evitar
+    fragmentação do DataFrame (PerformanceWarning do pandas).
+    """
+    idx = df_master.index
+    out: dict[str, Any] = {}
+
     for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
         s = df_master[col].astype(float)
-        df_master[f"ts_rollmax7_{short}"] = s.shift(1).rolling(7, min_periods=1).max()
-        df_master[f"ts_rollmax30_{short}"] = s.shift(1).rolling(30, min_periods=1).max()
-        df_master[f"ts_q85_30_{short}"] = (
+        out[f"ts_rollmax7_{short}"] = s.shift(1).rolling(7, min_periods=1).max()
+        out[f"ts_rollmax30_{short}"] = s.shift(1).rolling(30, min_periods=1).max()
+        out[f"ts_q85_30_{short}"] = (
             s.shift(1).rolling(30, min_periods=10).quantile(0.85)
         )
-        df_master[f"ts_q90_60_{short}"] = (
+        out[f"ts_q90_60_{short}"] = (
             s.shift(1).rolling(60, min_periods=15).quantile(0.90)
         )
-        df_master[f"ts_ewm_short_{short}"] = s.shift(1).ewm(span=5, adjust=False).mean()
+        out[f"ts_ewm_short_{short}"] = s.shift(1).ewm(span=5, adjust=False).mean()
         roll_m = s.shift(1).rolling(14, min_periods=3).mean()
-        df_master[f"ts_burst_{short}"] = (s.shift(1) / (roll_m + 1e-6)).fillna(0.0)
+        out[f"ts_burst_{short}"] = (s.shift(1) / (roll_m + 1e-6)).fillna(0.0)
 
     tv = df_master["target_valor"]
     tq = df_master["target_qtd"]
-    df_master["ts_weekly_echo_vgv"] = (
+    out["ts_weekly_echo_vgv"] = (
         0.45 * tv.shift(7) + 0.30 * tv.shift(14) + 0.25 * tv.shift(21)
     ).fillna(0.0)
-    df_master["ts_weekly_echo_qtd"] = (
+    out["ts_weekly_echo_qtd"] = (
         0.45 * tq.shift(7) + 0.30 * tq.shift(14) + 0.25 * tq.shift(21)
     ).fillna(0.0)
-    df_master["ts_ticket_lag1"] = (tv.shift(1) / (tq.shift(1) + 1e-6)).fillna(0.0)
+    out["ts_ticket_lag1"] = (tv.shift(1) / (tq.shift(1) + 1e-6)).fillna(0.0)
 
     try:
         from statsmodels.tsa.seasonal import STL
     except ImportError:
         for short in ("vgv", "qtd"):
-            df_master[f"ts_stl_trend_{short}"] = 0.0
-            df_master[f"ts_stl_seasamp_{short}"] = 0.0
-        return
+            out[f"ts_stl_trend_{short}"] = 0.0
+            out[f"ts_stl_seasamp_{short}"] = 0.0
+        return pd.DataFrame(out, index=idx)
 
     win, period = 91, 7
     for col, short in (("target_valor", "vgv"), ("target_qtd", "qtd")):
@@ -2887,8 +2894,10 @@ def _inject_ts_and_stl_features(
             except Exception:
                 trend[i] = float(np.nanmean(seg[-period:]))
                 seas_amp[i] = 0.0
-        df_master[f"ts_stl_trend_{short}"] = trend
-        df_master[f"ts_stl_seasamp_{short}"] = seas_amp
+        out[f"ts_stl_trend_{short}"] = trend
+        out[f"ts_stl_seasamp_{short}"] = seas_amp
+
+    return pd.DataFrame(out, index=idx)
 
 
 def _find_formulario_vgv_col(
@@ -3232,7 +3241,8 @@ def build_daily_master(
 
     merge_macro_bcb_into_daily(df_master, show_progress=show_progress)
 
-    _inject_ts_and_stl_features(df_master, show_progress=show_progress)
+    _ts_stl_extra = _inject_ts_and_stl_features(df_master, show_progress=show_progress)
+    df_master = pd.concat([df_master, _ts_stl_extra], axis=1)
 
     df_master.replace([np.inf, -np.inf], np.nan, inplace=True)
     bad_tgt = df_master["target_qtd"].isna() | df_master["target_valor"].isna()
