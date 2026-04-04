@@ -2402,6 +2402,15 @@ def _dim_feat_slug(s: str, max_len: int = 36) -> str:
     return t or "x"
 
 
+def _collapse_duplicate_pivot_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Soma colunas com o mesmo nome (ex.: slug truncado idêntico para categorias distintas)."""
+    if df.shape[1] == 0:
+        return df
+    if not df.columns.duplicated().any():
+        return df
+    return df.T.groupby(df.columns, sort=False).sum().T
+
+
 def _dim_pivot_counts(
     fn: pd.DataFrame,
     date_col: str | None,
@@ -2435,6 +2444,7 @@ def _dim_pivot_counts(
     sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
     pt = sub.groupby(["_d", "_ck"], observed=True).size().unstack(fill_value=0)
     pt.columns = [f"{prefix}_n_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
+    pt = _collapse_duplicate_pivot_columns(pt)
     return pt.reindex(master_index).fillna(0.0).astype(np.float64)
 
 
@@ -2475,6 +2485,7 @@ def _dim_pivot_sums(
     sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
     pt = sub.groupby(["_d", "_ck"], observed=True)["_v"].sum().unstack(fill_value=0)
     pt.columns = [f"{prefix}_v_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
+    pt = _collapse_duplicate_pivot_columns(pt)
     return pt.reindex(master_index).fillna(0.0).astype(np.float64)
 
 
@@ -2716,8 +2727,12 @@ def _inject_dim_features_and_funnel_interactions(
     )
 
     for tab in tables:
+        tab = _collapse_duplicate_pivot_columns(tab)
         for c in tab.columns:
-            df_master[c] = tab[c].astype(np.float64)
+            ser = tab[c]
+            if isinstance(ser, pd.DataFrame):
+                ser = ser.sum(axis=1, min_count=1)
+            df_master[c] = pd.to_numeric(ser, errors="coerce").fillna(0.0).astype(np.float64)
             created.append(str(c))
 
     # Concentração (HHI) nos corretores de vendas do dia
