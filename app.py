@@ -1519,8 +1519,26 @@ def _collect_candidate_specs(
     target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
 ) -> list[tuple[str, Pipeline, bool]]:
     """Nome, pipeline (template), usar sample_weight recency."""
+    import os
+
     out: list[tuple[str, Pipeline, bool]] = []
     long_h = int(horizon) >= 21
+
+    # Conjunto reduzido (predefinido): ~2× menos ajustes que o grid completo. Desative com PREVISAO_BENCHMARK_LITE=0.
+    if str(os.environ.get("PREVISAO_BENCHMARK_LITE", "1")).lower() in ("1", "true", "yes"):
+        out.append(("Ridge", build_ridge_pipe(rs), False))
+        out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
+        out.append(("RandomForest", build_random_forest_pipe(rs, horizon), False))
+        if LGBMRegressor is not None:
+            out.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
+            out.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
+        out.append(("HGB", build_hgb_pipe(rs, target_name), False))
+        xgbp_l = build_xgb_only_pipe(best_params, False, rs, horizon)
+        if xgbp_l is not None:
+            out.append(("XGB", xgbp_l, True))
+        out.append(("TS-linear", build_ts_linear_bridge_pipe(), False))
+        out.append(("Baseline mediana", build_dummy_median_pipe(), False))
+        return out
 
     out.append(("Ridge", build_ridge_pipe(rs), False))
     out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
@@ -1688,13 +1706,15 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
-    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
+    """n_trials <= 0 → auto com teto baixo (pipeline alvo ≤ ~2 min; ver OPTUNA_TRIALS_CAP_AUTO)."""
     if n_trials > 0:
-        return n_trials
-    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
+        return int(n_trials)
+    cap = int(OPTUNA_TRIALS_CAP_AUTO)
+    est = int(8 + 11 * np.log1p(max(n_samples, 20)) / np.log1p(420)))
+    base = max(8, min(cap, est))
     if int(horizon) >= 21:
-        base = min(178, base + 28)
-    return base
+        base = min(cap, base + 3)
+    return int(base)
 
 
 def train_one_target(
@@ -1744,7 +1764,9 @@ def train_one_target(
         X_imp = X
         y_imp = y
 
-    n_splits = min(n_splits_tss, max(3, len(X_opt) // 22))
+    n_splits = min(
+        int(OPTUNA_TSS_SPLITS_CAP), n_splits_tss, max(3, len(X_opt) // 22)
+    )
     n_splits = max(3, n_splits)
     nt = _resolve_n_trials(n_trials, len(X_opt), hz)
 
@@ -1804,8 +1826,7 @@ def train_one_target(
         )
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         es_patience, es_min_trials = _optuna_patience_cfg(nt)
-        study.optimize(
-            objective,
+        _opt_kw: dict[str, Any] = dict(
             n_trials=nt,
             show_progress_bar=show_progress,
             callbacks=[
@@ -1815,6 +1836,9 @@ def train_one_target(
                 )
             ],
         )
+        if float(OPTUNA_TIMEOUT_PER_TARGET_SEC) > 0:
+            _opt_kw["timeout"] = float(OPTUNA_TIMEOUT_PER_TARGET_SEC)
+        study.optimize(objective, **_opt_kw)
         completed = [
             t
             for t in study.trials
@@ -6084,10 +6108,17 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 
 
 # --- Decisões automáticas (sem input do utilizador) ---
-# Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
-OPTUNA_TRIALS_AUTO = 0
-# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
-BLEND_TOP_K_FIXO = 6
+# Meta ~2 min (build + treinos): PREVISAO_OPTUNA_* , PREVISAO_BENCHMARK_LITE , PREVISAO_BLEND_TOP_K .
+# Optuna: 0 = auto com teto (PREVISAO_OPTUNA_TRIALS_CAP); valor >0 fixa trials exatos.
+OPTUNA_TRIALS_AUTO = int(os.environ.get("PREVISAO_OPTUNA_TRIALS", "0"))
+# Teto de trials em modo auto (antes ~62–165; demasiado lento para 2 min).
+OPTUNA_TRIALS_CAP_AUTO = int(os.environ.get("PREVISAO_OPTUNA_TRIALS_CAP", "18"))
+# Segundos máximos por estudo Optuna (qtd ou VGV); 0 = sem limite de tempo.
+OPTUNA_TIMEOUT_PER_TARGET_SEC = float(os.environ.get("PREVISAO_OPTUNA_TIMEOUT_SEC", "40"))
+# TimeSeriesSplit no objetivo Optuna: menos folds acelera cada trial.
+OPTUNA_TSS_SPLITS_CAP = int(os.environ.get("PREVISAO_OPTUNA_SPLITS", "4"))
+# Top-K no super-ensemble (menor = mais rápido no fallback do blend).
+BLEND_TOP_K_FIXO = int(os.environ.get("PREVISAO_BLEND_TOP_K", "4"))
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
