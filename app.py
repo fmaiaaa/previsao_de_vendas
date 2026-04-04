@@ -1710,7 +1710,7 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     if n_trials > 0:
         return int(n_trials)
     cap = int(OPTUNA_TRIALS_CAP_AUTO)
-    est = int(8 + 11 * np.log1p(max(n_samples, 20)) / np.log1p(420)))
+    est = int(8 + 11 * np.log1p(max(n_samples, 20)) / np.log1p(420))
     base = max(8, min(cap, est))
     if int(horizon) >= 21:
         base = min(cap, base + 3)
