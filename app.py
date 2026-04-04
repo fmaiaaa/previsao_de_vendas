@@ -2190,6 +2190,14 @@ from tqdm.auto import tqdm
 # Após o sábado de referência, os totais do formulário só entram como feature (evita vazamento).
 FORMULARIO_FEATURE_LAG_DIAS = 7
 
+# Prazos (H dias) disponíveis na aba Previsões — treina-se **um** horizonte de cada vez (sem 3+7+30 em paralelo).
+HORIZONTES_FIXOS_UI: tuple[int, ...] = (3, 7, 14, 21, 30, 45, 60)
+
+
+def _por_h_chaves_horizonte(por_h: dict[Any, Any]) -> list[int]:
+    """Chaves inteiras de `por_h` (modelos por H dias), ordenadas."""
+    return sorted(k for k in por_h if isinstance(k, int))
+
 # Feriados nacionais + estaduais (RJ) — pacote `holidays`; se ausente, colunas ficam a zero.
 CAL_SUBDIV_BR = "RJ"
 
@@ -2740,7 +2748,10 @@ def _inject_dim_features_and_funnel_interactions(
     if len(cor_n) >= 2:
         M = df_master[cor_n].to_numpy(dtype=float)
         s = M.sum(axis=1, keepdims=True)
-        p = np.divide(M, s + 1e-9, out=np.zeros_like(M), where=s.flatten() > 1e-12)
+        # `where` tem de ter a mesma forma que M (não usar flatten — evita ValueError no np.divide)
+        _w = np.broadcast_to(s > 1e-12, M.shape)
+        p = np.zeros_like(M)
+        np.divide(M, s + 1e-9, out=p, where=_w)
         df_master["dim_venda_cor_hhi"] = np.sum(p * p, axis=1)
         created.append("dim_venda_cor_hhi")
 
@@ -2748,7 +2759,9 @@ def _inject_dim_features_and_funnel_interactions(
     if len(visit_cor) >= 2:
         M = df_master[visit_cor].to_numpy(dtype=float)
         s = M.sum(axis=1, keepdims=True)
-        p = np.divide(M, s + 1e-9, out=np.zeros_like(M), where=s.flatten() > 1e-12)
+        _w = np.broadcast_to(s > 1e-12, M.shape)
+        p = np.zeros_like(M)
+        np.divide(M, s + 1e-9, out=p, where=_w)
         df_master["dim_visit_cor_hhi"] = np.sum(p * p, axis=1)
         created.append("dim_visit_cor_hhi")
 
@@ -7320,11 +7333,12 @@ def run_training_pipeline(
 
     daily_pack = _daily_pack_from_master(df_master)
     progress.progress(1.0, text="A gerar relatório…")
+    horizontes_relatorio = _por_h_chaves_horizonte(por_horizonte)
     html_out = render_dashboard(
         stats_base,
         ticket,
         conv,
-        horizontes,
+        horizontes_relatorio,
         por_horizonte,
         best_params_preview,
         out_path=None,
@@ -7681,15 +7695,16 @@ def _render_tab_introducao() -> None:
         "<strong>X</strong> é vetorial, ambos indexados por <em>t</em>. Ademais, cada componente de <strong>X</strong> "
         "deve depender apenas do passado observado até <em>t</em>, sob pena de enviesar a validação fora da amostra."
     )
+    _hz_ui = ", ".join(str(x) for x in HORIZONTES_FIXOS_UI)
     _ix(
-        "<strong>Horizonte fixo H ∈ {3, 7, 30}.</strong> Para cada <em>t</em>, <strong>Y</strong> define-se como a soma de vendas "
+        f"<strong>Horizonte fixo H.</strong> Na aba <strong>Previsões</strong>, escolhe-se <strong>um</strong> prazo "
+        f"<strong>H</strong> em dias (opções típicas: {_hz_ui}). Para cada <em>t</em>, <strong>Y</strong> define-se como a soma de vendas "
         "(em quantidade ou valor) nos <strong>H</strong> primeiros dias da <em>série</em> imediatamente posteriores a <em>t</em>, "
-        "considerando apenas os dias efetivamente presentes no índice temporal."
+        "considerando apenas os dias efetivamente presentes no índice temporal. <strong>Não</strong> se treinam vários H em simultâneo."
     )
     _ix(
-        "<strong>Intervalo [d₁, d₂].</strong> Na aba <strong>Previsões</strong>, quando indicadas duas datas, "
-        "define-se um alvo adicional correspondente à soma no calendário entre esses limites, complementando, portanto, "
-        "os horizontes fixos H ∈ {3, 7, 30}."
+        "<strong>Intervalo [d₁, d₂].</strong> Na mesma aba, pode optar-se por treinar <strong>só</strong> um alvo definido pela soma "
+        "no calendário entre duas datas; nesse modo, não corre o modelo de horizonte fixo H."
     )
     _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
     _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
@@ -8331,17 +8346,18 @@ def _render_streamlit_ml_feature_importance(
     """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
     import plotly.graph_objects as go
 
+    _hz_imp = _por_h_chaves_horizonte(por_h)
     _tem_imp = any(
         (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
         or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
-        for h in (3, 7, 30)
+        for h in _hz_imp
     )
     if _tem_imp:
         st.markdown(
             '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
             unsafe_allow_html=True,
         )
-        for h in (3, 7, 30):
+        for h in _hz_imp:
             sub = por_h.get(h) or {}
             c1, c2 = st.columns(2)
             with c1:
@@ -8868,7 +8884,8 @@ def _render_streamlit_tab_apendice(
     random_seed: int,
     daily: dict[str, Any],
 ) -> None:
-    hz_txt = ", ".join(str(x) for x in (3, 7, 30))
+    int_hs = _por_h_chaves_horizonte(por_h)
+    hz_txt = ", ".join(str(x) for x in int_hs) if int_hs else "— (treine com um horizonte na aba Previsões)"
     modo = (
         "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
         "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
@@ -8881,15 +8898,16 @@ def _render_streamlit_tab_apendice(
         '<p class="pv-section-title">Apêndice</p>',
         unsafe_allow_html=True,
     )
-    tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
-        ["Metodologia", "H = 3 dias", "H = 7 dias", "H = 30 dias", "Personalizado"]
-    )
+    _tab_names = ["Metodologia"] + [f"H = {h} dias" for h in int_hs] + ["Personalizado"]
+    _tabs = st.tabs(_tab_names)
+    tab_met = _tabs[0]
+    tab_cust = _tabs[-1]
     with tab_met:
         st.markdown(
             f"""
 #### Resumo
 
-- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*, com *H* ∈ {{{hz_txt}}}; o vetor *X* incorpora apenas informação até *t*. Além disso, na aba **Previsões**, um intervalo entre datas de início e fim define um alvo complementar.
+- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t* (nesta execução: **H** ∈ {{{hz_txt}}}); o vetor *X* incorpora apenas informação até *t*. Na aba **Previsões**, pode optar-se por **intervalo personalizado** em vez de H fixo.
 - **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Optuna:** algoritmo TPE, **TimeSeriesSplit** e **MedianPruner**; a função objetivo penaliza a variância entre *folds*, promovendo estabilidade. Semente: **{random_seed}**.
@@ -8921,12 +8939,9 @@ O relatório HTML exportável na aba **Previsões** reúne, entre outros element
         st.markdown("**Hiperparâmetros LightGBM (VGV)**")
         st.json(bp.get("valor") or {})
 
-    with tab3:
-        _ap_horizon_block(3)
-    with tab7:
-        _ap_horizon_block(7)
-    with tab30:
-        _ap_horizon_block(30)
+    for _ti, _h in enumerate(int_hs):
+        with _tabs[_ti + 1]:
+            _ap_horizon_block(_h)
 
     with tab_cust:
         bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
@@ -9285,7 +9300,7 @@ def _render_streamlit_dossie_ml(
             "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
         )
         rows_m = []
-        for h in (3, 7, 30):
+        for h in _por_h_chaves_horizonte(por_h):
             sub = por_h.get(h) or {}
             for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
                 m = (sub.get(alvo) or {}).get("metrics_test") or {}
@@ -9373,7 +9388,7 @@ def main() -> None:
     st.markdown(
         '<div class="pv-hero-block">'
         '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
-        '<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>'
+        '<p class="pv-hero-sub">Consolidação da matriz diária, modelo para um prazo H à sua escolha (ou intervalo personalizado) e exportação de relatório HTML.</p>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -9403,54 +9418,85 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "Por padrão, estimam-se sempre os horizontes de <strong>3, 7 e 30</strong> dias. Adicionalmente, caso indique "
-            "um intervalo opcional nas datas abaixo, treina-se um par de modelos cuja soma-alvo corresponde ao calendário entre essas datas.</div>",
+            "Escolha <strong>um</strong> modo: <em>prazo fixo H</em> (treina um único modelo para os próximos <strong>H</strong> dias na série) "
+            "ou <em>intervalo entre datas</em> (treina só o alvo definido por esse calendário). Os dois modos não se combinam na mesma execução.</div>",
             unsafe_allow_html=True,
         )
+        modo_alvo = st.radio(
+            "Modo de alvo",
+            ["Horizonte fixo H (dias)", "Intervalo entre duas datas"],
+            horizontal=True,
+            key="pv_modo_alvo",
+        )
+        h_escolhido = 7
+        if modo_alvo.startswith("Horizonte"):
+            h_escolhido = int(
+                st.selectbox(
+                    "Prazo H (próximos H dias na série temporal)",
+                    options=list(HORIZONTES_FIXOS_UI),
+                    index=list(HORIZONTES_FIXOS_UI).index(7) if 7 in HORIZONTES_FIXOS_UI else 0,
+                    key="pv_horizonte_h",
+                )
+            )
+            st.caption(
+                "No modo horizonte fixo, as datas abaixo **não** entram no treino (deixe-as vazias ou ignore-as)."
+            )
         ic1, ic2 = st.columns(2)
         with ic1:
             d_ini = st.date_input(
-                "Dia inicial do intervalo (opcional)",
+                "Dia inicial do intervalo"
+                + (" (só modo intervalo)" if modo_alvo.startswith("Intervalo") else " (ignorado no modo H)"),
                 value=None,
                 key="pv_interval_start",
             )
         with ic2:
             d_fim = st.date_input(
-                "Dia final do intervalo (opcional)",
+                "Dia final do intervalo"
+                + (" (só modo intervalo)" if modo_alvo.startswith("Intervalo") else " (ignorado no modo H)"),
                 value=None,
                 key="pv_interval_end",
             )
-        if d_ini is not None and d_fim is not None:
-            a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
-            st.info(
-                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
-            )
-        elif d_ini is None and d_fim is None:
-            pass
-        else:
-            st.warning(
-                "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
-            )
+        if modo_alvo.startswith("Intervalo"):
+            if d_ini is not None and d_fim is not None:
+                a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+                st.info(
+                    f"Será treinado o alvo do calendário **{a.isoformat()}** → **{b.isoformat()}** (sem modelo H fixo nesta execução)."
+                )
+            elif d_ini is None and d_fim is None:
+                st.warning("Indique **início e fim** do intervalo para este modo, ou mude para horizonte fixo H.")
+            else:
+                st.warning(
+                    "Indique **ambas** as datas (início e fim) ou deixe **as duas** vazias e escolha o modo H."
+                )
+        elif d_ini is not None or d_fim is not None:
+            st.info("Modo **horizonte fixo**: as datas preenchidas acima **não** serão usadas nesta execução.")
 
         run_btn = st.button("Gerar previsões", type="primary", width="stretch", key="pv_gerar")
 
         if run_btn:
-            if (d_ini is None) ^ (d_fim is None):
-                st.error("Intervalo incompleto: são necessárias duas datas válidas ou nenhuma (deixe ambos os campos vazios).")
-            else:
+            usar_intervalo = modo_alvo.startswith("Intervalo")
+            if usar_intervalo and (d_ini is None or d_fim is None):
+                st.error("No modo intervalo, são obrigatórias **duas** datas (início e fim).")
+            elif not usar_intervalo and ((d_ini is None) ^ (d_fim is None)):
+                st.warning(
+                    "Só uma data está preenchida; no modo horizonte fixo isso é ignorado nesta execução."
+                )
+            if not (usar_intervalo and (d_ini is None or d_fim is None)):
                 with st.spinner("A carregar e analisar as planilhas…"):
                     dfs, sheet_metas, used_sa = build_data_bundle()
                 st.session_state["sheet_metas"] = sheet_metas
                 st.session_state["used_service_account"] = used_sa
                 try:
                     custom_previsao = None
-                    if d_ini is not None and d_fim is not None:
+                    horizontes_arg: list[int] | None = [h_escolhido]
+                    if usar_intervalo and d_ini is not None and d_fim is not None:
                         a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
                         custom_previsao = {
                             "mode": "range",
                             "date_start": a.isoformat(),
                             "date_end": b.isoformat(),
                         }
+                        horizontes_arg = None
                     with st.spinner("A treinar modelos e gerar o relatório…"):
                         (
                             stats_base,
@@ -9462,7 +9508,11 @@ def main() -> None:
                             daily_pack,
                             dossie_ml,
                             por_custom,
-                        ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
+                        ) = run_training_pipeline(
+                            dfs,
+                            custom_previsao=custom_previsao,
+                            horizontes=horizontes_arg,
+                        )
                     st.session_state.resultado = {
                         "stats_base": stats_base,
                         "ticket": ticket,
@@ -9545,9 +9595,10 @@ def main() -> None:
             )
             rows = []
             lbl = "In-sample" if full_train else "Holdout 30%"
-            for h in (3, 7, 30):
-                q = por_h[h]["qtd"]
-                v = por_h[h]["valor"]
+            for h in _por_h_chaves_horizonte(por_h):
+                sub_h = por_h.get(h) or {}
+                q = sub_h.get("qtd") or {}
+                v = sub_h.get("valor") or {}
                 acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
                 acc_v = v.get("metrics_test", {}).get("Acc_dir_mediana")
                 rows.append(
@@ -9592,7 +9643,7 @@ def main() -> None:
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             acc_warn = False
-            for h in (3, 7, 30):
+            for h in _por_h_chaves_horizonte(por_h):
                 for part in ("qtd", "valor"):
                     m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
