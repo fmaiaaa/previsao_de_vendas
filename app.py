@@ -974,6 +974,19 @@ def _accuracy_vs_train_median(
     return float((tb == pb).mean())
 
 
+def _directional_misrate(
+    y_true: np.ndarray, y_pred: np.ndarray, med: float
+) -> float:
+    """Proporção de pontos em que real e predito ficam em lados opostos a *med* (0–1)."""
+    yt = np.asarray(y_true, dtype=float).ravel()
+    yp = np.asarray(y_pred, dtype=float).ravel()
+    if len(yt) < 2 or not np.isfinite(med):
+        return 0.5
+    tb = (yt > med).astype(int)
+    pb = (yp > med).astype(int)
+    return float((tb != pb).mean())
+
+
 def temporal_train_test_indices(n: int, train_frac: float = 0.7) -> tuple[slice, slice]:
     """Primeiros train_frac para treino; resto para teste out-of-sample (ex.: 70%/30%)."""
     i_tr = max(1, int(n * train_frac))
@@ -1074,11 +1087,11 @@ def _fit_lgbm_with_early_stopping(
 def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
     """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
     nt = max(8, int(n_trials))
-    min_tr = max(6, min(22, (2 * nt) // 5))
-    pat = max(4, min(16, max(3, nt // 5)))
+    min_tr = max(14, min(48, (2 * nt) // 5))
+    pat = max(9, min(32, max(5, nt // 4)))
     if min_tr >= nt:
-        min_tr = max(5, min(nt - 2, (2 * nt) // 5))
-    return pat, max(4, min_tr)
+        min_tr = max(10, min(nt - 2, (2 * nt) // 5))
+    return pat, max(8, min_tr)
 
 
 def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
@@ -1122,6 +1135,8 @@ def _optuna_objective_lgbm(
     random_state: int,
     target_name: str,
     horizon: int = 7,
+    *,
+    median_dir_ref: float | None = None,
 ) -> float:
     """
     Otimização orientada à generalização temporal:
@@ -1181,6 +1196,7 @@ def _optuna_objective_lgbm(
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     scores: list[float] = []
+    dir_miss: list[float] = []
     try:
         for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
             sys.stderr.write(f"\r[Optuna] trial {trial.number + 1} • fold {step + 1}/{n_splits}…\033[K")
@@ -1189,7 +1205,7 @@ def _optuna_objective_lgbm(
             y_tr = y_train.iloc[tr_idx]
             sw = sample_weights(y_tr, True, target_name, horizon)
             y_va_fold = y_train.iloc[va_idx]
-            es_rounds = 36 if long_h else 28
+            es_rounds = 52 if long_h else 42
             _fit_lgbm_with_early_stopping(
                 model,
                 X_train.iloc[tr_idx],
@@ -1202,6 +1218,14 @@ def _optuna_objective_lgbm(
             p = model.predict(X_train.iloc[va_idx])
             fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
             scores.append(fold_mae)
+            if median_dir_ref is not None and np.isfinite(median_dir_ref):
+                dir_miss.append(
+                    _directional_misrate(
+                        np.asarray(y_va_fold, dtype=float),
+                        np.asarray(p, dtype=float),
+                        float(median_dir_ref),
+                    )
+                )
             trial.report(float(np.mean(scores)), step)
             if step >= 1 and trial.should_prune():
                 raise optuna.TrialPruned()
@@ -1211,7 +1235,10 @@ def _optuna_objective_lgbm(
         spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
         pen_std = 0.12 if long_h else 0.15
         pen_sp = 0.09 if long_h else 0.105
-        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
+        mean_dir_mis = float(np.mean(dir_miss)) if dir_miss else 0.0
+        # Penaliza erros «acima/abaixo da mediana do treino» (alinhado à métrica Acc_dir_mediana).
+        dir_pen = 0.38 * mean_mae * mean_dir_mis if dir_miss else 0.0
+        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6) + dir_pen
     finally:
         sys.stderr.write("\n")
         sys.stderr.flush()
@@ -1525,8 +1552,8 @@ def _collect_candidate_specs(
 ) -> list[tuple[str, Pipeline, bool]]:
     """Nome, pipeline (template), usar sample_weight recency.
 
-    Com *lean_benchmark* True (~6 modelos leves), o benchmark fica muito mais rápido.
-    None usa o valor global (por defeito enxuto; ver ``PREVISAO_ML_THOROUGH``).
+    Com *lean_benchmark* True (~6 modelos), o benchmark é mais rápido e menos rico.
+    None usa o valor global (benchmark completo por defeito; ``PREVISAO_ML_LEAN=1`` encurta).
     """
     if lean_benchmark is None:
         lean_benchmark = LEAN_BENCHMARK_DEFAULT
@@ -1717,10 +1744,10 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     """n_trials <= 0 → escala com log do tamanho da amostra (TPE + pruner + patience compensam menos trials)."""
     if n_trials > 0:
         return n_trials
-    # Teto ~26 trials; pruner + patience. Horizontes longos: pouco extra.
-    base = int(max(12, min(26, int(7 * np.log1p(n_samples)))))
+    # Mais trials → melhor MAE/acurácia direcional; pruner e patience limitam custo.
+    base = int(max(32, min(88, int(16 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(34, base + 6)
+        base = min(108, base + 20)
     return base
 
 
@@ -1778,6 +1805,10 @@ def train_one_target(
     n_splits = max(3, n_splits)
     nt = _resolve_n_trials(n_trials, len(X_opt), hz)
 
+    med_dir_ref = float(np.median(np.asarray(y_train, dtype=float)))
+    if not np.isfinite(med_dir_ref):
+        med_dir_ref = None
+
     if LGBMRegressor is None:
         if hz >= 21:
             best_params = {
@@ -1816,15 +1847,16 @@ def train_one_target(
                 random_state=random_state,
                 target_name=target_name,
                 horizon=hz,
+                median_dir_ref=med_dir_ref,
             )
 
-        n_startup = max(6, min(18, nt // 4))
+        n_startup = max(12, min(32, nt // 3))
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(
                 seed=optuna_seed,
                 multivariate=False,
-                n_startup_trials=max(6, min(14, nt // 5)),
+                n_startup_trials=max(10, min(26, nt // 4)),
             ),
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=n_startup,
@@ -3221,6 +3253,19 @@ def build_daily_master(
     )
     if df_master.index.duplicated().any():
         df_master = df_master[~df_master.index.duplicated(keep="last")]
+
+    from datetime import date as _date_today
+
+    _d_min = SERIE_DIARIA_INICIO.normalize()
+    _d_max = pd.Timestamp(_date_today.today()).normalize()
+    df_master = df_master.loc[
+        (df_master.index >= _d_min) & (df_master.index <= _d_max)
+    ]
+    if df_master.empty:
+        raise ValueError(
+            f"Sem observações diárias entre {_d_min.date()} e {_d_max.date()} (inclusive); "
+            "verifique as planilhas ou o intervalo configurado."
+        )
 
     df_form = dict_dfs.get("formulario_previsao")
     if df_form is not None and len(df_form) > 0:
@@ -5762,13 +5807,18 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 # --- Decisões automáticas (sem input do utilizador) ---
 # Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
 OPTUNA_TRIALS_AUTO = 0
-# Folds em TimeSeriesSplit durante Optuna (3 acelera bastante vs. 5; mais folds = mais estável).
-OPTUNA_TSS_SPLITS = 3
+# Folds na Optuna: 5 melhora estabilidade temporal (acurácia direcional). PREVISAO_OPTUNA_SPLITS=3 acelera.
+try:
+    OPTUNA_TSS_SPLITS = max(3, min(7, int(str(os.environ.get("PREVISAO_OPTUNA_SPLITS", "5")).strip())))
+except Exception:
+    OPTUNA_TSS_SPLITS = 5
+# Série diária (leads/vendas/…) usada no treino e nas análises: desta data até ao dia corrente (inclusive).
+SERIE_DIARIA_INICIO = pd.Timestamp("2025-01-01")
 # Um horizonte por execução de «Gerar previsões» quando o UI não envia lista.
 HORIZONTE_TREINO_PADRAO = 7
 HORIZONTES_FIXOS_DISPONIVEIS: tuple[int, ...] = (3, 7, 30)
-# Top-K no super-ensemble (menor = menos modelos a pontuar após o benchmark).
-BLEND_TOP_K_FIXO = 4
+# Top-K no super-ensemble (mais modelos → blend mais expressivo).
+BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
@@ -5786,15 +5836,15 @@ def _previsao_env_truthy(key: str) -> bool:
     return str(os.environ.get(key, "0")).lower() in ("1", "true", "yes")
 
 
-# Benchmark enxuto (~10 modelos) por defeito. PREVISAO_ML_THOROUGH=1 = lista completa (mais lenta).
-LEAN_BENCHMARK_DEFAULT = not _previsao_env_truthy("PREVISAO_ML_THOROUGH")
-# STL com robust=False é muito mais rápido; PREVISAO_STL_ROBUST=1 usa robust=True (mais pesado).
-STL_ROBUST_DEFAULT = _previsao_env_truthy("PREVISAO_STL_ROBUST")
-# Um STL a cada N dias (interpolado com ffill); 1 = diário (lento). PREVISAO_SKIP_STL=1 zera as colunas STL.
+# Benchmark completo por defeito (melhor acurácia direcional). PREVISAO_ML_LEAN=1 = lista curta (rápida).
+LEAN_BENCHMARK_DEFAULT = _previsao_env_truthy("PREVISAO_ML_LEAN")
+# STL robust=True por defeito (melhor sinal sazonal). PREVISAO_STL_FAST=1 usa robust=False (mais rápido).
+STL_ROBUST_DEFAULT = not _previsao_env_truthy("PREVISAO_STL_FAST")
+# STL diário (stride 1) por defeito. PREVISAO_STL_STRIDE=N para amostrar 1 em N dias (mais rápido).
 try:
-    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "7")).strip())
+    _stl_stride_raw = int(str(os.environ.get("PREVISAO_STL_STRIDE", "1")).strip())
 except Exception:
-    _stl_stride_raw = 7
+    _stl_stride_raw = 1
 STL_STRIDE_DEFAULT = max(1, min(31, _stl_stride_raw))
 
 
@@ -9240,11 +9290,11 @@ def _render_streamlit_dossie_ml(
                 adf = float(ad)
             except (TypeError, ValueError):
                 continue
-            if np.isfinite(adf) and adf < 0.8:
+            if np.isfinite(adf) and adf < 0.85:
                 low_acc.append(r)
         if _hay_metricas and low_acc:
             st.warning(
-                "A acurácia direcional é inferior a 80% em, pelo menos, um horizonte ou alvo; analise o conjunto de métricas "
+                "A acurácia direcional é inferior a 85% em, pelo menos, um horizonte ou alvo; analise o conjunto de métricas "
                 "antes de utilizar as previsões como único critério de decisão."
             )
         st.divider()
@@ -9313,6 +9363,8 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
+            "A série diária consolidada considera <strong>1 de janeiro de 2025</strong> como data inicial e "
+            "<strong>o dia de hoje</strong> como data final (inclusive). "
             "Cada execução de <strong>Gerar previsões</strong> treina <strong>apenas um</strong> horizonte fixo (3, 7 ou 30 dias), "
             "para reduzir tempo de CPU; execute novamente com outro horizonte se precisar de outro <em>H</em>. "
             "Opcionalmente, um intervalo de datas abaixo acrescenta um par de modelos com alvo de soma nesse calendário.</div>",
@@ -9525,17 +9577,17 @@ def main() -> None:
                 for part in ("qtd", "valor"):
                     m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
-                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.85:
                         acc_warn = True
             if pc:
                 for part in ("qtd", "valor"):
                     m = (pc.get(part) or {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
-                    if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    if a is not None and np.isfinite(float(a)) and float(a) < 0.85:
                         acc_warn = True
             if acc_warn:
                 st.warning(
-                    "A acurácia direcional situa-se abaixo de 80% em, pelo menos, um horizonte ou alvo; recomenda-se "
+                    "A acurácia direcional situa-se abaixo de 85% em, pelo menos, um horizonte ou alvo; recomenda-se "
                     "cruzar este sinal com MAE, RMSE e estabilidade temporal antes de decisões operacionais."
                 )
 
