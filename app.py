@@ -1519,26 +1519,8 @@ def _collect_candidate_specs(
     target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
 ) -> list[tuple[str, Pipeline, bool]]:
     """Nome, pipeline (template), usar sample_weight recency."""
-    import os
-
     out: list[tuple[str, Pipeline, bool]] = []
     long_h = int(horizon) >= 21
-
-    # Conjunto reduzido (predefinido): ~2× menos ajustes que o grid completo. Desative com PREVISAO_BENCHMARK_LITE=0.
-    if str(os.environ.get("PREVISAO_BENCHMARK_LITE", "1")).lower() in ("1", "true", "yes"):
-        out.append(("Ridge", build_ridge_pipe(rs), False))
-        out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
-        out.append(("RandomForest", build_random_forest_pipe(rs, horizon), False))
-        if LGBMRegressor is not None:
-            out.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
-            out.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
-        out.append(("HGB", build_hgb_pipe(rs, target_name), False))
-        xgbp_l = build_xgb_only_pipe(best_params, False, rs, horizon)
-        if xgbp_l is not None:
-            out.append(("XGB", xgbp_l, True))
-        out.append(("TS-linear", build_ts_linear_bridge_pipe(), False))
-        out.append(("Baseline mediana", build_dummy_median_pipe(), False))
-        return out
 
     out.append(("Ridge", build_ridge_pipe(rs), False))
     out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
@@ -1706,15 +1688,13 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
-    """n_trials <= 0 → auto com teto baixo (pipeline alvo ≤ ~2 min; ver OPTUNA_TRIALS_CAP_AUTO)."""
+    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
     if n_trials > 0:
-        return int(n_trials)
-    cap = int(OPTUNA_TRIALS_CAP_AUTO)
-    est = int(8 + 11 * np.log1p(max(n_samples, 20)) / np.log1p(420))
-    base = max(8, min(cap, est))
+        return n_trials
+    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
     if int(horizon) >= 21:
-        base = min(cap, base + 3)
-    return int(base)
+        base = min(178, base + 28)
+    return base
 
 
 def train_one_target(
@@ -1764,9 +1744,7 @@ def train_one_target(
         X_imp = X
         y_imp = y
 
-    n_splits = min(
-        int(OPTUNA_TSS_SPLITS_CAP), n_splits_tss, max(3, len(X_opt) // 22)
-    )
+    n_splits = min(n_splits_tss, max(3, len(X_opt) // 22))
     n_splits = max(3, n_splits)
     nt = _resolve_n_trials(n_trials, len(X_opt), hz)
 
@@ -1826,7 +1804,8 @@ def train_one_target(
         )
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         es_patience, es_min_trials = _optuna_patience_cfg(nt)
-        _opt_kw: dict[str, Any] = dict(
+        study.optimize(
+            objective,
             n_trials=nt,
             show_progress_bar=show_progress,
             callbacks=[
@@ -1836,9 +1815,6 @@ def train_one_target(
                 )
             ],
         )
-        if float(OPTUNA_TIMEOUT_PER_TARGET_SEC) > 0:
-            _opt_kw["timeout"] = float(OPTUNA_TIMEOUT_PER_TARGET_SEC)
-        study.optimize(objective, **_opt_kw)
         completed = [
             t
             for t in study.trials
@@ -2214,14 +2190,6 @@ from tqdm.auto import tqdm
 # Após o sábado de referência, os totais do formulário só entram como feature (evita vazamento).
 FORMULARIO_FEATURE_LAG_DIAS = 7
 
-# Prazos (H dias) disponíveis na aba Previsões — treina-se **um** horizonte de cada vez (sem 3+7+30 em paralelo).
-HORIZONTES_FIXOS_UI: tuple[int, ...] = (3, 7, 14, 21, 30, 45, 60)
-
-
-def _por_h_chaves_horizonte(por_h: dict[Any, Any]) -> list[int]:
-    """Chaves inteiras de `por_h` (modelos por H dias), ordenadas."""
-    return sorted(k for k in por_h if isinstance(k, int))
-
 # Feriados nacionais + estaduais (RJ) — pacote `holidays`; se ausente, colunas ficam a zero.
 CAL_SUBDIV_BR = "RJ"
 
@@ -2421,457 +2389,6 @@ def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     out = out.loc[out["_d"].notna()].copy()
     out["_valor"] = _winsorize_positive_series(out[c_val])
     return out, c_data, c_val
-
-
-# --- Agregações diárias por dimensão (corretor, imobiliária, etc.) + interações do funil ---
-_DIM_TOPK_DEFAULT = 12
-
-
-def _dim_feat_slug(s: str, max_len: int = 36) -> str:
-    import re as _re
-
-    t = _re.sub(r"[^a-z0-9]+", "_", str(s).lower().strip())[:max_len].strip("_")
-    return t or "x"
-
-
-def _collapse_duplicate_pivot_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Soma colunas com o mesmo nome (ex.: slug truncado idêntico para categorias distintas)."""
-    if df.shape[1] == 0:
-        return df
-    if not df.columns.duplicated().any():
-        return df
-    return df.T.groupby(df.columns, sort=False).sum().T
-
-
-def _dim_pivot_counts(
-    fn: pd.DataFrame,
-    date_col: str | None,
-    cat_col: str | None,
-    prefix: str,
-    master_index: pd.DatetimeIndex,
-    *,
-    top_k: int = _DIM_TOPK_DEFAULT,
-) -> pd.DataFrame | None:
-    if (
-        not date_col
-        or not cat_col
-        or date_col not in fn.columns
-        or cat_col not in fn.columns
-    ):
-        return None
-    sub = fn[[date_col, cat_col]].copy()
-    sub["_d"] = _to_day(sub[date_col])
-    sub = sub.loc[sub["_d"].notna()]
-    if sub.empty:
-        return None
-    sub["_c"] = (
-        sub[cat_col]
-        .fillna("(vazio)")
-        .astype(str)
-        .str.strip()
-        .str.slice(0, 72)
-    )
-    vc = sub["_c"].value_counts()
-    top_set = set(vc.head(int(top_k)).index)
-    sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
-    pt = sub.groupby(["_d", "_ck"], observed=True).size().unstack(fill_value=0)
-    pt.columns = [f"{prefix}_n_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
-    pt = _collapse_duplicate_pivot_columns(pt)
-    return pt.reindex(master_index).fillna(0.0).astype(np.float64)
-
-
-def _dim_pivot_sums(
-    fn: pd.DataFrame,
-    date_col: str | None,
-    cat_col: str | None,
-    val_col: str | None,
-    prefix: str,
-    master_index: pd.DatetimeIndex,
-    *,
-    top_k: int = _DIM_TOPK_DEFAULT,
-) -> pd.DataFrame | None:
-    if (
-        not date_col
-        or not cat_col
-        or not val_col
-        or date_col not in fn.columns
-        or cat_col not in fn.columns
-        or val_col not in fn.columns
-    ):
-        return None
-    sub = fn[[date_col, cat_col, val_col]].copy()
-    sub["_d"] = _to_day(sub[date_col])
-    sub = sub.loc[sub["_d"].notna()]
-    if sub.empty:
-        return None
-    sub["_v"] = _winsorize_positive_series(sub[val_col])
-    sub["_c"] = (
-        sub[cat_col]
-        .fillna("(vazio)")
-        .astype(str)
-        .str.strip()
-        .str.slice(0, 72)
-    )
-    vc = sub["_c"].value_counts()
-    top_set = set(vc.head(int(top_k)).index)
-    sub["_ck"] = np.where(sub["_c"].isin(top_set), sub["_c"], "_outros")
-    pt = sub.groupby(["_d", "_ck"], observed=True)["_v"].sum().unstack(fill_value=0)
-    pt.columns = [f"{prefix}_v_{_dim_feat_slug(c)}" for c in pt.columns.astype(str)]
-    pt = _collapse_duplicate_pivot_columns(pt)
-    return pt.reindex(master_index).fillna(0.0).astype(np.float64)
-
-
-def _inject_dim_features_and_funnel_interactions(
-    df_master: pd.DataFrame,
-    dict_dfs: dict[str, pd.DataFrame],
-) -> list[str]:
-    """
-    Acrescenta, por dia: contagens (e somas VGV quando aplicável) por corretor / imobiliária /
-    empreendimento / origem, com top-K + «outros»; concentração (HHI); produtos do funil;
-    interações polinomiais (grau 2, só cruzamentos) sobre volumes defasados.
-
-    Devolve os nomes das colunas criadas (para lags e médias móveis).
-    """
-    idx = df_master.index
-    created: list[str] = []
-    fn_l = normalize_dataframe_columns(dict_dfs["leads"].copy())
-    fn_a = normalize_dataframe_columns(dict_dfs["agendamentos"].copy())
-    fn_p = normalize_dataframe_columns(dict_dfs["pastas"].copy())
-    fn_v = normalize_dataframe_columns(dict_dfs["vendas"].copy())
-
-    d_le = find_column_any(
-        fn_l,
-        [
-            ["data", "criacao"],
-            ["data", "criacao", "lead"],
-            ["data", "atendimento"],
-        ],
-    )
-    d_ag = find_column_any(fn_a, [["data", "agendamento"]])
-    d_vi = find_column_any(fn_a, [["data", "visita"]])
-    d_pa = find_column_any(
-        fn_p,
-        [["data", "criacao", "pasta"], ["data", "criacao"]],
-    )
-    d_ve = find_column_any(
-        fn_v,
-        [
-            ["data", "venda"],
-            ["data", "fechamento"],
-            ["contrato", "gerado"],
-        ],
-    )
-    v_val = find_column_any(
-        fn_v,
-        [
-            ["valor", "real", "venda"],
-            ["valor", "real"],
-            ["vgv", "real"],
-            ["valor", "venda"],
-        ],
-    )
-
-    tables: list[pd.DataFrame] = []
-
-    def _add(tab: pd.DataFrame | None) -> None:
-        if tab is not None and not tab.empty:
-            tables.append(tab)
-
-    # Leads — proprietário / origem / tipo
-    _add(
-        _dim_pivot_counts(
-            fn_l,
-            d_le,
-            find_column_any(
-                fn_l,
-                [
-                    ["proprietario", "lead"],
-                    ["proprietario"],
-                    ["criado", "por"],
-                ],
-            ),
-            "dim_lead_prop",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_l,
-            d_le,
-            find_column_any(fn_l, [["origem", "lead"], ["origem"]]),
-            "dim_lead_origem",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_l,
-            d_le,
-            find_column_any(
-                fn_l,
-                [["tipo", "registro", "lead"], ["tipo", "lead"], ["classificacao"]],
-            ),
-            "dim_lead_tipo",
-            idx,
-        )
-    )
-
-    # Vendas — corretor / ranking / imobiliária / empreendimento (contagem + VGV por corretor)
-    _add(
-        _dim_pivot_counts(
-            fn_v,
-            d_ve,
-            find_column_any(
-                fn_v,
-                [
-                    ["contato", "corretor"],
-                    ["corretor", "proprietario"],
-                    ["corretor"],
-                ],
-            ),
-            "dim_venda_cor",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_sums(
-            fn_v,
-            d_ve,
-            find_column_any(
-                fn_v,
-                [
-                    ["contato", "corretor"],
-                    ["corretor", "proprietario"],
-                    ["corretor"],
-                ],
-            ),
-            v_val,
-            "dim_venda_cor",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_v,
-            d_ve,
-            find_column_any(fn_v, [["ranking"], ["rank"]]),
-            "dim_venda_rank",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_v,
-            d_ve,
-            find_column_any(fn_v, [["imobiliaria"], ["nome", "imobiliaria"]]),
-            "dim_venda_imob",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_v,
-            d_ve,
-            find_column_any(fn_v, [["empreendimento"], ["empreed"]]),
-            "dim_venda_emp",
-            idx,
-        )
-    )
-
-    # Pastas — empreendimento / correspondente
-    _add(
-        _dim_pivot_counts(
-            fn_p,
-            d_pa,
-            find_column_any(fn_p, [["empreendimento"], ["empreed"]]),
-            "dim_pasta_emp",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_p,
-            d_pa,
-            find_column_any(
-                fn_p,
-                [["correspondente"], ["corretor"], ["avaliacao", "credito"]],
-            ),
-            "dim_pasta_corr",
-            idx,
-        )
-    )
-
-    # Agendamentos / visitas — na data da visita realizada
-    _add(
-        _dim_pivot_counts(
-            fn_a,
-            d_vi,
-            find_column_any(fn_a, [["tipo", "visita"], ["tipo"]]),
-            "dim_visit_tipo",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_a,
-            d_vi,
-            find_column_any(
-                fn_a,
-                [["corretor", "nome"], ["corretor"], ["nome", "completo"]],
-            ),
-            "dim_visit_cor",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_a,
-            d_vi,
-            find_column_any(fn_a, [["imobiliaria"], ["nome", "imobiliaria"]]),
-            "dim_visit_imob",
-            idx,
-        )
-    )
-    _add(
-        _dim_pivot_counts(
-            fn_a,
-            d_vi,
-            find_column_any(
-                fn_a,
-                [["gerente", "regional"], ["gerente"], ["regional"]],
-            ),
-            "dim_visit_gerente",
-            idx,
-        )
-    )
-    # Agendamentos criados (data de criação do agendamento)
-    _add(
-        _dim_pivot_counts(
-            fn_a,
-            d_ag,
-            find_column_any(
-                fn_a,
-                [["corretor", "nome"], ["corretor"], ["nome", "completo"]],
-            ),
-            "dim_agend_cor",
-            idx,
-        )
-    )
-
-    for tab in tables:
-        tab = _collapse_duplicate_pivot_columns(tab)
-        for c in tab.columns:
-            ser = tab[c]
-            if isinstance(ser, pd.DataFrame):
-                ser = ser.sum(axis=1, min_count=1)
-            df_master[c] = pd.to_numeric(ser, errors="coerce").fillna(0.0).astype(np.float64)
-            created.append(str(c))
-
-    # Concentração (HHI) nos corretores de vendas do dia
-    cor_n = [c for c in df_master.columns if c.startswith("dim_venda_cor_n_")]
-    if len(cor_n) >= 2:
-        M = df_master[cor_n].to_numpy(dtype=float)
-        s = M.sum(axis=1, keepdims=True)
-        # `where` tem de ter a mesma forma que M (não usar flatten — evita ValueError no np.divide)
-        _w = np.broadcast_to(s > 1e-12, M.shape)
-        p = np.zeros_like(M)
-        np.divide(M, s + 1e-9, out=p, where=_w)
-        df_master["dim_venda_cor_hhi"] = np.sum(p * p, axis=1)
-        created.append("dim_venda_cor_hhi")
-
-    visit_cor = [c for c in df_master.columns if c.startswith("dim_visit_cor_n_")]
-    if len(visit_cor) >= 2:
-        M = df_master[visit_cor].to_numpy(dtype=float)
-        s = M.sum(axis=1, keepdims=True)
-        _w = np.broadcast_to(s > 1e-12, M.shape)
-        p = np.zeros_like(M)
-        np.divide(M, s + 1e-9, out=p, where=_w)
-        df_master["dim_visit_cor_hhi"] = np.sum(p * p, axis=1)
-        created.append("dim_visit_cor_hhi")
-
-    # Datas comerciais (efeitos sazonais de varejo / imobiliário)
-    dser = pd.Series(idx)
-    dm = dser.dt.month.to_numpy()
-    dw = dser.dt.dayofweek.to_numpy()
-    dd = dser.dt.day.to_numpy()
-    mae_m = (dm == 5) & (dw == 6) & (dd >= 8) & (dd <= 14)
-    pai_m = (dm == 8) & (dw == 6) & (dd >= 8) & (dd <= 14)
-    nam = (dm == 6) & (dd == 12)
-    bf = (dm == 11) & (dw == 4) & (dd >= 22) & (dd <= 28)
-    nat = (dm == 12) & (dd == 25)
-    for _nm, _ar in (
-        ("cal_dia_maes", mae_m),
-        ("cal_dia_pais", pai_m),
-        ("cal_dia_namorados", nam),
-        ("cal_black_friday", bf),
-        ("cal_natal", nat),
-    ):
-        df_master[_nm] = _ar.astype(np.float64)
-        created.append(_nm)
-
-    # Produtos cruzados do funil (defasagem 1 dia para alinhar a «informação até t»)
-    def _l1(c: str) -> pd.Series:
-        return df_master[c].shift(1).fillna(0.0)
-
-    if all(c in df_master.columns for c in ("vol_leads", "vol_pastas")):
-        df_master["ix_l1_leads_x_pastas"] = _l1("vol_leads") * _l1("vol_pastas")
-        created.append("ix_l1_leads_x_pastas")
-    if all(c in df_master.columns for c in ("vol_visit", "vol_agend")):
-        df_master["ix_l1_visit_x_agend"] = _l1("vol_visit") * _l1("vol_agend")
-        created.append("ix_l1_visit_x_agend")
-    if all(c in df_master.columns for c in ("vol_pastas", "vol_visit")):
-        df_master["ix_l1_pastas_x_visit"] = _l1("vol_pastas") * _l1("vol_visit")
-        created.append("ix_l1_pastas_x_visit")
-    if all(c in df_master.columns for c in ("vol_leads", "vol_visit")):
-        df_master["ix_l1_leads_x_visit"] = _l1("vol_leads") * _l1("vol_visit")
-        created.append("ix_l1_leads_x_visit")
-    if all(c in df_master.columns for c in ("vol_agend", "vol_leads")):
-        df_master["ix_l1_agend_x_leads"] = _l1("vol_agend") * _l1("vol_leads")
-        created.append("ix_l1_agend_x_leads")
-
-    # Razões móveis 7d (interação temporal)
-    if all(c in df_master.columns for c in ("vol_leads", "vol_visit", "vol_pastas")):
-        rl7 = df_master["vol_leads"].shift(1).rolling(7, min_periods=1).sum()
-        rv7 = df_master["vol_visit"].shift(1).rolling(7, min_periods=1).sum()
-        rp7 = df_master["vol_pastas"].shift(1).rolling(7, min_periods=1).sum()
-        df_master["ix_r7_visit_over_leads"] = rv7 / (rl7 + 1e-5)
-        df_master["ix_r7_pastas_over_visit"] = rp7 / (rv7 + 1e-5)
-        created.extend(["ix_r7_visit_over_leads", "ix_r7_pastas_over_visit"])
-
-    # PolynomialFeatures: apenas termos cruzados entre volumes defasados (funil agregado)
-    try:
-        from sklearn.preprocessing import PolynomialFeatures
-
-        core_cols = ["vol_leads", "vol_agend", "vol_visit", "vol_pastas"]
-        if all(c in df_master.columns for c in core_cols):
-            core_mat = (
-                df_master[core_cols]
-                .shift(1)
-                .fillna(0.0)
-                .astype(np.float32)
-                .to_numpy()
-            )
-            poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
-            Z = poly.fit_transform(core_mat)
-            names = list(poly.get_feature_names_out(core_cols))
-            used_slugs: set[str] = set()
-            for j, name in enumerate(names):
-                nm = str(name)
-                if " " not in nm:
-                    continue
-                base_slug = "ix_poly_" + _dim_feat_slug(nm.replace(" ", "_x_"))[:40]
-                slug = base_slug
-                u = 0
-                while slug in used_slugs:
-                    u += 1
-                    slug = f"{base_slug}_{u}"
-                used_slugs.add(slug)
-                df_master[slug] = Z[:, j].astype(np.float64)
-                created.append(slug)
-    except Exception:
-        pass
-
-    return created
 
 
 def forward_calendar_features(index: pd.DatetimeIndex, horizon: int) -> pd.DataFrame:
@@ -3656,8 +3173,6 @@ def build_daily_master(
             if show_progress:
                 print(f"Aviso: não integrei o formulário de previsão: {e}")
 
-    colunas_dim_extra = _inject_dim_features_and_funnel_interactions(df_master, dict_dfs)
-
     colunas_base = [
         "vol_leads",
         "vol_agend",
@@ -3668,20 +3183,6 @@ def build_daily_master(
     ]
     colunas_fb = [c for c in df_master.columns if c.startswith("fb_")]
     for col in colunas_base + colunas_fb:
-        s = df_master[col]
-        for lag in (1, 3, 7, 14, 30):
-            df_master[f"{col}_lag_{lag}"] = s.shift(lag)
-        df_master[f"{col}_ma_7d"] = s.shift(1).rolling(7, min_periods=1).mean()
-        df_master[f"{col}_ma_15d"] = s.shift(1).rolling(15, min_periods=1).mean()
-        df_master[f"{col}_ma_30d"] = s.shift(1).rolling(30, min_periods=1).mean()
-        df_master[f"{col}_std_15d"] = s.shift(1).rolling(15, min_periods=1).std()
-        df_master[f"{col}_momentum"] = df_master[f"{col}_ma_7d"] / (
-            df_master[f"{col}_ma_30d"] + 1e-5
-        )
-
-    for col in colunas_dim_extra:
-        if col not in df_master.columns:
-            continue
         s = df_master[col]
         for lag in (1, 3, 7, 14, 30):
             df_master[f"{col}_lag_{lag}"] = s.shift(lag)
@@ -5986,84 +5487,73 @@ def _formulario_nf_pair_cols(fn: pd.DataFrame) -> tuple[str | None, str | None]:
 
 
 def _formulario_map_columns(fn: pd.DataFrame) -> dict[str, Any]:
-    """
-    Colunas do Esboço após `normalize_header`: nomes canónicos em minúsculas,
-    sem acentos (ex.: «vendas facilitadas previstas», «data de referencia (...)»).
-    """
-    cols = set(fn.columns)
-
-    def _req(exact: str) -> str | None:
-        return exact if exact in cols else None
-
-    def _ref_col() -> str | None:
-        exact = "data de referencia (indicar sempre o sabado da semana)"
-        if exact in cols:
-            return exact
-        for c in fn.columns:
-            sc = str(c)
-            if sc.startswith("data de referencia"):
-                return sc
-        return find_column_any(
-            fn,
-            [
-                ["data", "referencia", "sabado"],
-                ["referencia", "sabado"],
-                ["data", "referencia"],
-            ],
-        )
-
     m: dict[str, Any] = {}
-    m["ref"] = _ref_col()
-    m["v_fp"] = _req("vendas facilitadas previstas")
-    m["v_fr"] = _req("vendas facilitadas reais")
-    m["v_np"] = _req("vendas normais previstas")
-    m["v_nr"] = _req("vendas normais reais")
-    m["q_fp"] = _req("qtd vendas facilitadas previstas")
-    m["q_fr"] = _req("qtd vendas facilitadas reais")
-    m["q_np"] = _req("qtd vendas normais previstas")
-    m["q_nr"] = _req("qtd vendas normais reais")
-    m["regiao"] = _req("regiao")
-    m["canal"] = _req("canal")
-    m["nf"] = _req("normal ou facilitada")
-    m["imobiliaria"] = _req("imobiliaria")
-    m["regional"] = _req("regional ou imob")
-    m["empreendimento"] = _req("empreendimento (previsto para ter venda)")
-    # Compatibilidade com gráficos antigos / agregações
-    m["q_fac_p"], m["q_fac_r"] = m["q_fp"], m["q_fr"]
-    m["q_norm_p"], m["q_norm_r"] = m["q_np"], m["q_nr"]
-    m["vgv_prev"] = m["v_fp"]
-    m["vgv_real"] = m["v_fr"]
-    m["vendas_prev"], m["vendas_real"] = m["v_np"], m["v_nr"]
-    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
+    m["ref"] = find_column_any(
+        fn,
+        [
+            ["data", "referencia", "sabado"],
+            ["referencia", "sabado"],
+            ["data", "referencia"],
+        ],
+    )
+    m["empreendimento"] = find_column_any(
+        fn,
+        [["empreendimento", "previsto"], ["empreendimento"], ["previsto", "ter", "venda"]],
+    )
+    m["regional"] = find_column_any(fn, [["regional", "imob"], ["regional"]])
+    m["canal"] = find_column(fn, ["canal"])
+    m["regiao"] = find_column(fn, ["regiao"])
+    m["imobiliaria"] = find_column(fn, ["imobiliaria"])
     m["gerente"] = find_column(fn, ["gerente"])
     m["erro"] = find_column(fn, ["erro", "previs"])
+    m["vendas_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if (
+            "vendas" in lc
+            and ("previs" in lc or "previst" in lc)
+            and "real" not in lc
+            and "qtd" not in lc
+            and "vgv" not in lc
+        ):
+            m["vendas_prev"] = c
+            break
+    m["vendas_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vendas" in lc and "real" in lc and "qtd" not in lc and "vgv" not in lc:
+            m["vendas_real"] = c
+            break
+    m["vgv_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and ("previs" in lc or "previst" in lc) and "real" not in lc:
+            m["vgv_prev"] = c
+            break
+    m["vgv_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and "real" in lc:
+            m["vgv_real"] = c
+            break
+    used_q: set[str] = set()
+    m["q_fac_p"] = _find_formulario_qtd_col(
+        fn, [["facilitadas", "previstas"], ["facilitada", "prevista"]], used=used_q
+    )
+    m["q_fac_r"] = _find_formulario_qtd_col(
+        fn,
+        [["facilitadas", "reais"], ["facilitadas", "real"], ["facilitada", "real"]],
+        used=used_q,
+    )
+    m["q_norm_p"] = _find_formulario_qtd_col(
+        fn, [["normais", "previstas"], ["normal", "prevista"]], used=used_q
+    )
+    m["q_norm_r"] = _find_formulario_qtd_col(
+        fn, [["normais", "reais"], ["normais", "real"], ["normal", "real"]], used=used_q
+    )
+    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
     m["visitas"] = find_column_any(fn, [["visitas", "totais", "esperadas"], ["visitas"]])
     return m
-
-
-def _formulario_colunas_obrigatorias_ok(mc: dict[str, Any]) -> tuple[bool, list[str]]:
-    faltam: list[str] = []
-    need = [
-        ("ref", "Data de referência (sábado)"),
-        ("v_fp", "Vendas Facilitadas Previstas"),
-        ("v_fr", "Vendas Facilitadas Reais"),
-        ("v_np", "Vendas Normais Previstas"),
-        ("v_nr", "Vendas Normais Reais"),
-        ("q_fp", "QTD Vendas Facilitadas Previstas"),
-        ("q_fr", "QTD Vendas Facilitadas Reais"),
-        ("q_np", "QTD Vendas Normais Previstas"),
-        ("q_nr", "QTD Vendas Normais Reais"),
-        ("regiao", "Região"),
-        ("canal", "Canal"),
-        ("nf", "Normal ou Facilitada"),
-        ("imobiliaria", "Imobiliária"),
-        ("regional", "Regional ou IMOB"),
-        ("empreendimento", "Empreendimento (Previsto para ter venda)"),
-    ]
-    for key, label in need:
-        if not mc.get(key):
-            faltam.append(label)
-    return (not faltam, faltam)
 
 
 def _formulario_canon_canal(x: Any) -> str:
@@ -6108,17 +5598,10 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 
 
 # --- Decisões automáticas (sem input do utilizador) ---
-# Meta ~2 min (build + treinos): PREVISAO_OPTUNA_* , PREVISAO_BENCHMARK_LITE , PREVISAO_BLEND_TOP_K .
-# Optuna: 0 = auto com teto (PREVISAO_OPTUNA_TRIALS_CAP); valor >0 fixa trials exatos.
-OPTUNA_TRIALS_AUTO = int(os.environ.get("PREVISAO_OPTUNA_TRIALS", "0"))
-# Teto de trials em modo auto (antes ~62–165; demasiado lento para 2 min).
-OPTUNA_TRIALS_CAP_AUTO = int(os.environ.get("PREVISAO_OPTUNA_TRIALS_CAP", "18"))
-# Segundos máximos por estudo Optuna (qtd ou VGV); 0 = sem limite de tempo.
-OPTUNA_TIMEOUT_PER_TARGET_SEC = float(os.environ.get("PREVISAO_OPTUNA_TIMEOUT_SEC", "40"))
-# TimeSeriesSplit no objetivo Optuna: menos folds acelera cada trial.
-OPTUNA_TSS_SPLITS_CAP = int(os.environ.get("PREVISAO_OPTUNA_SPLITS", "4"))
-# Top-K no super-ensemble (menor = mais rápido no fallback do blend).
-BLEND_TOP_K_FIXO = int(os.environ.get("PREVISAO_BLEND_TOP_K", "4"))
+# Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
+OPTUNA_TRIALS_AUTO = 0
+# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
+BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
@@ -7151,8 +6634,6 @@ def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
 def run_training_pipeline(
     dfs: dict[str, pd.DataFrame],
     custom_previsao: dict[str, Any] | None = None,
-    *,
-    horizontes: list[int] | None = None,
 ) -> tuple[
     dict[str, float],
     float,
@@ -7178,6 +6659,7 @@ def run_training_pipeline(
     ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
     conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
 
+    horizontes = [3, 7, 30]
     por_horizonte: dict[Any, dict[str, Any]] = {}
     best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
 
@@ -7212,12 +6694,11 @@ def run_training_pipeline(
     vals_ok = isinstance(custom_previsao, dict) and not range_mode and bool(cvals)
     have_custom = range_ok or vals_ok
     extra_custom = 2 if have_custom else 0
-    horizontes_run: list[int] = [] if have_custom else list(horizontes or [7])
     progress = st.progress(0, text="A preparar modelos…")
-    total_steps = len(horizontes_run) * 2 + extra_custom
+    total_steps = len(horizontes) * 2 + extra_custom
     step = 0
 
-    for h in horizontes_run:
+    for h in horizontes:
         Xq, yq = build_xy_for_horizon(df_master, "target_qtd", h)
         Xv, yv = build_xy_for_horizon(df_master, "target_valor", h)
 
@@ -7364,12 +6845,11 @@ def run_training_pipeline(
 
     daily_pack = _daily_pack_from_master(df_master)
     progress.progress(1.0, text="A gerar relatório…")
-    horizontes_relatorio = _por_h_chaves_horizonte(por_horizonte)
     html_out = render_dashboard(
         stats_base,
         ticket,
         conv,
-        horizontes_relatorio,
+        horizontes,
         por_horizonte,
         best_params_preview,
         out_path=None,
@@ -7437,16 +6917,24 @@ def _streamlit_carregar_dados_exploratorios() -> None:
 
 def _render_tab_formulario_previsao_humano() -> None:
     """Painéis a partir da planilha de respostas ao formulário (previsão vs real, filtros)."""
+    import plotly.colors as plc
     import plotly.graph_objects as go
 
     st.markdown(
         '<p class="pv-section-title">Formulário — previsão humana</p>',
         unsafe_allow_html=True,
     )
+    st.markdown(
+        "<div style='text-align:justify;color:#64748b;font-size:0.92rem;margin:0 auto 1rem auto;max-width:100%'>"
+        "Respostas ao <strong>Esboço — formulário</strong>: quantidades e VGV previstos versus realizados, por "
+        "<em>empreendimento</em>, <em>canal</em>, <em>regional</em> e <em>data de referência</em> (sábado). "
+        "Utilize <strong>Análises → Carregar dados</strong> ou <strong>Previsões → Gerar previsões</strong>, "
+        "ou o botão abaixo para sincronizar as planilhas.</div>",
+        unsafe_allow_html=True,
+    )
     if st.button(
         "Sincronizar planilhas (inclui formulário)",
         key="pv_form_reload",
-        type="primary",
         width="stretch",
     ):
         with st.spinner("A ler Google Sheets…"):
@@ -7467,229 +6955,595 @@ def _render_tab_formulario_previsao_humano() -> None:
 
     fn = normalize_dataframe_columns(df_raw.copy())
     mc = _formulario_map_columns(fn)
-    ok_cols, faltam = _formulario_colunas_obrigatorias_ok(mc)
-    if not ok_cols:
-        st.error(
-            "O cabeçalho do formulário não coincide com o **Esboço** esperado. "
-            "Ajuste os nomes das colunas na planilha (após normalização: minúsculas, sem acentos)."
-        )
-        st.markdown("**Colunas em falta:**\n- " + "\n- ".join(faltam))
-        return
 
     def _ref_series() -> pd.Series:
-        rc = mc.get("ref")
-        if not rc or rc not in fn.columns:
+        if not mc.get("ref") or mc["ref"] not in fn.columns:
             return pd.Series(pd.NaT, index=fn.index)
-        return pd.to_datetime(fn[rc], errors="coerce")
+        return pd.to_datetime(fn[mc["ref"]], errors="coerce")
 
     rs = _ref_series()
     fn["_ref_d"] = rs.dt.normalize()
 
-    ref_c = mc["ref"]
-    regiao_c = mc["regiao"]
-    canal_c = mc["canal"]
-    nf_c = mc["nf"]
-    imob_c = mc["imobiliaria"]
-    reg_c = mc["regional"]
-    emp_c = mc["empreendimento"]
+    emp_c = mc.get("empreendimento")
+    reg_c = mc.get("regional")
+    canal_c = mc.get("canal")
+    regiao_c = mc.get("regiao")
 
     st.markdown("##### Filtros")
-    r1a, r1b, r1c, r1d = st.columns(4)
-    with r1a:
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        emp_opts: list[str] = []
+        if emp_c and emp_c in fn.columns:
+            emp_opts = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
+        sel_emp = st.multiselect("Empreendimento", options=emp_opts, default=[], key="pv_ff_emp")
+    with f2:
         dlist = sorted({_ for _ in fn["_ref_d"].dropna().unique()})
         d_labels = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dlist]
-        sel_d = st.multiselect(
-            "Data de referência (sábado)",
-            options=d_labels,
-            default=[],
-            key="pv_ff_dt",
-        )
-    with r1b:
-        ro = sorted({str(x).strip() for x in fn[regiao_c].dropna().unique() if str(x).strip()})
-        sel_regiao = st.multiselect("Região", options=ro, default=[], key="pv_ff_regiao")
-    with r1c:
-        co = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
-        sel_canal = st.multiselect("Canal", options=co, default=[], key="pv_ff_canal")
-    with r1d:
-        no = sorted({str(x).strip() for x in fn[nf_c].dropna().unique() if str(x).strip()})
-        sel_nf = st.multiselect("Normal ou Facilitada", options=no, default=[], key="pv_ff_nf")
-    r2a, r2b, r2c = st.columns(3)
-    with r2a:
-        io = sorted({str(x).strip() for x in fn[imob_c].dropna().unique() if str(x).strip()})
-        sel_imob = st.multiselect("Imobiliária", options=io, default=[], key="pv_ff_imob")
-    with r2b:
-        rrg = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
-        sel_regional = st.multiselect("Regional ou IMOB", options=rrg, default=[], key="pv_ff_reg")
-    with r2c:
-        eo = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
-        sel_emp = st.multiselect(
-            "Empreendimento (Previsto para ter venda)",
-            options=eo,
-            default=[],
-            key="pv_ff_emp",
-        )
+        sel_d = st.multiselect("Data de referência (sábado)", options=d_labels, default=[], key="pv_ff_dt")
+    with f3:
+        canal_opts: list[str] = []
+        if canal_c and canal_c in fn.columns:
+            canal_opts = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
+        sel_canal = st.multiselect("Canal", options=canal_opts, default=[], key="pv_ff_canal")
+    with f4:
+        reg_opts: list[str] = []
+        if reg_c and reg_c in fn.columns:
+            reg_opts = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
+        sel_reg = st.multiselect("Regional ou IMOB", options=reg_opts, default=[], key="pv_ff_reg")
 
     dff = fn.copy()
+    if sel_emp and emp_c and emp_c in dff.columns:
+        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
     if sel_d:
         pick = {pd.Timestamp(s).normalize() for s in sel_d}
         dff = dff[dff["_ref_d"].isin(pick)]
-    if sel_regiao:
-        dff = dff[dff[regiao_c].astype(str).isin(sel_regiao)]
-    if sel_canal:
+    if sel_canal and canal_c and canal_c in dff.columns:
         dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
-    if sel_nf:
-        dff = dff[dff[nf_c].astype(str).isin(sel_nf)]
-    if sel_imob:
-        dff = dff[dff[imob_c].astype(str).isin(sel_imob)]
-    if sel_regional:
-        dff = dff[dff[reg_c].astype(str).isin(sel_regional)]
-    if sel_emp:
-        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
+    if sel_reg and reg_c and reg_c in dff.columns:
+        dff = dff[dff[reg_c].astype(str).isin(sel_reg)]
 
     if dff.empty:
         st.warning("Sem linhas após aplicar os filtros.")
         return
 
-    st.caption(f"**{len(dff):,}** linhas (após filtros).")
+    st.caption(f"**{len(dff):,}** linhas (após filtros) · **{dff.shape[1]}** colunas na base bruta.")
 
-    s_vfp = _formulario_num_series(dff, mc["v_fp"])
-    s_vfr = _formulario_num_series(dff, mc["v_fr"])
-    s_vnp = _formulario_num_series(dff, mc["v_np"])
-    s_vnr = _formulario_num_series(dff, mc["v_nr"])
-    s_qfp = _formulario_num_series(dff, mc["q_fp"])
-    s_qfr = _formulario_num_series(dff, mc["q_fr"])
-    s_qnp = _formulario_num_series(dff, mc["q_np"])
-    s_qnr = _formulario_num_series(dff, mc["q_nr"])
+    qfp, qfr = mc.get("q_fac_p"), mc.get("q_fac_r")
+    qnp, qnr = mc.get("q_norm_p"), mc.get("q_norm_r")
+    vgp, vgr = mc.get("vgv_prev"), mc.get("vgv_real")
+    vprev, vreal = mc.get("vendas_prev"), mc.get("vendas_real")
+    nf_p = mc.get("nf_prev")
 
-    st.markdown("##### Totais filtrados")
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        st.metric("Vendas Facilitadas Previstas", f"R$ {float(s_vfp.sum())/1e6:,.2f} mi")
-        st.metric("Vendas Facilitadas Reais", f"R$ {float(s_vfr.sum())/1e6:,.2f} mi")
-    with a2:
-        st.metric("Vendas Normais Previstas", f"R$ {float(s_vnp.sum())/1e6:,.2f} mi")
-        st.metric("Vendas Normais Reais", f"R$ {float(s_vnr.sum())/1e6:,.2f} mi")
-    with a3:
-        st.metric("QTD Facilitadas Previstas", f"{float(s_qfp.sum()):,.0f}")
-        st.metric("QTD Facilitadas Reais", f"{float(s_qfr.sum()):,.0f}")
-    with a4:
-        st.metric("QTD Normais Previstas", f"{float(s_qnp.sum()):,.0f}")
-        st.metric("QTD Normais Reais", f"{float(s_qnr.sum()):,.0f}")
+    s_qfp = _formulario_num_series(dff, qfp)
+    s_qfr = _formulario_num_series(dff, qfr)
+    s_qnp = _formulario_num_series(dff, qnp)
+    s_qnr = _formulario_num_series(dff, qnr)
+    s_vgp = _formulario_num_series(dff, vgp)
+    s_vgr = _formulario_num_series(dff, vgr)
+
+    tot_fac_p = float(s_qfp.sum())
+    tot_fac_r = float(s_qfr.sum())
+    tot_norm_p = float(s_qnp.sum())
+    tot_norm_r = float(s_qnr.sum())
+    tot_vgv_p = float(s_vgp.sum())
+    tot_vgv_r = float(s_vgr.sum())
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("QTD facilitadas — previstas", f"{tot_fac_p:,.0f}")
+    with m2:
+        st.metric("QTD facilitadas — reais", f"{tot_fac_r:,.0f}")
+    with m3:
+        st.metric("QTD normais — previstas", f"{tot_norm_p:,.0f}")
+    with m4:
+        st.metric("QTD normais — reais", f"{tot_norm_r:,.0f}")
+    with m5:
+        st.metric("VGV previsto (soma)", f"R$ {tot_vgv_p/1e6:.2f} mi")
+    with m6:
+        st.metric("VGV real (soma)", f"R$ {tot_vgv_r/1e6:.2f} mi")
+
+    if mc.get("erro") and mc["erro"] in dff.columns:
+        err = pd.to_numeric(dff[mc["erro"]], errors="coerce").dropna()
+        if len(err):
+            e1, e2 = st.columns(2)
+            with e1:
+                st.metric("Erro de previsão — média |·|", f"{float(err.abs().mean()):,.2f}")
+            with e2:
+                st.metric("Erro de previsão — mediana", f"{float(err.median()):,.2f}")
 
     _ipc = {"displayModeBar": True, "displaylogo": False}
+    pal = plc.qualitative.Bold + plc.qualitative.Pastel1 + plc.qualitative.Dark24
 
-    metric_specs: list[tuple[str, pd.Series, bool]] = [
-        ("Vendas Facilitadas Previstas (R$)", s_vfp, True),
-        ("Vendas Facilitadas Reais (R$)", s_vfr, True),
-        ("Vendas Normais Previstas (R$)", s_vnp, True),
-        ("Vendas Normais Reais (R$)", s_vnr, True),
-        ("QTD Vendas Facilitadas Previstas", s_qfp, False),
-        ("QTD Vendas Facilitadas Reais", s_qfr, False),
-        ("QTD Vendas Normais Previstas", s_qnp, False),
-        ("QTD Vendas Normais Reais", s_qnr, False),
-    ]
-
-    dim_specs: list[tuple[str, str]] = [
-        ("Data de referência (sábado)", "__ref_label__"),
-        ("Região", regiao_c),
-        ("Canal", canal_c),
-        ("Normal ou Facilitada", nf_c),
-        ("Imobiliária", imob_c),
-        ("Regional ou IMOB", reg_c),
-        ("Empreendimento (Previsto para ter venda)", emp_c),
-    ]
-
-    def _x_labels_for_dim(dim_key: str) -> pd.Series:
-        if dim_key == "__ref_label__":
-            return dff["_ref_d"].apply(
-                lambda t: pd.Timestamp(t).strftime("%Y-%m-%d") if pd.notna(t) else "(vazio)"
-            )
-        return dff[dim_key].map(lambda x: str(x).strip() if pd.notna(x) and str(x).strip() else "(vazio)")
-
-    def _bar_agg(title: str, xlabs: pd.Series, yser: pd.Series, *, money: bool) -> go.Figure | None:
-        sub = pd.DataFrame({"_x": xlabs, "_y": yser})
-        g = sub.groupby("_x", as_index=False)["_y"].sum().sort_values("_y", ascending=False)
-        if g.empty or not np.isfinite(g["_y"].sum()) or float(g["_y"].sum()) == 0.0:
+    def _stack_xy_color(
+        title: str,
+        xcol: str | None,
+        ccol: str | None,
+        yser: pd.Series,
+        *,
+        height: int = 400,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns or not ccol or ccol not in dff.columns:
             return None
-        xv = g["_x"].tolist()
-        yv = g["_y"].tolist()
-        if money:
-            ydisp = [float(v) / 1e6 for v in yv]
-            txt = [f"{v:.2f} mi" if v > 0 else "" for v in ydisp]
-            ylab = "R$ (mi)"
-        else:
-            ydisp = [float(v) for v in yv]
-            txt = [f"{v:,.0f}" if v > 0 else "" for v in ydisp]
-            ylab = "Quantidade"
-        fig = go.Figure(
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), ccol: dff[ccol].astype(str), "_y": yser})
+        sub = sub.groupby([xcol, ccol], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if sub.empty:
+            return None
+        xcats = sorted(sub[xcol].unique().tolist())
+        colors = sorted(sub[ccol].unique().tolist())
+        fig = go.Figure()
+        for i, lab in enumerate(colors):
+            chunk = sub[sub[ccol] == lab]
+            yv = chunk.set_index(xcol)["_y"].reindex(xcats).fillna(0).values
+            fig.add_trace(
+                go.Bar(
+                    name=str(lab)[:46],
+                    x=xcats,
+                    y=yv,
+                    marker_color=pal[i % len(pal)],
+                    text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                    textposition="inside",
+                    insidetextfont=dict(color="white", size=10),
+                )
+            )
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="stack",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(240, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
+        )
+        return fig
+
+    def _group_prev_real(
+        title: str,
+        xcol: str | None,
+        s_pre: pd.Series,
+        s_re: pd.Series,
+        lab_p: str,
+        lab_r: str,
+        *,
+        height: int = 380,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns:
+            return None
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), "_p": s_pre, "_r": s_re})
+        g = sub.groupby(xcol, as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
+        if g.empty:
+            return None
+        g = g.sort_values("_p", ascending=False)
+        xcats = g[xcol].tolist()
+        fig = go.Figure()
+        fig.add_trace(
             go.Bar(
-                x=xv,
-                y=ydisp,
+                name=lab_p,
+                x=xcats,
+                y=g["_p"],
                 marker_color=PLOT_AZUL,
-                text=txt,
+                text=[f"{v:.0f}" for v in g["_p"]],
                 textposition="outside",
             )
         )
-        lo = _plotly_layout_direcional(
-            title=title,
-            height=320,
-            xaxis_tickangle=-38,
-            yaxis_title=ylab,
-            margin=dict(t=72, l=52, r=36, b=max(100, min(220, 24 + 6 * max((len(str(x)) for x in xv), default=0)))),
+        fig.add_trace(
+            go.Bar(
+                name=lab_r,
+                x=xcats,
+                y=g["_r"],
+                marker_color=PLOT_ACCENT,
+                text=[f"{v:.0f}" for v in g["_r"]],
+                textposition="outside",
+            )
         )
-        fig.update_layout(**lo)
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="group",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
+        )
         return fig
 
-    st.markdown("##### Análises por dimensão")
-    st.caption(
-        "Para cada dimensão do formulário, somas da métrica escolhida ao longo das linhas filtradas "
-        "(uma barra por valor distinto da dimensão)."
-    )
-    for dim_title, dim_col in dim_specs:
-        with st.expander(f"Por **{dim_title}**", expanded=False):
-            if dim_col == "__ref_label__":
-                xlabs = _x_labels_for_dim("__ref_label__")
-            else:
-                if dim_col not in dff.columns:
-                    st.caption("—")
-                    continue
-                xlabs = _x_labels_for_dim(dim_col)
-                if dim_col == canal_c:
-                    xlabs = dff[canal_c].map(_formulario_canon_canal).astype(str)
+    st.markdown("##### Previsão por regional — empilhado (QTD)")
+    st.caption("Cada cor é um **empreendimento**; o eixo X é **Regional ou IMOB**.")
+    ra, rb = st.columns(2)
+    with ra:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas facilitadas (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qfp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with rb:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas normais (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
 
-            for i in range(0, len(metric_specs), 2):
-                c_left, c_right = st.columns(2)
-                for j, col_slot in enumerate((c_left, c_right)):
-                    idx = i + j
-                    if idx >= len(metric_specs):
-                        break
-                    mname, mser, money = metric_specs[idx]
-                    fig = _bar_agg(f"{mname} · {dim_title}", xlabs, mser, money=money)
-                    with col_slot:
-                        if fig:
-                            st.plotly_chart(fig, width="stretch", config=_ipc)
-                        else:
-                            st.caption("—")
+    st.markdown("##### Previsão por produto — canal (QTD e VGV)")
+    st.caption("Eixo X: **empreendimento**; empilhamento por **canal** (DV / IMOB).")
+    if canal_c and emp_c:
+        sc = dff[canal_c].map(_formulario_canon_canal)
+        ca, cb = st.columns(2)
+        with ca:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_qnp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=10),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — Normais (QTD)",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        with cb:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_vgp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    lbl_txt = [f"{float(v)/1e3:.1f} mil" if v > 0 else "" for v in yv]
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=lbl_txt,
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=9),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — VGV",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        yaxis_title="R$",
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+    else:
+        st.caption("Colunas de empreendimento ou canal ausentes — gráficos por canal omitidos.")
+
+    st.markdown("##### Previsão por produto — empilhado por regional (QTD)")
+    st.caption("Eixo X: **empreendimento**; cores: **Regional ou IMOB**.")
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        fg = _stack_xy_color(
+            "Previsão por produto — Facilitadas",
+            emp_c,
+            reg_c,
+            s_qfp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with pc2:
+        fg = _stack_xy_color(
+            "Previsão por produto — Normais",
+            emp_c,
+            reg_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    if nf_p and nf_p in dff.columns and reg_c and reg_c in dff.columns:
+        st.markdown("##### Previsão agregada por tipo (Normal / Facilitada / …)")
+        vp = (
+            _formulario_num_series(dff, vprev)
+            if vprev
+            else pd.Series(1.0, index=dff.index, dtype=float)
+        )
+        sub = pd.DataFrame(
+            {
+                reg_c: dff[reg_c].astype(str),
+                nf_p: dff[nf_p].astype(str).replace("nan", "(vazio)"),
+                "_y": vp,
+            }
+        )
+        sub = sub.groupby([reg_c, nf_p], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if not sub.empty:
+            xcats = sorted(sub[reg_c].unique().tolist())
+            fig = go.Figure()
+            for i, lab in enumerate(sorted(sub[nf_p].unique().tolist())):
+                chunk = sub[sub[nf_p] == lab]
+                yv = chunk.set_index(reg_c)["_y"].reindex(xcats).fillna(0).values
+                fig.add_trace(
+                    go.Bar(
+                        name=str(lab)[:40],
+                        x=xcats,
+                        y=yv,
+                        marker_color=pal[i % len(pal)],
+                        text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                        textposition="outside",
+                    )
+                )
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    title="Previsão — soma de «Vendas Previsão» por regional e tipo",
+                    height=400,
+                    barmode="stack",
+                    legend=_plotly_legend_bottom(),
+                    xaxis_tickangle=-28,
+                    margin=dict(t=100, l=52, r=36, b=138),
+                )
+            )
+            st.plotly_chart(fig, width="stretch", config=_ipc)
+        else:
+            st.caption("Sem dados para o gráfico de tipos.")
+
+    st.markdown("##### Previsão × Real — por **Regional ou IMOB**")
+    gx1, gx2 = st.columns(2)
+    with gx1:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Facilitadas (QTD)",
+            reg_c,
+            s_qfp,
+            s_qfr,
+            "QTD facilitadas previstas",
+            "QTD facilitadas reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with gx2:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Normais (QTD)",
+            reg_c,
+            s_qnp,
+            s_qnr,
+            "QTD normais previstas",
+            "QTD normais reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    st.markdown("##### Previsão × Real — por **empreendimento** (top por volume previsto)")
+    if emp_c and emp_c in dff.columns:
+        sub = pd.DataFrame(
+            {
+                emp_c: dff[emp_c].astype(str),
+                "_p": s_qnp + s_qfp,
+                "_pf": s_qfp,
+                "_pr": s_qfr,
+                "_qn": s_qnp,
+                "_qr": s_qnr,
+            }
+        )
+        g = sub.groupby(emp_c, as_index=False).agg(
+            _p=("_p", "sum"),
+            _pf=("_pf", "sum"),
+            _pr=("_pr", "sum"),
+            _qn=("_qn", "sum"),
+            _qr=("_qr", "sum"),
+        )
+        g = g.sort_values("_p", ascending=False).head(22)
+        if not g.empty:
+            xcats = g[emp_c].tolist()
+
+            def _pair_fig(title: str, yp: str, yr: str, npref: str, nrref: str) -> go.Figure:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        name=npref,
+                        x=xcats,
+                        y=g[yp],
+                        marker_color=PLOT_AZUL,
+                        text=[f"{v:.0f}" for v in g[yp]],
+                        textposition="outside",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        name=nrref,
+                        x=xcats,
+                        y=g[yr],
+                        marker_color=PLOT_ACCENT,
+                        text=[f"{v:.0f}" for v in g[yr]],
+                        textposition="outside",
+                    )
+                )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title=title,
+                        height=440,
+                        barmode="group",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-40,
+                        margin=dict(t=100, l=52, r=36, b=188),
+                    )
+                )
+                return fig
+
+            gy1, gy2 = st.columns(2)
+            with gy1:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Facilitadas — previstas × reais",
+                        "_pf",
+                        "_pr",
+                        "QTD facilitadas previstas",
+                        "QTD facilitadas reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+            with gy2:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Normais — previstas × reais",
+                        "_qn",
+                        "_qr",
+                        "QTD normais previstas",
+                        "QTD normais reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+    else:
+        st.caption("—")
+
+    st.markdown("##### Tabelas resumo — **Região** × canal (DV / IMOB)")
+    if regiao_c and regiao_c in dff.columns and canal_c and canal_c in dff.columns:
+        dpx = dff[[regiao_c, canal_c]].copy()
+        dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
+        dpx["_q_prev"] = s_qnp + s_qfp
+        dpx["_q_real"] = s_qnr + s_qfr
+        pv = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_prev",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pr = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_real",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pv.columns = [str(c) if c != regiao_c else "Região" for c in pv.columns]
+        pr.columns = [str(c) if c != regiao_c else "Região" for c in pr.columns]
+
+        def _add_total_row(tab: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+            if tab.empty:
+                return tab
+            row = {tab.columns[0]: "Total geral"}
+            for c in num_cols:
+                if c in tab.columns:
+                    row[c] = pd.to_numeric(tab[c], errors="coerce").fillna(0).sum()
+            return pd.concat([tab, pd.DataFrame([row])], ignore_index=True)
+
+        num_p = [c for c in pv.columns if c != "Região"]
+        num_r = [c for c in pr.columns if c != "Região"]
+        st.caption("Totais de **QTD** (normais + facilitadas) por região e canal.")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown("**Previsão (QTD)**")
+            st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
+        with t2:
+            st.markdown("**Realizado (QTD)**")
+            st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
+
+        if vgp and vgr:
+            dpx["_v_prev"] = s_vgp
+            dpx["_v_real"] = s_vgr
+            pv2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_prev",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pr2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_real",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pv2.columns = [str(c) if c != regiao_c else "Região" for c in pv2.columns]
+            pr2.columns = [str(c) if c != regiao_c else "Região" for c in pr2.columns]
+            st.markdown("**VGV por região e canal (R$)**")
+            t3, t4 = st.columns(2)
+            with t3:
+                st.caption("Previsão")
+                n3 = [c for c in pv2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pv2, n3), width="stretch", hide_index=True)
+            with t4:
+                st.caption("Realizado")
+                n4 = [c for c in pr2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pr2, n4), width="stretch", hide_index=True)
+    else:
+        st.caption("Defina colunas **Região** e **Canal** na planilha para ver as tabelas cruzadas.")
 
     with st.expander("Pré-visualização dos dados filtrados (primeiras linhas)", expanded=False):
         show_cols = [
             c
             for c in [
-                ref_c,
-                regiao_c,
-                canal_c,
-                nf_c,
-                imob_c,
-                reg_c,
+                mc.get("ref"),
                 emp_c,
-                mc["v_fp"],
-                mc["v_fr"],
-                mc["v_np"],
-                mc["v_nr"],
-                mc["q_fp"],
-                mc["q_fr"],
-                mc["q_np"],
-                mc["q_nr"],
+                reg_c,
+                canal_c,
+                regiao_c,
+                qfp,
+                qfr,
+                qnp,
+                qnr,
+                vgp,
+                vgr,
+                vprev,
+                vreal,
+                mc.get("erro"),
             ]
             if c and c in dff.columns
         ]
@@ -7726,16 +7580,15 @@ def _render_tab_introducao() -> None:
         "<strong>X</strong> é vetorial, ambos indexados por <em>t</em>. Ademais, cada componente de <strong>X</strong> "
         "deve depender apenas do passado observado até <em>t</em>, sob pena de enviesar a validação fora da amostra."
     )
-    _hz_ui = ", ".join(str(x) for x in HORIZONTES_FIXOS_UI)
     _ix(
-        f"<strong>Horizonte fixo H.</strong> Na aba <strong>Previsões</strong>, escolhe-se <strong>um</strong> prazo "
-        f"<strong>H</strong> em dias (opções típicas: {_hz_ui}). Para cada <em>t</em>, <strong>Y</strong> define-se como a soma de vendas "
+        "<strong>Horizonte fixo H ∈ {3, 7, 30}.</strong> Para cada <em>t</em>, <strong>Y</strong> define-se como a soma de vendas "
         "(em quantidade ou valor) nos <strong>H</strong> primeiros dias da <em>série</em> imediatamente posteriores a <em>t</em>, "
-        "considerando apenas os dias efetivamente presentes no índice temporal. <strong>Não</strong> se treinam vários H em simultâneo."
+        "considerando apenas os dias efetivamente presentes no índice temporal."
     )
     _ix(
-        "<strong>Intervalo [d₁, d₂].</strong> Na mesma aba, pode optar-se por treinar <strong>só</strong> um alvo definido pela soma "
-        "no calendário entre duas datas; nesse modo, não corre o modelo de horizonte fixo H."
+        "<strong>Intervalo [d₁, d₂].</strong> Na aba <strong>Previsões</strong>, quando indicadas duas datas, "
+        "define-se um alvo adicional correspondente à soma no calendário entre esses limites, complementando, portanto, "
+        "os horizontes fixos H ∈ {3, 7, 30}."
     )
     _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
     _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
@@ -8377,18 +8230,17 @@ def _render_streamlit_ml_feature_importance(
     """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
     import plotly.graph_objects as go
 
-    _hz_imp = _por_h_chaves_horizonte(por_h)
     _tem_imp = any(
         (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
         or (por_h.get(h) or {}).get("valor", {}).get("importance_names")
-        for h in _hz_imp
+        for h in (3, 7, 30)
     )
     if _tem_imp:
         st.markdown(
             '<p class="pv-section-title">Importância de features (modelo operacional por horizonte)</p>',
             unsafe_allow_html=True,
         )
-        for h in _hz_imp:
+        for h in (3, 7, 30):
             sub = por_h.get(h) or {}
             c1, c2 = st.columns(2)
             with c1:
@@ -8579,11 +8431,11 @@ def _render_streamlit_tab_analises(
     _xr_f = _plotly_xaxis_range_from_dates(dates)
     if _xr_f:
         _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
-    _lo_f = {
+    fig_f.update_layout(
         **_lo_f,
-        "xaxis_title": "Eixo X — data",
-        "yaxis_title": "Eixo Y₁ — contagens do funil (empilhadas, / dia)",
-        "yaxis2": dict(
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
+        yaxis2=dict(
             overlaying="y",
             side="right",
             title=dict(
@@ -8593,7 +8445,7 @@ def _render_streamlit_tab_analises(
             showgrid=False,
             tickfont=dict(size=11),
         ),
-        "yaxis3": dict(
+        yaxis3=dict(
             anchor="free",
             overlaying="y",
             side="right",
@@ -8605,8 +8457,7 @@ def _render_streamlit_tab_analises(
             showgrid=False,
             tickfont=dict(size=11),
         ),
-    }
-    fig_f.update_layout(_lo_f)
+    )
     st.plotly_chart(fig_f, width="stretch", config=_pc)
     _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
 
@@ -8640,7 +8491,7 @@ def _render_streamlit_tab_analises(
     _xr_roll = _plotly_xaxis_range_from_dates(dates)
     if _xr_roll:
         _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
-    fig_roll.update_layout(_lo_roll)
+    fig_roll.update_layout(**_lo_roll)
     st.plotly_chart(fig_roll, width="stretch", config=_pc)
     _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
 
@@ -8825,14 +8676,15 @@ def _render_streamlit_tab_analises(
                             hovertemplate=htempl,
                         )
                     )
-                    _lo_pair = _plotly_layout_direcional(
-                        title=f"Dispersão: {xlab} × {ylab}",
-                        height=440,
-                        xaxis_title=f"Eixo X — {xlab}",
-                        yaxis_title=f"Eixo Y — {ylab}",
-                        margin=dict(t=56, l=56, r=48, b=100),
+                    fig_pair.update_layout(
+                        **_plotly_layout_direcional(
+                            title=f"Dispersão: {xlab} × {ylab}",
+                            height=440,
+                            xaxis_title=f"Eixo X — {xlab}",
+                            yaxis_title=f"Eixo Y — {ylab}",
+                            margin=dict(t=56, l=56, r=48, b=100),
+                        ),
                     )
-                    fig_pair.update_layout(_lo_pair)
                     st.plotly_chart(fig_pair, width="stretch", config=_pc)
                     _txt_r = (
                         f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
@@ -8872,7 +8724,7 @@ def _render_streamlit_tab_analises(
                     line=dict(width=2),
                 )
             )
-        _lo_m_base = _plotly_layout_direcional(
+        _lo_m = _plotly_layout_direcional(
             title="Indicadores macro (z-score por série)",
             height=400,
             xaxis_title="Eixo X — data",
@@ -8880,9 +8732,10 @@ def _render_streamlit_tab_analises(
             legend=_plotly_legend_bottom(),
             margin=dict(t=100, l=56, r=52, b=112),
         )
-        _xr_m = _plotly_xaxis_range_from_dates(dates)
-        _xax_m = {**_lo_m_base["xaxis"], **({"range": _xr_m} if _xr_m else {})}
-        fig_m.update_layout(**{**_lo_m_base, "xaxis": _xax_m})
+    _xr_m = _plotly_xaxis_range_from_dates(dates)
+        if _xr_m:
+            _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
+        fig_m.update_layout(**_lo_m)
         st.plotly_chart(fig_m, width="stretch", config=_pc)
         _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
 
@@ -8915,8 +8768,7 @@ def _render_streamlit_tab_apendice(
     random_seed: int,
     daily: dict[str, Any],
 ) -> None:
-    int_hs = _por_h_chaves_horizonte(por_h)
-    hz_txt = ", ".join(str(x) for x in int_hs) if int_hs else "— (treine com um horizonte na aba Previsões)"
+    hz_txt = ", ".join(str(x) for x in (3, 7, 30))
     modo = (
         "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
         "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
@@ -8929,16 +8781,15 @@ def _render_streamlit_tab_apendice(
         '<p class="pv-section-title">Apêndice</p>',
         unsafe_allow_html=True,
     )
-    _tab_names = ["Metodologia"] + [f"H = {h} dias" for h in int_hs] + ["Personalizado"]
-    _tabs = st.tabs(_tab_names)
-    tab_met = _tabs[0]
-    tab_cust = _tabs[-1]
+    tab_met, tab3, tab7, tab30, tab_cust = st.tabs(
+        ["Metodologia", "H = 3 dias", "H = 7 dias", "H = 30 dias", "Personalizado"]
+    )
     with tab_met:
         st.markdown(
             f"""
 #### Resumo
 
-- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t* (nesta execução: **H** ∈ {{{hz_txt}}}); o vetor *X* incorpora apenas informação até *t*. Na aba **Previsões**, pode optar-se por **intervalo personalizado** em vez de H fixo.
+- **Alvo:** soma de vendas (qtd ou VGV) nos **H** dias imediatamente seguintes a *t*, com *H* ∈ {{{hz_txt}}}; o vetor *X* incorpora apenas informação até *t*. Além disso, na aba **Previsões**, um intervalo entre datas de início e fim define um alvo complementar.
 - **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia.
 - **Validação:** {modo}
 - **Optuna:** algoritmo TPE, **TimeSeriesSplit** e **MedianPruner**; a função objetivo penaliza a variância entre *folds*, promovendo estabilidade. Semente: **{random_seed}**.
@@ -8970,9 +8821,12 @@ O relatório HTML exportável na aba **Previsões** reúne, entre outros element
         st.markdown("**Hiperparâmetros LightGBM (VGV)**")
         st.json(bp.get("valor") or {})
 
-    for _ti, _h in enumerate(int_hs):
-        with _tabs[_ti + 1]:
-            _ap_horizon_block(_h)
+    with tab3:
+        _ap_horizon_block(3)
+    with tab7:
+        _ap_horizon_block(7)
+    with tab30:
+        _ap_horizon_block(30)
 
     with tab_cust:
         bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
@@ -9331,7 +9185,7 @@ def _render_streamlit_dossie_ml(
             "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
         )
         rows_m = []
-        for h in _por_h_chaves_horizonte(por_h):
+        for h in (3, 7, 30):
             sub = por_h.get(h) or {}
             for alvo, nome in (("qtd", "Quantidade"), ("valor", "VGV")):
                 m = (sub.get(alvo) or {}).get("metrics_test") or {}
@@ -9419,7 +9273,7 @@ def main() -> None:
     st.markdown(
         '<div class="pv-hero-block">'
         '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
-        '<p class="pv-hero-sub">Consolidação da matriz diária, modelo para um prazo H à sua escolha (ou intervalo personalizado) e exportação de relatório HTML.</p>'
+        '<p class="pv-hero-sub">Consolidação da matriz diária, modelos nos horizontes 3, 7 e 30 dias e exportação de relatório HTML.</p>'
         "</div>",
         unsafe_allow_html=True,
     )
@@ -9449,85 +9303,54 @@ def main() -> None:
         )
         st.markdown(
             "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
-            "Escolha <strong>um</strong> modo: <em>prazo fixo H</em> (treina um único modelo para os próximos <strong>H</strong> dias na série) "
-            "ou <em>intervalo entre datas</em> (treina só o alvo definido por esse calendário). Os dois modos não se combinam na mesma execução.</div>",
+            "Por padrão, estimam-se sempre os horizontes de <strong>3, 7 e 30</strong> dias. Adicionalmente, caso indique "
+            "um intervalo opcional nas datas abaixo, treina-se um par de modelos cuja soma-alvo corresponde ao calendário entre essas datas.</div>",
             unsafe_allow_html=True,
         )
-        modo_alvo = st.radio(
-            "Modo de alvo",
-            ["Horizonte fixo H (dias)", "Intervalo entre duas datas"],
-            horizontal=True,
-            key="pv_modo_alvo",
-        )
-        h_escolhido = 7
-        if modo_alvo.startswith("Horizonte"):
-            h_escolhido = int(
-                st.selectbox(
-                    "Prazo H (próximos H dias na série temporal)",
-                    options=list(HORIZONTES_FIXOS_UI),
-                    index=list(HORIZONTES_FIXOS_UI).index(7) if 7 in HORIZONTES_FIXOS_UI else 0,
-                    key="pv_horizonte_h",
-                )
-            )
-            st.caption(
-                "No modo horizonte fixo, as datas abaixo **não** entram no treino (deixe-as vazias ou ignore-as)."
-            )
         ic1, ic2 = st.columns(2)
         with ic1:
             d_ini = st.date_input(
-                "Dia inicial do intervalo"
-                + (" (só modo intervalo)" if modo_alvo.startswith("Intervalo") else " (ignorado no modo H)"),
+                "Dia inicial do intervalo (opcional)",
                 value=None,
                 key="pv_interval_start",
             )
         with ic2:
             d_fim = st.date_input(
-                "Dia final do intervalo"
-                + (" (só modo intervalo)" if modo_alvo.startswith("Intervalo") else " (ignorado no modo H)"),
+                "Dia final do intervalo (opcional)",
                 value=None,
                 key="pv_interval_end",
             )
-        if modo_alvo.startswith("Intervalo"):
-            if d_ini is not None and d_fim is not None:
-                a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
-                st.info(
-                    f"Será treinado o alvo do calendário **{a.isoformat()}** → **{b.isoformat()}** (sem modelo H fixo nesta execução)."
-                )
-            elif d_ini is None and d_fim is None:
-                st.warning("Indique **início e fim** do intervalo para este modo, ou mude para horizonte fixo H.")
-            else:
-                st.warning(
-                    "Indique **ambas** as datas (início e fim) ou deixe **as duas** vazias e escolha o modo H."
-                )
-        elif d_ini is not None or d_fim is not None:
-            st.info("Modo **horizonte fixo**: as datas preenchidas acima **não** serão usadas nesta execução.")
+        if d_ini is not None and d_fim is not None:
+            a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+            st.info(
+                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes fixos."
+            )
+        elif d_ini is None and d_fim is None:
+            pass
+        else:
+            st.warning(
+                "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
+            )
 
         run_btn = st.button("Gerar previsões", type="primary", width="stretch", key="pv_gerar")
 
         if run_btn:
-            usar_intervalo = modo_alvo.startswith("Intervalo")
-            if usar_intervalo and (d_ini is None or d_fim is None):
-                st.error("No modo intervalo, são obrigatórias **duas** datas (início e fim).")
-            elif not usar_intervalo and ((d_ini is None) ^ (d_fim is None)):
-                st.warning(
-                    "Só uma data está preenchida; no modo horizonte fixo isso é ignorado nesta execução."
-                )
-            if not (usar_intervalo and (d_ini is None or d_fim is None)):
+            if (d_ini is None) ^ (d_fim is None):
+                st.error("Intervalo incompleto: são necessárias duas datas válidas ou nenhuma (deixe ambos os campos vazios).")
+            else:
                 with st.spinner("A carregar e analisar as planilhas…"):
                     dfs, sheet_metas, used_sa = build_data_bundle()
                 st.session_state["sheet_metas"] = sheet_metas
                 st.session_state["used_service_account"] = used_sa
                 try:
                     custom_previsao = None
-                    horizontes_arg: list[int] | None = [h_escolhido]
-                    if usar_intervalo and d_ini is not None and d_fim is not None:
+                    if d_ini is not None and d_fim is not None:
                         a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
                         custom_previsao = {
                             "mode": "range",
                             "date_start": a.isoformat(),
                             "date_end": b.isoformat(),
                         }
-                        horizontes_arg = None
                     with st.spinner("A treinar modelos e gerar o relatório…"):
                         (
                             stats_base,
@@ -9539,11 +9362,7 @@ def main() -> None:
                             daily_pack,
                             dossie_ml,
                             por_custom,
-                        ) = run_training_pipeline(
-                            dfs,
-                            custom_previsao=custom_previsao,
-                            horizontes=horizontes_arg,
-                        )
+                        ) = run_training_pipeline(dfs, custom_previsao=custom_previsao)
                     st.session_state.resultado = {
                         "stats_base": stats_base,
                         "ticket": ticket,
@@ -9626,10 +9445,9 @@ def main() -> None:
             )
             rows = []
             lbl = "In-sample" if full_train else "Holdout 30%"
-            for h in _por_h_chaves_horizonte(por_h):
-                sub_h = por_h.get(h) or {}
-                q = sub_h.get("qtd") or {}
-                v = sub_h.get("valor") or {}
+            for h in (3, 7, 30):
+                q = por_h[h]["qtd"]
+                v = por_h[h]["valor"]
                 acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
                 acc_v = v.get("metrics_test", {}).get("Acc_dir_mediana")
                 rows.append(
@@ -9674,7 +9492,7 @@ def main() -> None:
                 )
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             acc_warn = False
-            for h in _por_h_chaves_horizonte(por_h):
+            for h in (3, 7, 30):
                 for part in ("qtd", "valor"):
                     m = (por_h.get(h) or {}).get(part, {}).get("metrics_test") or {}
                     a = m.get("Acc_dir_mediana")
