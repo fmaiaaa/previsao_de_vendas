@@ -823,9 +823,11 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import (
     ExtraTreesRegressor,
+    GradientBoostingRegressor,
     HistGradientBoostingRegressor,
     RandomForestRegressor,
     StackingRegressor,
+    VotingRegressor,
 )
 from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.neighbors import KNeighborsRegressor
@@ -1517,80 +1519,58 @@ def _score_val_mae(
 
 def _collect_candidate_specs(
     target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
-) -> list[tuple[str, Pipeline, bool]]:
-    """Nome, pipeline (template), usar sample_weight recency."""
-    out: list[tuple[str, Pipeline, bool]] = []
-    long_h = int(horizon) >= 21
+) -> list[tuple[str, Any, bool]]:
+    """Candidatos alinhados a prevhtml.py: XGBoost, RF, GBR, Ridge e VotingRegressor."""
+    # Mesma assinatura do pipeline; Optuna/LGBM não alimentam mais estes modelos (hiperparâmetros fixos).
+    _ = (target_name, best_params, horizon)
 
-    out.append(("Ridge", build_ridge_pipe(rs), False))
-    out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
-    out.append(("RandomForest", build_random_forest_pipe(rs, horizon), False))
+    out: list[tuple[str, Any, bool]] = []
 
-    if LGBMRegressor is not None:
-        out.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
-        out.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
-        out.append(("LGBM+q0.78", build_lgbm_quantile_pipe(best_params, 0.78, rs), True))
-        if long_h:
-            out.append(
-                ("LGBM+q0.85", build_lgbm_quantile_pipe(best_params, 0.85, rs), True)
-            )
-        if target_name == "valor":
-            out.append(("LGBM+q0.82", build_lgbm_quantile_pipe(best_params, 0.82, rs), True))
-            if long_h:
-                out.append(
-                    ("LGBM+q0.90", build_lgbm_quantile_pipe(best_params, 0.90, rs), True)
-                )
-            out.append(("LGBM+log1p", build_lgbm_only_pipe(best_params, True, rs), True))
-
-    out.append(("TS-linear", build_ts_linear_bridge_pipe(), False))
-    if LGBMRegressor is not None:
+    if XGBRegressor is not None:
         out.append(
             (
-                "Med+High-LGBM",
-                build_median_quantile_blend_pipe(best_params, rs, target_name, horizon),
+                "XGBoost",
+                XGBRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=rs,
+                ),
                 False,
             )
         )
 
-    out.append(("HGB", build_hgb_pipe(rs, target_name), False))
-
-    xgbp = build_xgb_only_pipe(best_params, False, rs, horizon)
-    if xgbp is not None:
-        out.append(("XGB", xgbp, True))
-        if target_name == "valor":
-            xl = build_xgb_only_pipe(best_params, True, rs, horizon)
-            if xl is not None:
-                out.append(("XGB+log1p", xl, True))
-
-    cb = build_catboost_pipe(False, rs, target_name)
-    if cb is not None:
-        out.append(("CatBoost", cb, False))
-        if target_name == "valor":
-            cb_log = build_catboost_pipe(True, rs, target_name)
-            if cb_log is not None:
-                out.append(("CatBoost+log1p", cb_log, False))
-
-    out.append(("ExtraTrees", build_extratrees_pipe(best_params, False, rs, horizon), True))
-    if target_name == "valor":
-        out.append(
-            ("ExtraTrees+log1p", build_extratrees_pipe(best_params, True, rs, horizon), True)
+    out.append(
+        (
+            "Random Forest",
+            RandomForestRegressor(
+                n_estimators=100, max_depth=5, random_state=rs
+            ),
+            False,
         )
-        ngbp = build_ngboost_pipe(rs)
-        if ngbp is not None:
-            out.append(("NGBoost", ngbp, False))
+    )
+    out.append(
+        (
+            "Gradient Boosting",
+            GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.05,
+                max_depth=4,
+                random_state=rs,
+            ),
+            False,
+        )
+    )
+    out.append(("Ridge Linear", Ridge(alpha=1.0), False))
 
-    lstack = build_light_stack_pipe(best_params, False, rs, target_name)
-    if lstack is not None:
-        out.append(("Stack(LGBM+HGB)", lstack, False))
-        if target_name == "valor":
-            ls2 = build_light_stack_pipe(best_params, True, rs, target_name)
-            if ls2 is not None:
-                out.append(("Stack+log1p", ls2, False))
-
-    out.append(("SVM (SVR)", build_svm_pipe(rs, target_name), False))
-    out.append(("k-NN", build_knn_pipe(rs, target_name), False))
-
-    out.append(("Baseline mediana", build_dummy_median_pipe(), False))
+    voting_estimators = [(n, m) for n, m, _ in out]
+    out.append(
+        (
+            "Ensemble (Voting)",
+            VotingRegressor(estimators=voting_estimators),
+            False,
+        )
+    )
     return out
 
 
@@ -2181,6 +2161,7 @@ def merge_macro_bcb_into_daily(
 
 # ----- inlined: features.py -----
 
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -2389,6 +2370,114 @@ def _resolve_vendas(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
     out = out.loc[out["_d"].notna()].copy()
     out["_valor"] = _winsorize_positive_series(out[c_val])
     return out, c_data, c_val
+
+
+def _vdim_slug(part: str, max_len: int = 36) -> str:
+    t = normalize_header(str(part).strip())[:max_len]
+    t = re.sub(r"[^a-z0-9_]+", "_", t).strip("_")
+    return t or "na"
+
+
+def build_vendas_wide_daily(
+    df_v: pd.DataFrame,
+    *,
+    max_dim_combinations: int = 4000,
+) -> pd.DataFrame:
+    """
+    Agrega a base bruta de vendas num painel diário largo: por dia, contagens e soma de VGV
+    por combinação de dimensões (corretor, ranking, empreendimento, regional, canal, …).
+
+    Colunas geradas: prefixo ``vdim_q__`` (quantidade) e ``vdim_v__`` (soma VGV).
+    Não entram no treino ML (filtradas em ``build_feature_matrix`` / ``build_xy_for_horizon``).
+    """
+    if df_v is None or len(df_v) < 1:
+        return pd.DataFrame()
+    fn = normalize_dataframe_columns(df_v.copy())
+    c_data = find_column_any(
+        fn,
+        [
+            ["data", "venda"],
+            ["data", "fechamento"],
+        ],
+    )
+    c_val = find_column_any(
+        fn,
+        [
+            ["valor", "real", "venda"],
+            ["valor", "real"],
+            ["vgv", "real"],
+            ["valor", "venda"],
+            ["vgv"],
+        ],
+    )
+    if c_val is None:
+        c_val = find_column(fn, ["valor"])
+    if c_data is None or c_val is None:
+        return pd.DataFrame()
+
+    dim_candidates: list[tuple[str, str | None]] = [
+        ("corretor", find_column_any(fn, [["corretor"], ["vendedor"], ["broker"]])),
+        ("ranking", find_column_any(fn, [["ranking"], ["rank"]])),
+        (
+            "empreend",
+            find_column_any(
+                fn,
+                [
+                    ["empreendimento"],
+                    ["empreend"],
+                    ["produto"],
+                ],
+            ),
+        ),
+        ("regional", find_column_any(fn, [["regional", "imob"], ["regional"]])),
+        ("canal", find_column(fn, ["canal"])),
+    ]
+    dims = [(tag, c) for tag, c in dim_candidates if c is not None and c in fn.columns]
+    if not dims:
+        return pd.DataFrame()
+
+    work = fn.copy()
+    work["_d"] = _to_day(work[c_data])
+    work = work.loc[work["_d"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["_valor"] = pd.to_numeric(work[c_val], errors="coerce").fillna(0.0)
+
+    parts: list[pd.Series] = []
+    for _tag, col in dims:
+        s = work[col].fillna("").astype(str).str.strip()
+        s = s.replace("", "na").replace("nan", "na")
+        parts.append(s.map(_vdim_slug))
+
+    combo = parts[0].astype(str)
+    for p in parts[1:]:
+        combo = combo + "__" + p.astype(str)
+
+    if combo.nunique() > max_dim_combinations:
+        vc = combo.value_counts()
+        top = set(vc.nlargest(max(1, max_dim_combinations - 1)).index)
+        combo = combo.where(combo.isin(top), "_outros_agrupados")
+
+    work["_dim"] = combo
+    g = work.groupby(["_d", "_dim"], observed=True)
+    cnt = g.size().unstack(fill_value=0).astype(np.float64)
+    vgv = g["_valor"].sum().unstack(fill_value=0.0).astype(np.float64)
+
+    def _col_name(prefix: str, raw: str) -> str:
+        body = str(raw)
+        if len(body) > 72:
+            body = hashlib.sha256(body.encode("utf-8")).hexdigest()[:24]
+        else:
+            body = re.sub(r"[^a-z0-9_]+", "_", body.lower()).strip("_") or "x"
+        return f"{prefix}{body}"
+
+    cnt.columns = [_col_name("vdim_q__", c) for c in cnt.columns]
+    vgv.columns = [_col_name("vdim_v__", c) for c in vgv.columns]
+    out = pd.concat([cnt, vgv], axis=1)
+    out.index = pd.DatetimeIndex(pd.to_datetime(out.index).normalize())
+    out = out.sort_index().fillna(0.0)
+    out = out.loc[:, ~out.columns.duplicated()]
+    return out.replace([np.inf, -np.inf], 0.0)
 
 
 def forward_calendar_features(index: pd.DatetimeIndex, horizon: int) -> pd.DataFrame:
@@ -3233,6 +3322,14 @@ def build_daily_master(
 
     _inject_ts_and_stl_features(df_master, show_progress=show_progress)
 
+    try:
+        vw = build_vendas_wide_daily(df_v)
+        if vw is not None and not vw.empty:
+            df_master = df_master.join(vw, how="left")
+    except Exception as e:
+        if show_progress:
+            print(f"Aviso: painel desagregado de vendas (vdim_) omitido: {e}")
+
     df_master.replace([np.inf, -np.inf], np.nan, inplace=True)
     bad_tgt = df_master["target_qtd"].isna() | df_master["target_valor"].isna()
     df_master = df_master.loc[~bad_tgt].copy()
@@ -3243,7 +3340,11 @@ def build_daily_master(
 
 def build_feature_matrix(df_master: pd.DataFrame) -> pd.DataFrame:
     """Matriz X alinhada ao índice diário (sem colunas de alvo bruto)."""
-    feature_cols = [c for c in df_master.columns if c not in ("target_qtd", "target_valor")]
+    feature_cols = [
+        c
+        for c in df_master.columns
+        if c not in ("target_qtd", "target_valor") and not str(c).startswith("vdim_")
+    ]
     X = df_master[feature_cols].copy()
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
     return X.fillna(0.0)
