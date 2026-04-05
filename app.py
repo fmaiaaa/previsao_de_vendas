@@ -818,14 +818,16 @@ import numpy as np
 import optuna
 import pandas as pd
 from tqdm.auto import tqdm
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import (
     ExtraTreesRegressor,
+    GradientBoostingRegressor,
     HistGradientBoostingRegressor,
     RandomForestRegressor,
     StackingRegressor,
+    VotingRegressor,
 )
 from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.neighbors import KNeighborsRegressor
@@ -833,7 +835,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.svm import SVR
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, PolynomialFeatures
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -880,6 +882,53 @@ class TrainResult:
     chart_y_pred: list[float] = field(default_factory=list)
     chart_split_index: int = 0
     benchmark_appendix: dict[str, Any] | None = None
+
+
+class PrevHtmlPolyEnricher(BaseEstimator, TransformerMixin):
+    """
+    Correlação absoluta com y → top 30 colunas + PolynomialFeatures(grau=2),
+    como em prevhtml.py (sem bias polinomial).
+    """
+
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("PrevHtmlPolyEnricher requer y no fit.")
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        y_s = pd.Series(np.asarray(y).ravel(), index=X_df.index).astype(float)
+        X_num = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        corr = X_num.corrwith(y_s).abs().fillna(0.0)
+        k = min(30, max(1, X_num.shape[1]))
+        self.top_cols_: list[Any] = corr.nlargest(k).index.tolist()
+        self.rest_cols_: list[Any] = [c for c in X_num.columns if c not in self.top_cols_]
+        self._in_columns_: list[Any] = list(X_num.columns)
+        self.poly_ = PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)
+        self.poly_.fit(X_num[self.top_cols_].astype(np.float32))
+        return self
+
+    def transform(self, X):
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        X_aligned = X_df.reindex(columns=self._in_columns_, fill_value=0.0)
+        X_num = X_aligned.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        P = self.poly_.transform(X_num[self.top_cols_].astype(np.float32))
+        names = [
+            str(n).replace(" ", "_X_").replace(":", "")
+            for n in self.poly_.get_feature_names_out(self.top_cols_)
+        ]
+        poly_df = pd.DataFrame(P, columns=names, index=X_num.index)
+        return pd.concat([X_num[self.rest_cols_], poly_df], axis=1)
+
+
+class _PrevHtmlQtdPredictor:
+    """Regressor + enriquecimento prevhtml já ajustados (apenas .predict)."""
+
+    def __init__(self, enricher: PrevHtmlPolyEnricher, regressor: Any) -> None:
+        self._enricher = enricher
+        self._regressor = regressor
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        Xt = self._enricher.transform(X)
+        pr = np.asarray(self._regressor.predict(Xt), dtype=float).ravel()
+        return np.maximum(0.0, np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0))
 
 
 class _FittedBlend:
@@ -1518,7 +1567,7 @@ def _score_val_mae(
 def _collect_candidate_specs(
     target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
 ) -> list[tuple[str, Pipeline, bool]]:
-    """Nome, pipeline (template), usar sample_weight recency."""
+    """Nome, pipeline (template), usar sample_weight recency (alvo valor / VGV)."""
     out: list[tuple[str, Pipeline, bool]] = []
     long_h = int(horizon) >= 21
 
@@ -1697,6 +1746,250 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     return base
 
 
+def _prevhtml_model_templates(random_state: int) -> dict[str, Any]:
+    """
+    Modelagem explícita (script executivo): XGBRegressor, RandomForestRegressor,
+    GradientBoostingRegressor, Ridge(alpha=1.0) e VotingRegressor sobre os quatro primeiros.
+    Hiperparâmetros alinhados ao pipeline de referência (n_estimators=100, etc.).
+    """
+    bases: list[tuple[str, Any]] = []
+    if XGBRegressor is not None:
+        bases.append(
+            (
+                "XGBoost",
+                XGBRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
+            )
+        )
+    bases.extend(
+        [
+            (
+                "Random Forest",
+                RandomForestRegressor(
+                    n_estimators=100, max_depth=5, random_state=random_state
+                ),
+            ),
+            (
+                "Gradient Boosting",
+                GradientBoostingRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
+            ),
+            ("Ridge Linear", Ridge(alpha=1.0)),
+        ]
+    )
+    out = dict(bases)
+    out["Ensemble (Voting)"] = VotingRegressor(
+        estimators=[(n, clone(e)) for n, e in bases]
+    )
+    return out
+
+
+def _train_one_target_prevhtml(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    random_state: int,
+    show_progress: bool,
+    full_period_train: bool,
+    train_frac: float,
+) -> TrainResult:
+    """
+    Estratégia prevhtml.py: correlação → top-30 → polinômio grau 2;
+    split cronológico 70/30 dentro da zona de treino para competição por MAE;
+    vencedor reajustado em toda a zona de treino; modelo final em toda a série (como o app).
+    """
+    hz = int(horizon)
+    idx = X.index.intersection(y.index)
+    Xa = X.loc[idx].copy()
+    ya = pd.to_numeric(y.loc[idx], errors="coerce").astype(float)
+
+    if not full_period_train:
+        sl_tr, sl_te = temporal_train_test_indices(len(Xa), float(train_frac))
+        X_fit_zone = Xa.iloc[sl_tr]
+        y_fit_zone = ya.iloc[sl_tr]
+        X_outer = Xa.iloc[sl_te]
+        y_outer = ya.iloc[sl_te]
+    else:
+        X_fit_zone = Xa
+        y_fit_zone = ya
+        X_outer = Xa
+        y_outer = ya
+
+    enrich = PrevHtmlPolyEnricher()
+    enrich.fit(X_fit_zone, y_fit_zone)
+    Xef = enrich.transform(X_fit_zone)
+
+    n_in = len(Xef)
+    split_i = int(n_in * 0.7)
+    if split_i < 1 or (n_in - split_i) < 1:
+        raise ValueError(
+            "Série curta demais para o split interno 70/30 (estratégia prevhtml, alvo quantidade)."
+        )
+
+    X_p_tr = Xef.iloc[:split_i]
+    X_p_te = Xef.iloc[split_i:]
+    y_p_tr = y_fit_zone.iloc[:split_i]
+    y_p_te = y_fit_zone.iloc[split_i:]
+
+    templates = _prevhtml_model_templates(random_state)
+    maes: dict[str, float] = {}
+    loop = list(templates.items())
+    if show_progress:
+        loop = list(tqdm(loop, desc="Prevhtml (qtd)", leave=False, unit="modelo"))
+    for name, tpl in loop:
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            maes[name] = float(mean_absolute_error(y_p_te, pv))
+        except Exception:
+            continue
+
+    if not maes:
+        dm = DummyRegressor(strategy="median")
+        dm.fit(X_p_tr, y_p_tr)
+        pv0 = np.maximum(0.0, dm.predict(X_p_te))
+        win_name = "Baseline mediana (fallback)"
+        templates = {win_name: dm}
+        maes = {win_name: float(mean_absolute_error(y_p_te, pv0))}
+
+    win_name = min(maes, key=lambda k: maes[k])
+    win_tpl = templates[win_name]
+
+    reg_fit_zone = clone(win_tpl)
+    reg_fit_zone.fit(Xef, y_fit_zone)
+
+    X_all_enr = enrich.transform(Xa)
+    reg_prod = clone(win_tpl)
+    reg_prod.fit(X_all_enr, ya)
+
+    pipe = _PrevHtmlQtdPredictor(enrich, reg_prod)
+
+    reg_eval = clone(win_tpl)
+    reg_eval.fit(X_p_tr, y_p_tr)
+    pred_inner_te = np.maximum(0.0, reg_eval.predict(X_p_te))
+    y_max_tr = float(np.percentile(y_p_tr, 99.5)) if len(y_p_tr) else 0.0
+    long_hz = hz >= 21
+    cap_mult = 2.75 if long_hz else 2.35
+    cap = max(y_max_tr * cap_mult, 1.0)
+    pred_inner_te = np.clip(
+        np.nan_to_num(pred_inner_te, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+
+    thr = float(np.median(y_p_tr))
+
+    if full_period_train:
+        pred_outer = pred_inner_te
+        yo = y_p_te
+        do = X_p_te.index
+    else:
+        X_outer_enr = enrich.transform(X_outer)
+        pred_outer = np.maximum(0.0, reg_fit_zone.predict(X_outer_enr))
+        pred_outer = np.clip(
+            np.nan_to_num(pred_outer, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+        )
+        yo = y_outer
+        do = X_outer.index
+
+    metrics_val = _metrics_dict(y_p_te.values, pred_inner_te, "qtd")
+    metrics_test = _metrics_dict(np.asarray(yo, dtype=float), np.asarray(pred_outer, dtype=float), "qtd")
+    metrics_val["n_features"] = float(Xa.shape[1])
+    metrics_test["n_features"] = float(Xa.shape[1])
+
+    pred_chart = pipe.predict(Xa)
+    pred_chart = np.clip(
+        np.nan_to_num(pred_chart, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+    chart_dates = [d.strftime("%Y-%m-%d") for d in Xa.index]
+    chart_y_real = ya.tolist()
+    chart_y_pred = pred_chart.tolist()
+    chart_split_index = int(len(X_fit_zone)) if not full_period_train else split_i
+
+    y_tr_ref = np.asarray(y_p_tr, dtype=float)
+    metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        y_p_te.values, pred_inner_te, y_tr_ref
+    )
+    metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        np.asarray(yo, dtype=float), pred_outer, y_tr_ref
+    )
+
+    bench_rows: list[dict[str, Any]] = []
+    for name, tpl in templates.items():
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            if full_period_train:
+                pt = pv
+                y_te_b = y_p_te
+            else:
+                pt = np.maximum(0.0, m.predict(enrich.transform(X_outer)))
+                y_te_b = y_outer
+            bench_rows.append(
+                {
+                    "name": name,
+                    "mae_val": float(mean_absolute_error(y_p_te, pv)),
+                    "reg_val": regression_metrics(y_p_te.values, pv),
+                    "reg_test": regression_metrics(np.asarray(y_te_b, dtype=float), pt),
+                    "bin_val": binary_from_regression(y_p_te.values, pv, thr),
+                    "bin_test": binary_from_regression(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                    "roc_test": roc_curve_data(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                }
+            )
+        except Exception:
+            continue
+    bench_rows.sort(key=lambda r: r["mae_val"])
+    benchmark_appendix = _sanitize_benchmark_appendix(
+        {
+            "rows": bench_rows,
+            "winner_label": win_name,
+            "winner_names": [win_name],
+            "winner_weights": [1.0],
+            "threshold_y": thr,
+        }
+    )
+
+    best_params: dict[str, Any] = {
+        "estrategia": "prevhtml_poly_correlacao_70_30",
+        "modelo_vencedor": win_name,
+        "mae_split_interno": maes,
+        "horizonte_alvo": hz,
+    }
+
+    return TrainResult(
+        pipeline=pipe,
+        metrics_val=metrics_val,
+        metrics_test=metrics_test,
+        importance=pd.Series(dtype=float),
+        y_val=y_p_te,
+        y_val_pred=pred_inner_te,
+        y_test=pd.Series(np.asarray(yo, dtype=float), index=do),
+        y_test_pred=np.asarray(pred_outer, dtype=float),
+        best_params=best_params,
+        dates_val=X_p_te.index,
+        dates_test=do,
+        model_label=f"Prevhtml: {win_name}",
+        full_period_train=full_period_train,
+        chart_dates=chart_dates,
+        chart_y_real=chart_y_real,
+        chart_y_pred=chart_y_pred,
+        chart_split_index=chart_split_index,
+        benchmark_appendix=benchmark_appendix,
+    )
+
+
 def train_one_target(
     X: pd.DataFrame,
     y: pd.Series,
@@ -1711,6 +2004,17 @@ def train_one_target(
     full_period_train: bool = False,
     train_frac: float = 0.7,
 ) -> TrainResult:
+    if target_name == "qtd":
+        return _train_one_target_prevhtml(
+            X,
+            y,
+            horizon=horizon,
+            random_state=random_state,
+            show_progress=show_progress,
+            full_period_train=full_period_train,
+            train_frac=train_frac,
+        )
+
     n = len(X)
     hz = int(horizon)
 
@@ -4360,7 +4664,7 @@ def _interpret_text_correlation_matrix(labels: list[str], z: list[list[float]]) 
             + "; ".join(f"{a}–{b}: {r:+.2f}" for a, b, r in pos_f)
             + "."
         )
-    neg_f = [p for p in pairs if p[2] <= -0.25]
+    neg_f = [p for p in neg if p[2] <= -0.25]
     if neg_f:
         chunks.append(
             "Por outro lado, destacam-se estas associações negativas: "
@@ -4614,4 +4918,5000 @@ def _appendix_for_horizon_target(
         rt = r.get("reg_test") or {}
         reg_rows_html.append(
             "<tr>"
-            f"<td class='p-2 border
+            f"<td class='p-2 border font-medium text-slate-800'>{nm}</td>"
+            f"<td class='p-2 border'>{_cell_metric(r.get('mae_val'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rv.get('MAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('RMSE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('R2'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MedAE'), prec=3, scale_million=vgv)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('ExplainedVar'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(rt.get('MaxError'), prec=3, scale_million=vgv)}</td>"
+            "</tr>"
+        )
+
+    bin_heads = (
+        "<tr class='bg-slate-100'>"
+        "<th class='p-2 border' rowspan='2'>Modelo</th>"
+        "<th class='p-2 border text-center' colspan='5'>Validação (binária aux.)</th>"
+        "<th class='p-2 border text-center' colspan='5'>Teste (binária aux.)</th>"
+        "</tr>"
+        "<tr class='bg-slate-50 text-xs'>"
+        "<th class='p-2 border'>Acc</th><th class='p-2 border'>Prec</th><th class='p-2 border'>Rec</th>"
+        "<th class='p-2 border'>F1</th><th class='p-2 border'>AUC</th>"
+        "<th class='p-2 border'>Acc</th><th class='p-2 border'>Prec</th><th class='p-2 border'>Rec</th>"
+        "<th class='p-2 border'>F1</th><th class='p-2 border'>AUC</th>"
+        "</tr>"
+    )
+    bin_rows_html = [bin_heads]
+    for r in rows_raw:
+        nm = html_lib.escape(str(r.get("name", "")))
+        bv = r.get("bin_val") or {}
+        bt = r.get("bin_test") or {}
+        bin_rows_html.append(
+            "<tr>"
+            f"<td class='p-2 border font-medium'>{nm}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Accuracy'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Precision'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('Recall'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('F1'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bv.get('ROC_AUC'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Accuracy'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Precision'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('Recall'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('F1'), prec=3)}</td>"
+            f"<td class='p-2 border'>{_cell_metric(bt.get('ROC_AUC'), prec=3)}</td>"
+            "</tr>"
+        )
+
+    unit_note = (
+        "Valores de erro em milhões de R$ (VGV)."
+        if vgv
+        else "Valores de erro em unidades (quantidade)."
+    )
+    vgv_js = "true" if vgv else "false"
+
+    roc_traces = ba.get("roc_traces") or []
+    mae_bar: list[dict[str, Any]] = []
+    for r in rows_raw:
+        rt = r.get("reg_test") or {}
+        mae_bar.append(
+            {
+                "name": str(r.get("name", "")),
+                "mae": rt.get("MAE"),
+            }
+        )
+
+    roc_json = _json_safe(roc_traces)
+    mae_json = _json_safe(mae_bar)
+
+    html_frag = f"""
+    <div class="glass-card p-6 mb-8">
+      <h4 class="text-lg font-bold text-slate-900 mb-2">{html_lib.escape(title)} — horizonte {h} dias</h4>
+      <p class="text-xs text-slate-600 mb-3">
+        Vencedor do benchmark (menor MAE na validação interna): <b>{win}</b><br/>
+        Composição: {blend_txt}<br/>
+        Limiar da tarefa binária auxiliar (mediana de <code>y</code> só no treino interno do benchmark): <b>{thr_s}</b>.
+        Métricas de teste referem-se ao conjunto <b>{hold_lbl}</b>. {unit_note}
+      </p>
+      <div class="overflow-x-auto mb-4">
+        <p class="text-xs font-bold text-slate-500 uppercase mb-1">Regressão (validação / teste)</p>
+        <table class="text-xs border-collapse w-full min-w-[720px]">{"".join(reg_rows_html)}</table>
+      </div>
+      <div class="overflow-x-auto mb-4">
+        <p class="text-xs font-bold text-slate-500 uppercase mb-1">
+          Classificação auxiliar (real e predito &gt; limiar vs ≤ limiar; score ROC = valor predito contínuo)
+        </p>
+        <table class="text-xs border-collapse w-full min-w-[900px]">{"".join(bin_rows_html)}</table>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div>
+          <p class="text-xs font-bold text-slate-600 mb-1">Curvas ROC (teste — tarefa auxiliar)</p>
+          <div id="roc_{slug}_{h}" style="height:400px;width:100%;"></div>
+        </div>
+        <div>
+          <p class="text-xs font-bold text-slate-600 mb-1">MAE no teste — comparação entre modelos</p>
+          <div id="maebar_{slug}_{h}" style="height:400px;width:100%;"></div>
+        </div>
+      </div>
+    </div>
+    """
+
+    script = f"""
+    (function() {{
+      var roc = {roc_json};
+      var palette = ['#6366f1','#10b981','#f59e0b','#ec4899','#8b5cf6','#06b6d4','#84cc16','#f97316','#64748b','#0ea5e9'];
+      var traces = roc.map(function(t, i) {{
+        return {{
+          x: t.fpr || [], y: t.tpr || [], mode: 'lines',
+          name: (t.name || '') + (t.auc != null ? ' (AUC=' + Number(t.auc).toFixed(3) + ')' : ''),
+          line: {{ width: 1.5, color: palette[i % palette.length] }}
+        }};
+      }});
+      traces.push({{ x: [0,1], y: [0,1], mode: 'lines', name: 'aleatório', line: {{ dash: 'dot', color: '#94a3b8' }} }});
+      Plotly.newPlot('roc_{slug}_{h}', traces, {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11, color: '#475569' }},
+        margin: {{ t: 36, l: 48, r: 12, b: 48 }},
+        xaxis: {{ title: 'Taxa de falsos positivos', gridcolor: '#e2e8f0', zeroline: false }},
+        yaxis: {{ title: 'Taxa de verdadeiros positivos', gridcolor: '#e2e8f0', zeroline: false }},
+        showlegend: true, legend: {{ orientation: 'v', x: 1.02, y: 1 }}
+      }}, {{ responsive: true }});
+
+      var mb = {mae_json};
+      var vgv = {vgv_js};
+      var yv = mb.map(function(d) {{
+        var v = d.mae;
+        if (v == null || isNaN(v)) return 0;
+        return vgv ? v / 1e6 : v;
+      }});
+      var ytitle = vgv ? 'MAE teste (mi R$)' : 'MAE teste (unid.)';
+      Plotly.newPlot('maebar_{slug}_{h}', [{{
+        type: 'bar',
+        x: mb.map(function(d) {{ return d.name; }}),
+        y: yv,
+        marker: {{ color: '#4f46e5', opacity: 0.85 }}
+      }}], {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 28, l: 52, r: 12, b: 120 }},
+        xaxis: {{ tickangle: -55, automargin: true }},
+        yaxis: {{ title: ytitle, gridcolor: '#f1f5f9' }}
+      }}, {{ responsive: true }});
+    }})();
+    """
+    return html_frag, script
+
+
+def _methodology_appendix_block(
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
+) -> str:
+    hz_txt = ", ".join(str(x) for x in horizontes)
+    modo = (
+        "<b>100% da série</b> no modelo final; ~8% finais só para pesos do ensemble (sem holdout nas métricas principais)."
+        if full_period_train
+        else "<b>70% / 30%</b> cronológicos; ~8% no fim do treino para escolher o ensemble. "
+        "MAE, RMSE, R² no <b>teste (30%)</b> salvo indicação em contrário."
+    )
+    params_blocks: list[str] = []
+    for h in horizontes:
+        pq = best_params_preview.get(h, {}).get("qtd", {})
+        ql = html_lib.escape(str(por_horizonte[h]["qtd"].get("model_label", "—")))
+        pj = html_lib.escape(json.dumps(pq, indent=2, ensure_ascii=False)[:12000])
+        params_blocks.append(
+            f'<div class="glass-card p-5 mb-5 border-t-4 border-slate-700">'
+            f'<h4 class="font-bold text-slate-900 mb-2">Horizonte {h} dias — quantidade</h4>'
+            f'<p class="text-sm text-slate-600 mb-2">Modelo: <b>{ql}</b></p>'
+            f'<p class="text-xs font-bold text-slate-500 uppercase mb-1">Metadados / parâmetros registados</p>'
+            f'<pre class="text-xs overflow-auto max-h-56 bg-slate-50 p-3 rounded-lg border">{pj}</pre></div>'
+        )
+    candidatos = (
+        "<b>XGBoost</b> (100 árvores, <code>learning_rate=0.05</code>, <code>max_depth=4</code>), "
+        "<b>Random Forest</b> (100, <code>max_depth=5</code>), "
+        "<b>Gradient Boosting</b> (100, <code>learning_rate=0.05</code>, <code>max_depth=4</code>), "
+        "<b>Ridge</b> (<code>alpha=1.0</code>) e <b>VotingRegressor</b> sobre estes quatro."
+    )
+    return f"""
+    <div class="glass-card p-8 mb-8 border-l-4 border-blue-600">
+      <h2 class="text-2xl font-black text-slate-900 mb-4">Metodologia</h2>
+      <div class="text-sm text-slate-700 space-y-3 leading-relaxed text-justify">
+        <p><b>Alvo.</b> Apenas <b>quantidade</b>: em cada <code>t</code>, soma de vendas (unidades) nos próximos <code>H</code> dias da série, <code>H</code> ∈ {{{hz_txt}}}. <code>X</code> só com dados até <code>t</code> (lags, calendário, STL, feriados, macro BCB, formulário defasado, etc.).</p>
+        <p><b>Engenharia preditiva.</b> Correlação com o alvo → top 30 variáveis → <code>PolynomialFeatures(degree=2)</code> sem bias; restantes colunas concatenadas (fluxo tipo relatório executivo).</p>
+        <p><b>Dados.</b> <b>{n_rows:,}</b> dias; <b>{n_features}</b> colunas após engenharia na matriz diária.</p>
+        <p><b>Validação.</b> {modo}</p>
+        <p><b>Modelos (fixos).</b> {candidatos} Competição por MAE no teste cronológico (30%); vencedor reajustado no histórico. Semente <b>{random_seed}</b>.</p>
+        <p><b>Métricas binárias (HTML).</b> Comparação à mediana de <code>y</code> no treino do benchmark.</p>
+      </div>
+    </div>
+    <h3 class="text-lg font-black text-slate-800 mb-3">Registo por horizonte (quantidade)</h3>
+    {"".join(params_blocks)}
+    """
+
+
+def _build_analises_pane_html(daily: dict[str, Any]) -> tuple[str, str]:
+    daily_html = {k: v for k, v in daily.items() if k != "numeric_series_for_picker"}
+    dj = _json_safe(daily_html)
+    interp_block = _html_eda_interpretacoes(daily)
+    html_frag = """
+    <div class="glass-card p-6 mb-6">
+      <h3 class="text-xl font-black text-slate-900 mb-2">Séries diárias — funil e alvos</h3>
+      <p class="text-sm text-slate-600 mb-4 text-justify">Contagens do funil (empilhadas), vendas diárias em quantidade e VGV.</p>
+      <div id="an_combo" style="height:480px;width:100%;"></div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Média por dia da semana</h4>
+        <div id="an_dow" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Correlação (variáveis-chave)</h4>
+        <div id="an_corr" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6" id="an_scatter_row">
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × qtd (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Complementa a matriz acima: cada ponto corresponde a um dia civil, com leads no eixo horizontal e vendas em quantidade no vertical.</p>
+        <div id="an_scatter_q" style="height:380px;width:100%;"></div>
+      </div>
+      <div class="glass-card p-6">
+        <h4 class="font-bold text-slate-800 mb-2">Dispersão: leads × VGV (mesmo dia)</h4>
+        <p class="text-sm text-slate-600 mb-3 text-justify">Mesmo eixo horizontal (leads); o VGV diário é apresentado em milhões de reais, de modo a alinhar a escala à leitura do funil.</p>
+        <div id="an_scatter_v" style="height:380px;width:100%;"></div>
+      </div>
+    </div>
+    <div class="glass-card p-6 mb-6" id="an_macro_wrap">
+      <h4 class="font-bold text-slate-800 mb-2">Indicadores macro (normalizados)</h4>
+      <div id="an_macro" style="height:360px;width:100%;"></div>
+    </div>
+    """
+    html_frag = html_frag + interp_block
+    script = f"""
+    (function() {{
+      var D = {dj};
+      var dates = D.dates || [];
+      function zscore(arr) {{
+        var m = arr.reduce(function(a,b){{return a+b;}},0) / (arr.length || 1);
+        var v = arr.reduce(function(a,b){{return a+Math.pow(b-m,2);}},0) / (arr.length || 1);
+        var s = Math.sqrt(v) || 1;
+        return arr.map(function(x) {{ return (x - m) / s; }});
+      }}
+      function xAxisRangeFromDates(ds) {{
+        if (!ds || ds.length < 2) return {{}};
+        return {{ range: [ds[0], ds[ds.length - 1]] }};
+      }}
+      Plotly.newPlot('an_combo', [
+        {{ x: dates, y: D.vol_leads, name: 'Leads', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(15,23,42,0.35)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_agend, name: 'Agend.', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(59,130,246,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_visit, name: 'Visitas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(99,102,241,0.4)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.vol_pastas, name: 'Pastas', stackgroup: 'one', line: {{ width: 0 }}, fillcolor: 'rgba(139,92,246,0.45)', type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_qtd, name: 'Vendas (linha)', yaxis: 'y2', line: {{ color: '#059669', width: 2.5 }}, type: 'scatter', mode: 'lines' }},
+        {{ x: dates, y: D.target_valor.map(function(v){{return v/1e6;}}), name: 'VGV (linha)', yaxis: 'y3', line: {{ color: '#ea580c', width: 2, dash: 'dot' }}, type: 'scatter', mode: 'lines' }}
+      ], {{
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 96, l: 52, r: 56, b: 56 }},
+        xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+        yaxis: {{ title: 'Eixo Y₁ — funil empilhado', gridcolor: '#e5e7eb' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — qtd (/ dia)', showgrid: false }},
+        yaxis3: {{ anchor: 'free', overlaying: 'y', side: 'right', position: 0.98, title: 'Eixo Y₃ — valor (mi R$ / dia)', showgrid: false }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.06, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, font: {{ size: 10 }}, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+      }}, {{ responsive: true }});
+
+      var dl = D.dow_labels || [];
+      Plotly.newPlot('an_dow', [
+        {{ x: dl, y: D.dow_mean_qtd || [], name: 'Barras — qtd', type: 'bar', marker: {{ color: '#334155' }} }},
+        {{ x: dl, y: (D.dow_mean_valor || []).map(function(v){{return v/1e6;}}), name: 'Barras — VGV', type: 'bar', marker: {{ color: '#0d9488' }}, yaxis: 'y2' }}
+      ], {{
+        barmode: 'group',
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        xaxis: {{ title: 'Eixo X — dia da semana' }},
+        yaxis: {{ title: 'Eixo Y₁ — média qtd (/ dia)' }},
+        yaxis2: {{ overlaying: 'y', side: 'right', title: 'Eixo Y₂ — média VGV (mi R$ / dia)' }},
+        font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+        margin: {{ t: 56, l: 48, r: 48, b: 48 }},
+        legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.04, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#e2e8f0', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+      }}, {{ responsive: true }});
+
+      var labs = D.corr_labels || [];
+      var z = D.corr_z || [];
+      if (labs.length > 1 && z.length) {{
+        Plotly.newPlot('an_corr', [{{
+          z: z, x: labs, y: labs, type: 'heatmap', colorscale: 'RdBu', zmid: 0,
+          hoverongaps: false
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 28, l: 120, r: 28, b: 120 }},
+          font: {{ size: 10 }}, xaxis: {{ tickangle: -45 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_corr').innerHTML = '<p class="text-sm text-slate-500 p-4">Correlação indisponível.</p>';
+      }}
+
+      var vl = D.vol_leads || [];
+      var tqsc = D.target_qtd || [];
+      var tvmi = (D.target_valor || []).map(function(v){{ return v / 1e6; }});
+      var scatterOk = vl.length > 5 && vl.length === tqsc.length && vl.length === tvmi.length;
+      if (scatterOk) {{
+        Plotly.newPlot('an_scatter_q', [{{
+          x: vl, y: tqsc, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#3b82f6', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — qtd vendida', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+        Plotly.newPlot('an_scatter_v', [{{
+          x: vl, y: tvmi, type: 'scatter', mode: 'markers',
+          marker: {{ size: 7, opacity: 0.5, color: '#0d9488', line: {{ width: 0.5, color: '#ffffff' }} }}
+        }}], {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          xaxis: {{ title: 'Eixo X — leads', gridcolor: '#e5e7eb' }}, yaxis: {{ title: 'Eixo Y — VGV (mi R$)', gridcolor: '#e5e7eb' }},
+          margin: {{ t: 20, l: 52, r: 28, b: 52 }},
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }}
+        }}, {{ responsive: true }});
+      }} else {{
+        var srow = document.getElementById('an_scatter_row');
+        if (srow) srow.style.display = 'none';
+      }}
+
+      var macro = D.macro || {{}};
+      var mk = Object.keys(macro);
+      if (mk.length) {{
+        var traces = mk.slice(0, 5).map(function(k) {{
+          return {{ x: dates, y: zscore(macro[k] || []), name: k, line: {{ width: 1.4 }} }};
+        }});
+        Plotly.newPlot('an_macro', traces, {{
+          paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+          title: 'Macro (z-score por série)',
+          font: {{ family: 'Plus Jakarta Sans', size: 11 }},
+          margin: {{ t: 72, l: 48, r: 28, b: 48 }},
+          xaxis: Object.assign({{ title: 'Eixo X — data' }}, xAxisRangeFromDates(dates)),
+          yaxis: {{ title: 'Eixo Y — z-score' }},
+          legend: {{ orientation: 'h', yanchor: 'bottom', y: 1.05, x: 0.5, xanchor: 'center', bgcolor: 'rgba(248,250,252,0.94)', bordercolor: '#cbd5e1', borderwidth: 1, title: {{ text: 'Séries', font: {{ size: 10, color: '#64748b' }} }} }}
+        }}, {{ responsive: true }});
+      }} else {{
+        document.getElementById('an_macro_wrap').style.display = 'none';
+      }}
+    }})();
+    """
+    return html_frag, script
+
+
+def _build_appendix_html(
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    full_period_train: bool,
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    blend_top_k: int,
+    random_seed: int,
+    n_rows: int,
+    n_features: int,
+) -> tuple[str, str]:
+    parts: list[str] = []
+    scripts: list[str] = []
+    intro_meth = _methodology_appendix_block(
+        horizontes,
+        por_horizonte,
+        best_params_preview,
+        full_period_train,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
+    )
+    for h in horizontes:
+        ph = por_horizonte[h]
+        hq, sq = _appendix_for_horizon_target(
+            ph["qtd"].get("benchmark_appendix"),
+            h,
+            "Volume (quantidade)",
+            "qtd",
+            False,
+            full_period_train,
+        )
+        parts.append(
+            f'<div class="mb-4"><h3 class="text-xl font-black text-slate-800 mb-3">Horizonte {h} dias — benchmark</h3>{hq}</div>'
+        )
+        if sq:
+            scripts.append(sq)
+    bench_intro = """
+    <div class="glass-card p-6 mb-8 border-l-4 border-indigo-500">
+      <h2 class="text-xl font-black text-slate-900 mb-2">Benchmark</h2>
+      <p class="text-sm text-slate-600">Regressão (quantidade), tarefa binária auxiliar, ROC e MAE no teste — XGBoost, Random Forest, Gradient Boosting, Ridge e Voting.</p>
+    </div>
+    """
+    return intro_meth + bench_intro + "\n".join(parts), "\n".join(scripts)
+
+
+def render_dashboard(
+    stats_base: dict[str, float],
+    ticket_medio: float,
+    conversao_funil: float,
+    horizontes: list[int],
+    por_horizonte: dict[int, dict[str, Any]],
+    best_params_preview: dict[int, dict[str, dict[str, Any]]],
+    out_path: str | None = None,
+    full_period_train: bool = False,
+    daily_pack: dict[str, Any] | None = None,
+    blend_top_k: int = 6,
+    random_seed: int = 42,
+) -> str:
+    """
+    por_horizonte[h]['qtd']: resultados de previsão de quantidade (sem alvo valor/VGV).
+    """
+    funnel = [
+        {"etapa": "Leads", "valor": int(stats_base["leads"])},
+        {"etapa": "Agendamentos", "valor": int(stats_base["agend"])},
+        {"etapa": "Visitas", "valor": int(stats_base["visit"])},
+        {"etapa": "Pastas", "valor": int(stats_base["pastas"])},
+        {"etapa": "Vendas", "valor": int(stats_base["vendas"])},
+    ]
+    funnel_json = _json_safe(funnel)
+    hoje = datetime.now().strftime("%d/%m/%Y")
+    subtreino = (
+        "Modelo final no histórico completo; ~8% finais para pesos do ensemble. Previsão: H dias após a última data."
+        if full_period_train
+        else "Métricas no bloco final (30%); modelo operacional reajustado em todo o histórico."
+    )
+    lbl_mae_grande = "MAE in-sample (100%)" if full_period_train else "MAE teste (30%)"
+    lbl_r2_grande = "R² in-sample (100%)" if full_period_train else "R² teste (30%)"
+    lbl_val_box = (
+        "Seleção ensemble (~8% final do histórico)"
+        if full_period_train
+        else "Seleção ensemble (~8% do bloco de treino 70%)"
+    )
+    lbl_graf_series = (
+        "Real vs modelo — treino (~92%) | validação (~8%) · linha vertical na separação"
+        if full_period_train
+        else "Real vs modelo — treino (70%) | teste (30%) · linha vertical na separação"
+    )
+    lbl_chart_treino = "Treino (~92%)" if full_period_train else "Treino (70%)"
+    lbl_chart_hold = "Validação (~8%)" if full_period_train else "Teste (30%)"
+    lbl_tr_js = json.dumps(lbl_chart_treino, ensure_ascii=False)
+    lbl_te_js = json.dumps(lbl_chart_hold, ensure_ascii=False)
+    lbl_modelo_esc = (
+        "Modelo escolhido (MAE na fatia final — seleção de ensemble)"
+        if full_period_train
+        else "Modelo escolhido (MAE na validação interna do treino 70%)"
+    )
+
+    tabs_html = ""
+    for i, h in enumerate(horizontes):
+        cls = "active" if i == 0 else "text-slate-600 hover:bg-white/50"
+        tabs_html += (
+            f'<button type="button" onclick="openTab(\'horizon_{h}\', this)" '
+            f'class="tab-btn {cls} px-6 py-3 rounded-xl font-bold text-sm uppercase tracking-wide">'
+            f"{h} dias</button>"
+        )
+
+    blocks = ""
+    for i, h in enumerate(horizontes):
+        ph = por_horizonte[h]
+        q = ph["qtd"]
+        active = "active" if i == 0 else ""
+
+        y_tq = _json_safe(
+            [float(x) for x in (q.get("chart_y_real") or q["y_test"])]
+        )
+        y_pq = _json_safe(
+            [float(x) for x in (q.get("chart_y_pred") or q["pred_test"])]
+        )
+        x_dates = _json_safe(q.get("chart_dates") or q["dates_test"])
+        split_q = int(q.get("chart_split_index") or 0)
+        _inames = q.get("importance_names") or []
+        _ivals = q.get("importance_vals") or []
+        imp_n = _json_safe(_inames)
+        imp_v = _json_safe([float(x) for x in _ivals])
+        has_imp = len(_inames) > 0
+
+        mv_t = q["metrics_test"]
+        mv_v = q["metrics_val"]
+
+        params_q = best_params_preview.get(h, {}).get("qtd", {})
+        params_block = (
+            f"<p class='text-sm text-slate-600 mb-2'>{lbl_modelo_esc}: "
+            f"<b class='text-slate-900'>{q['model_label']}</b> (quantidade)</p>"
+            f"<pre class='text-xs overflow-auto max-h-48 bg-slate-50 p-3 rounded-lg border'>"
+            f"{json.dumps(params_q, indent=2, ensure_ascii=False)[:4000]}"
+            f"</pre>"
+        )
+
+        pred_q = float(q["pred_ultimo_dia"])
+
+        imp_html = ""
+        imp_js = ""
+        if has_imp:
+            imp_html = f"""
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-4">Importância de features (referência)</h4>
+                    <div id="chart_i_{h}" style="height:400px;width:100%;"></div>
+                </div>"""
+            imp_js = f"""
+                    Plotly.newPlot('chart_i_{h}', [
+                        {{ x: {imp_v}, y: {imp_n}, type: 'bar', orientation: 'h', marker: {{color: '#6366f1'}} }}
+                    ], Object.assign({{}}, layoutBase, {{yaxis: {{automargin: true, tickfont: {{size: 10}}}}, margin: {{l: 200, t: 10, b: 40}}}}), {{responsive: true}});"""
+
+        blocks += f"""
+            <div id="horizon_{h}" class="tab-content {active}">
+                <div class="max-w-2xl mx-auto mb-8">
+                    <div class="bg-gradient-to-br from-blue-600 to-indigo-800 p-8 rounded-2xl shadow-xl text-white relative overflow-hidden">
+                        <p class="text-blue-100 text-sm font-semibold mb-1">Previsão — quantidade (próx. {h} dias na série)</p>
+                        <p class="text-5xl font-black">{pred_q:,.1f} <span class="text-xl font-medium text-blue-200">unid.</span></p>
+                        <p class="text-blue-200/80 text-xs mt-3">Modelagem exclusiva de volume (XGBoost, Random Forest, Gradient Boosting, Ridge, Voting). VGV não é previsto nesta versão.</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3 mb-6 max-w-2xl mx-auto">
+                    <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm">
+                        <div class="text-slate-400 text-xs font-bold uppercase">{lbl_mae_grande} — Qtd</div>
+                        <div class="text-xl font-black text-slate-800">{mv_t['MAE']:.2f}</div>
+                    </div>
+                    <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm">
+                        <div class="text-slate-400 text-xs font-bold uppercase">{lbl_r2_grande} — Qtd</div>
+                        <div class="text-xl font-black text-indigo-600">{(mv_t['R2']*100):.1f}%</div>
+                    </div>
+                </div>
+
+                <div class="max-w-2xl mx-auto mb-6">
+                    <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                        <div class="text-slate-500 text-xs font-bold uppercase mb-1">{lbl_val_box} — Volume</div>
+                        <div class="text-sm">MAE {mv_v['MAE']:.2f} · RMSE {mv_v['RMSE']:.2f} · sMAPE {mv_v['sMAPE']:.1f}% · MAPE {mv_v['MAPE']:.1f}%</div>
+                    </div>
+                </div>
+
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-3">Parâmetros / registo do modelo (quantidade)</h4>
+                    {params_block}
+                </div>
+
+                <div class="glass-card p-6 mb-6">
+                    <h4 class="text-lg font-bold text-slate-800 mb-4">{lbl_graf_series} — Volume</h4>
+                    <div id="chart_q_{h}" style="height:380px;width:100%;"></div>
+                </div>
+                {imp_html}
+                <script>
+                (function() {{
+                    var layoutBase = {{
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                        font: {{family: 'Plus Jakarta Sans', color: '#64748b'}},
+                        margin: {{t:52,l:50,r:20,b:60}},
+                        xaxis: {{gridcolor: '#f1f5f9', zerolinecolor: '#e2e8f0'}},
+                        yaxis: {{gridcolor: '#f1f5f9', zerolinecolor: '#e2e8f0'}},
+                        legend: {{orientation: 'h', y: -0.2}}
+                    }};
+                    var xdt = {x_dates};
+                    var splitIdxQ = {split_q};
+                    var lblTr = {lbl_tr_js};
+                    var lblTe = {lbl_te_js};
+                    function layoutTrainTest(splitIdx) {{
+                        var lo = Object.assign({{}}, layoutBase, {{
+                            xaxis: Object.assign({{}}, layoutBase.xaxis, {{tickangle: -35}})
+                        }});
+                        if (xdt.length >= 2) {{
+                            lo.xaxis = Object.assign({{}}, lo.xaxis, {{
+                                range: [xdt[0], xdt[xdt.length - 1]]
+                            }});
+                        }}
+                        if (splitIdx > 0 && splitIdx < xdt.length) {{
+                            var sd = xdt[splitIdx];
+                            lo.shapes = [{{
+                                type: 'line', xref: 'x', yref: 'paper',
+                                x0: sd, x1: sd, y0: 0, y1: 1,
+                                line: {{ color: '#64748b', width: 2, dash: '4px,3px' }}
+                            }}];
+                            var imt = Math.max(0, Math.floor(splitIdx / 2));
+                            var ime = Math.min(xdt.length - 1, splitIdx + Math.floor((xdt.length - splitIdx) / 2));
+                            lo.annotations = [
+                                {{ x: xdt[imt], y: 1.07, xref: 'x', yref: 'paper', text: lblTr, showarrow: false,
+                                  font: {{size: 11, color: '#64748b'}}, xanchor: 'center' }},
+                                {{ x: xdt[ime], y: 1.07, xref: 'x', yref: 'paper', text: lblTe, showarrow: false,
+                                  font: {{size: 11, color: '#64748b'}}, xanchor: 'center' }}
+                            ];
+                        }}
+                        return lo;
+                    }}
+                    Plotly.newPlot('chart_q_{h}', [
+                        {{ x: xdt, y: {y_tq}, name: 'Real', mode: 'lines', line: {{color: '#94a3b8', width: 2}} }},
+                        {{ x: xdt, y: {y_pq}, name: 'Modelo', mode: 'lines', line: {{color: '#6366f1', width: 2}} }}
+                    ], Object.assign({{}}, layoutTrainTest(splitIdxQ)), {{responsive: true}});
+                    {imp_js}
+                }})();
+                </script>
+            </div>
+        """
+
+    dp = daily_pack if daily_pack is not None else {}
+    n_rows = int(dp.get("n_rows") or 0)
+    n_features = int(dp.get("n_features") or 0)
+    appendix_html, appendix_scripts = _build_appendix_html(
+        horizontes,
+        por_horizonte,
+        full_period_train,
+        best_params_preview,
+        blend_top_k,
+        random_seed,
+        n_rows,
+        n_features,
+    )
+    analises_html, analises_scripts = _build_analises_pane_html(dp)
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Previsão de vendas — ML</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {{ font-family: 'Plus Jakarta Sans', sans-serif; }}
+    body {{ background: #e2e8f0; color: #0f172a; }}
+    .glass-card {{
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 1rem;
+      box-shadow: 0 4px 6px -1px rgba(15,23,42,0.08), 0 10px 24px -8px rgba(15,23,42,0.1);
+    }}
+    .tab-content {{ display: none; opacity: 0; transition: opacity 0.25s ease; }}
+    .tab-content.active {{ display: block; opacity: 1; }}
+    .tab-btn.active {{
+      background: #2563eb; color: white;
+      box-shadow: 0 4px 14px rgba(37,99,235,0.35);
+    }}
+    .section-pane {{ display: none; }}
+    .section-pane.active {{ display: block; }}
+    .sec-main-btn {{ background: #e2e8f0; color: #475569; transition: all 0.2s; }}
+    .sec-main-btn.active {{
+      background: #0f172a; color: white;
+      box-shadow: 0 4px 14px rgba(15,23,42,0.2);
+    }}
+  </style>
+</head>
+<body class="p-3 md:p-5">
+  <div class="max-w-7xl mx-auto px-1 sm:px-2">
+    <header class="glass-card p-6 mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+      <div>
+        <h1 class="text-2xl md:text-3xl font-extrabold text-slate-900">Previsão de vendas</h1>
+        <p class="text-slate-500 mt-1">{subtreino}</p>
+      </div>
+      <span class="text-sm font-semibold text-slate-600 bg-slate-100 px-4 py-2 rounded-full">{hoje}</span>
+    </header>
+
+    <div class="flex flex-wrap gap-2 mb-6 justify-center">
+      <button type="button" class="sec-main-btn active px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide"
+        data-sec="analises" onclick="openSection('analises', this)">Análises</button>
+      <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
+        data-sec="previsoes" onclick="openSection('previsoes', this)">Previsão</button>
+      <button type="button" class="sec-main-btn px-5 py-2.5 rounded-xl font-bold text-sm uppercase tracking-wide text-slate-600"
+        data-sec="apendice" onclick="openSection('apendice', this)">Apêndice</button>
+    </div>
+
+    <div id="sec-analises" class="section-pane active">
+    {analises_html}
+    </div>
+
+    <div id="sec-previsoes" class="section-pane">
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div class="glass-card p-5 border-t-4 border-slate-800">
+        <p class="text-xs font-bold text-slate-400 uppercase">Leads</p>
+        <p class="text-2xl font-black">{stats_base["leads"]:,.0f}</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-blue-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">Conversão (vendas/leads)</p>
+        <p class="text-2xl font-black">{conversao_funil:.2f}%</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-emerald-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">VGV histórico</p>
+        <p class="text-2xl font-black">R$ {stats_base["vgv"]/1e6:.1f}M</p>
+      </div>
+      <div class="glass-card p-5 border-t-4 border-amber-500">
+        <p class="text-xs font-bold text-slate-400 uppercase">Ticket médio</p>
+        <p class="text-2xl font-black">R$ {ticket_medio/1e3:,.0f}k</p>
+      </div>
+    </div>
+
+    <div class="flex justify-center mb-8">
+      <div class="inline-flex flex-wrap gap-2 bg-white border border-slate-200 p-2 rounded-2xl shadow-sm">
+        <span class="self-center text-xs font-bold text-slate-500 px-2">Horizonte:</span>
+        {tabs_html}
+      </div>
+    </div>
+
+    <div class="glass-card p-6 mb-8">
+      <h3 class="text-lg font-bold text-slate-800 mb-3">Funil agregado (volume de registros)</h3>
+      <div id="global_funnel" style="height:320px;width:100%;"></div>
+    </div>
+
+    {blocks}
+    </div>
+
+    <div id="sec-apendice" class="section-pane">
+    {appendix_html}
+    </div>
+  </div>
+
+  <script>
+    function openSection(secId, btn) {{
+      document.querySelectorAll('.section-pane').forEach(function(p) {{
+        p.classList.toggle('active', p.id === 'sec-' + secId);
+      }});
+      document.querySelectorAll('.sec-main-btn').forEach(function(b) {{
+        var on = b.getAttribute('data-sec') === secId;
+        b.classList.toggle('active', on);
+        b.classList.toggle('text-slate-600', !on);
+      }});
+      window.dispatchEvent(new Event('resize'));
+      if (typeof Plotly !== 'undefined') {{
+        setTimeout(function() {{
+          var sel = secId === 'apendice' ? '#sec-apendice' : (secId === 'analises' ? '#sec-analises' : '#sec-previsoes');
+          document.querySelectorAll(sel + ' .js-plotly-plot').forEach(function(gd) {{
+            try {{ Plotly.Plots.resize(gd); }} catch (e) {{}}
+          }});
+        }}, 120);
+      }}
+    }}
+    function openTab(tabId, el) {{
+      document.querySelectorAll('.tab-content').forEach(function(c) {{ c.classList.remove('active'); }});
+      document.querySelectorAll('.tab-btn').forEach(function(b) {{
+        b.classList.remove('active');
+        b.classList.add('text-slate-600', 'hover:bg-white/50');
+      }});
+      document.getElementById(tabId).classList.add('active');
+      el.classList.add('active');
+      el.classList.remove('text-slate-600', 'hover:bg-white/50');
+      window.dispatchEvent(new Event('resize'));
+    }}
+    var dataFunnel = {funnel_json};
+    Plotly.newPlot('global_funnel', [{{
+      type: 'funnel', y: dataFunnel.map(function(d) {{ return d.etapa; }}), x: dataFunnel.map(function(d) {{ return d.valor; }}),
+      textinfo: 'value+percent initial',
+      marker: {{ color: ['#0f172a','#3b82f6','#6366f1','#8b5cf6','#10b981'] }}
+    }}], {{
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      font: {{ family: 'Plus Jakarta Sans', color: '#475569' }},
+      margin: {{ l: 120, r: 20, t: 10, b: 10 }}
+    }}, {{ responsive: true }});
+    {analises_scripts}
+    {appendix_scripts}
+  </script>
+</body>
+</html>"""
+
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+    return html
+
+
+_ROOT = Path(__file__).resolve().parent
+
+import base64
+import html
+import os
+import streamlit as st
+
+# --- Identidade visual (paridade com ficha de credenciamento Vendas RJ — aplicar_estilo) ---
+COR_AZUL_ESC = "#04428f"
+COR_VERMELHO = "#cb0935"
+COR_BORDA = "#eef2f6"
+COR_INPUT_BG = "#f0f2f6"
+COR_TEXTO_MUTED = "#64748b"
+COR_TEXTO_LABEL = "#1e293b"
+COR_VERMELHO_ESCURO = "#9e0828"
+
+LOGO_TOPO_ARQUIVO = "502.57_LOGO DIRECIONAL_V2F-01.png"
+FAVICON_ARQUIVO = "502.57_LOGO D_COR_V3F.png"
+URL_LOGO_DIRECIONAL_FALLBACK = (
+    "https://logodownload.org/wp-content/uploads/2021/04/direcional-engenharia-logo.png"
+)
+
+BG_HERO_URL = (
+    "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab"
+    "?auto=format&fit=crop&w=1920&q=80"
+)
+
+
+def _hex_rgb_triplet(hex_color: str) -> str:
+    """Converte #RRGGBB em 'r, g, b' para uso em rgba(...)."""
+    x = (hex_color or "").strip().lstrip("#")
+    if len(x) != 6:
+        return "0, 0, 0"
+    return f"{int(x[0:2], 16)}, {int(x[2:4], 16)}, {int(x[4:6], 16)}"
+
+
+RGB_AZUL_CSS = _hex_rgb_triplet(COR_AZUL_ESC)
+RGB_VERMELHO_CSS = _hex_rgb_triplet(COR_VERMELHO)
+
+# Cores secundárias para gráficos Plotly (identidade Direcional)
+PLOT_AZUL = COR_AZUL_ESC
+PLOT_VERMELHO = COR_VERMELHO
+PLOT_ACCENT = "#0e7490"
+PLOT_MUTED = "#64748b"
+PLOT_GRID = "#e2e8f0"
+# Fundo dos gráficos: transparente para fundir com o cartão (.block-container) no Streamlit e glass-card no HTML
+PLOTLY_PAPER_BG = "rgba(0,0,0,0)"
+PLOTLY_PLOT_BG = "rgba(0,0,0,0)"
+
+# Legenda horizontal por baixo da área de plotagem, acima do rótulo/título do eixo X
+def _plotly_legend_bottom() -> dict[str, Any]:
+    return dict(
+        orientation="h",
+        yanchor="top",
+        y=-0.11,
+        x=0.5,
+        xanchor="center",
+        font=dict(size=10),
+        bgcolor="rgba(248,250,252,0.94)",
+        bordercolor="#cbd5e1",
+        borderwidth=1,
+        title=dict(text="Séries", font=dict(size=10, color="#64748b")),
+    )
+
+
+def _plotly_layout_direcional(
+    title: str | None = None,
+    height: int | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Layout base Plotly: paleta e tipografia alinhadas à marca."""
+    lo: dict[str, Any] = {
+        "template": "plotly_white",
+        "paper_bgcolor": PLOTLY_PAPER_BG,
+        "plot_bgcolor": PLOTLY_PLOT_BG,
+        "font": dict(
+            family="Montserrat, Inter, sans-serif",
+            size=12,
+            color="#1e293b",
+        ),
+        "xaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "yaxis": dict(
+            gridcolor=PLOT_GRID,
+            zerolinecolor="#cbd5e1",
+            showline=True,
+            linecolor="#cbd5e1",
+            tickfont=dict(size=11),
+        ),
+        "hoverlabel": dict(
+            bgcolor="#ffffff",
+            font_size=12,
+            font_family="Montserrat, Inter, sans-serif",
+            bordercolor=PLOT_GRID,
+        ),
+        "hovermode": "x unified",
+        "legend": dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.11,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+        "margin": dict(t=56, l=56, r=52, b=118),
+    }
+    if title:
+        lo["title"] = dict(
+            text=title,
+            font=dict(size=17, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+            x=0.5,
+            xanchor="center",
+        )
+    if height is not None:
+        lo["height"] = height
+    lo.update(extra)
+    return lo
+
+
+def _plotly_xaxis_range_from_dates(dates: Any) -> list[Any] | None:
+    """Intervalo [mín, máx] das datas da série para o eixo X (sem folga além do necessário)."""
+    if not dates:
+        return None
+    try:
+        s = pd.to_datetime(pd.Series(list(dates)), errors="coerce").dropna()
+        if s.empty:
+            return None
+        t0, t1 = s.min(), s.max()
+        if t0 == t1:
+            t0 = t0 - pd.Timedelta(days=1)
+            t1 = t1 + pd.Timedelta(days=1)
+        return [t0, t1]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _formulario_df_from_state() -> pd.DataFrame | None:
+    """Prioridade: *snapshot* explícito (botão na aba Formulário) → resultado ML → análises exploratórias."""
+    fs = st.session_state.get("formulario_snapshot")
+    if isinstance(fs, pd.DataFrame) and not fs.empty:
+        return fs.copy()
+    r = st.session_state.get("resultado")
+    if isinstance(r, dict):
+        df = r.get("df_formulario")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df.copy()
+    dex = st.session_state.get("dados_exploratorios")
+    if isinstance(dex, dict):
+        df = dex.get("df_formulario")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df.copy()
+    return None
+
+
+def _formulario_nf_pair_cols(fn: pd.DataFrame) -> tuple[str | None, str | None]:
+    hits = [
+        c
+        for c in fn.columns
+        if "normal" in str(c).lower() and "facilitada" in str(c).lower()
+    ]
+    prev_c = next((c for c in hits if "real" not in str(c).lower()), hits[0] if hits else None)
+    real_c = next((c for c in hits if "real" in str(c).lower()), None)
+    return prev_c, real_c
+
+
+def _formulario_map_columns(fn: pd.DataFrame) -> dict[str, Any]:
+    m: dict[str, Any] = {}
+    m["ref"] = find_column_any(
+        fn,
+        [
+            ["data", "referencia", "sabado"],
+            ["referencia", "sabado"],
+            ["data", "referencia"],
+        ],
+    )
+    m["empreendimento"] = find_column_any(
+        fn,
+        [["empreendimento", "previsto"], ["empreendimento"], ["previsto", "ter", "venda"]],
+    )
+    m["regional"] = find_column_any(fn, [["regional", "imob"], ["regional"]])
+    m["canal"] = find_column(fn, ["canal"])
+    m["regiao"] = find_column(fn, ["regiao"])
+    m["imobiliaria"] = find_column(fn, ["imobiliaria"])
+    m["gerente"] = find_column(fn, ["gerente"])
+    m["erro"] = find_column(fn, ["erro", "previs"])
+    m["vendas_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if (
+            "vendas" in lc
+            and ("previs" in lc or "previst" in lc)
+            and "real" not in lc
+            and "qtd" not in lc
+            and "vgv" not in lc
+        ):
+            m["vendas_prev"] = c
+            break
+    m["vendas_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vendas" in lc and "real" in lc and "qtd" not in lc and "vgv" not in lc:
+            m["vendas_real"] = c
+            break
+    m["vgv_prev"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and ("previs" in lc or "previst" in lc) and "real" not in lc:
+            m["vgv_prev"] = c
+            break
+    m["vgv_real"] = None
+    for c in fn.columns:
+        lc = str(c).lower()
+        if "vgv" in lc and "real" in lc:
+            m["vgv_real"] = c
+            break
+    used_q: set[str] = set()
+    m["q_fac_p"] = _find_formulario_qtd_col(
+        fn, [["facilitadas", "previstas"], ["facilitada", "prevista"]], used=used_q
+    )
+    m["q_fac_r"] = _find_formulario_qtd_col(
+        fn,
+        [["facilitadas", "reais"], ["facilitadas", "real"], ["facilitada", "real"]],
+        used=used_q,
+    )
+    m["q_norm_p"] = _find_formulario_qtd_col(
+        fn, [["normais", "previstas"], ["normal", "prevista"]], used=used_q
+    )
+    m["q_norm_r"] = _find_formulario_qtd_col(
+        fn, [["normais", "reais"], ["normais", "real"], ["normal", "real"]], used=used_q
+    )
+    m["nf_prev"], m["nf_real"] = _formulario_nf_pair_cols(fn)
+    m["visitas"] = find_column_any(fn, [["visitas", "totais", "esperadas"], ["visitas"]])
+    return m
+
+
+def _formulario_canon_canal(x: Any) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "(vazio)"
+    s = str(x).strip().lower()
+    if not s or s == "nan":
+        return "(vazio)"
+    if "imob" in s:
+        return "IMOB"
+    if "dv" in s:
+        return "DV RJ" if "rj" in s else "DV"
+    return str(x).strip()[:32]
+
+
+def _formulario_num_series(df: pd.DataFrame, col: str | None) -> pd.Series:
+    if not col or col not in df.columns:
+        return pd.Series(0.0, index=df.index, dtype=float)
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+
+def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
+    """Limiares de divisão no eixo da *feature* 0 (ilustração 1D de árvore de decisão)."""
+    try:
+        tr = tree_reg.tree_
+        out: list[float] = []
+        stack = [0]
+        while stack:
+            node = int(stack.pop())
+            left = int(tr.children_left[node])
+            if left == -1:
+                continue
+            if int(tr.feature[node]) == 0:
+                th = float(tr.threshold[node])
+                if np.isfinite(th):
+                    out.append(th)
+            stack.append(int(tr.children_right[node]))
+            stack.append(left)
+        return sorted(set(out))
+    except Exception:
+        return []
+
+
+# --- Decisões automáticas (sem input do utilizador) ---
+# Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
+OPTUNA_TRIALS_AUTO = 0
+# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
+BLEND_TOP_K_FIXO = 6
+RANDOM_SEED = 42
+# Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
+TRAIN_FRAC_FIXO = 0.7
+# Holdout final nas métricas do relatório (mais fiável que 100% in-sample).
+FULL_PERIOD_TRAIN_FIXO = False
+# tqdm nas etapas longas (build master, STL, Optuna). Desative com PREVISAO_HIDE_TQDM=1.
+SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Horizontes H (soma nos próximos H dias no índice) disponíveis na UI.
+HORIZONTES_PREVISAO_DISPONIVEIS: tuple[int, int, int] = (3, 7, 30)
+
+
+def normalize_horizontes_previsao(selecionados: list[int]) -> list[int]:
+    """Valida e ordena subconjunto de {3, 7, 30}; exige pelo menos um valor."""
+    allow = {3, 7, 30}
+    out = sorted({int(x) for x in selecionados if int(x) in allow})
+    if not out:
+        raise ValueError(
+            "Selecione pelo menos um horizonte entre 3, 7 e 30 dias."
+        )
+    return out
+
+
+def _chaves_horizonte_em_por_h(por_h: dict[Any, Any]) -> list[int]:
+    """Chaves inteiras de `por_h` (exclui 'custom' e similares)."""
+    return sorted(k for k in por_h if isinstance(k, int))
+
+
+def _configure_streamlit_progress() -> None:
+    """Reduz bufferização da saída e força flush nas barras tqdm (Streamlit / terminal)."""
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+    try:
+        import tqdm.std as _tqdm_std
+
+        if getattr(_tqdm_std.tqdm, "_pv_flush_patched", False):
+            return
+        _orig_update = _tqdm_std.tqdm.update
+
+        def _update_flush(self: Any, n: int = 1) -> Any:
+            r = _orig_update(self, n)
+            try:
+                fp = getattr(self, "fp", None)
+                if fp is not None and hasattr(fp, "flush"):
+                    fp.flush()
+            except Exception:
+                pass
+            return r
+
+        _tqdm_std.tqdm.update = _update_flush  # type: ignore[method-assign]
+        _tqdm_std.tqdm._pv_flush_patched = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+DEFAULT_SPREADSHEET_IDS: dict[str, str] = {
+    "formulario_previsao": "1lBliB3AjR5vJyRy9SoDi6DQOA9x5LC5wYfNNo5cz0bE",
+    "vendas": "1jb6bYBAlslele2V1CTUVHPNR55SJEiRojN1jGX3gJ4w",
+    "pastas": "1GC6GQytaDhjVslJ7seNBRfuE9QKulOU8dCeZsDPy0_g",
+    "leads": "1w-htBl8UxwqgFU1bspweBLW54-mzJwFBkcYC0Qib5Wk",
+    "agendamentos": "1TE0J29jxASqd3MbgV6Frwn3kAzlCDf5gzX3I_tmVy1Y",
+}
+
+CSV_GID_HINTS: dict[str, list[str]] = {
+    "formulario_previsao": ["155389951", "0"],
+    "agendamentos": ["1490757093", "0"],
+    "vendas": ["0"],
+    "pastas": ["0"],
+    "leads": ["0"],
+}
+
+
+def _resolver_png_raiz(nome: str) -> Path | None:
+    for base in (_ROOT, _ROOT.parent):
+        p = base / nome
+        if p.is_file():
+            return p
+    for name in ("logo_direcional.png", "logo.png"):
+        p = _ROOT / "assets" / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _logo_url_secrets() -> str | None:
+    try:
+        b = st.secrets.get("branding")
+        if isinstance(b, dict):
+            u = (b.get("LOGO_URL") or "").strip()
+            if u:
+                return u
+    except Exception:
+        pass
+    return None
+
+
+def _exibir_logo_topo() -> None:
+    path = _resolver_png_raiz(LOGO_TOPO_ARQUIVO)
+    url = _logo_url_secrets()
+    try:
+        if path:
+            ext = path.suffix.lower().lstrip(".")
+            mime = "image/png" if ext == "png" else "image/jpeg"
+            b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+            src = f"data:{mime};base64,{b64}"
+        elif url:
+            src = html.escape(url)
+        else:
+            src = html.escape(URL_LOGO_DIRECIONAL_FALLBACK)
+        st.markdown(
+            f'<div class="pv-logo-wrap"><img src="{src}" alt="Direcional Engenharia" /></div>',
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.markdown(
+            f'<div class="pv-logo-wrap"><img src="{html.escape(URL_LOGO_DIRECIONAL_FALLBACK)}" alt="Direcional" /></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def inject_css() -> None:
+    """CSS alinhado à ficha Vendas RJ (`aplicar_estilo`): gradiente global, cartão vidro, tipografia Montserrat+Inter."""
+    st.markdown(
+        f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&family=Inter:wght@400;500;600;700&display=swap');
+@keyframes fichaFadeIn {{
+  from {{ opacity: 0; transform: translateY(18px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+@keyframes fichaShimmer {{
+  0% {{ background-position: 0% 50%; }}
+  100% {{ background-position: 200% 50%; }}
+}}
+:root {{
+  --pv-content-max: min(1320px, 98vw);
+}}
+html, body {{
+  font-family: 'Inter', sans-serif;
+  color: {COR_TEXTO_LABEL};
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+.stApp,
+[data-testid="stApp"] {{
+  background:
+    linear-gradient(135deg, rgba({RGB_AZUL_CSS}, 0.82) 0%, rgba(30, 58, 95, 0.55) 38%, rgba({RGB_VERMELHO_CSS}, 0.22) 72%, rgba(15, 23, 42, 0.45) 100%),
+    url("{BG_HERO_URL}") center / cover no-repeat !important;
+  background-attachment: scroll !important;
+  background-color: transparent !important;
+}}
+[data-testid="stAppViewContainer"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+header[data-testid="stHeader"],
+[data-testid="stHeader"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}}
+[data-testid="stHeader"] > div,
+[data-testid="stHeader"] header {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}}
+[data-testid="stDecoration"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stSidebar"] {{ display: none !important; }}
+[data-testid="stSidebarCollapsedControl"] {{ display: none !important; }}
+[data-testid="stToolbar"] {{
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+}}
+[data-testid="stToolbar"] button,
+[data-testid="stToolbar"] a {{
+  color: rgba(255, 255, 255, 0.92) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stHeader"] button {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+[data-testid="stToolbar"] svg {{
+  fill: currentColor !important;
+  color: inherit !important;
+}}
+[data-testid="stToolbar"] svg path[stroke] {{
+  stroke: currentColor !important;
+}}
+[data-testid="stToolbar"] button:hover,
+[data-testid="stToolbar"] a:hover,
+[data-testid="stHeader"] button:hover {{
+  background: rgba(255, 255, 255, 0.12) !important;
+}}
+/* Tabelas HTML (ex.: Introdução): ocupam toda a largura útil do cartão */
+.pv-fullbleed-table-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 0 1rem 0 !important;
+  box-sizing: border-box;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}}
+.pv-fullbleed-table-wrap table {{
+  width: 100% !important;
+  border-collapse: collapse;
+  table-layout: auto;
+}}
+.pv-fullbleed-table-wrap th,
+.pv-fullbleed-table-wrap td {{
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}}
+/* Dataframes Streamlit: mesma largura útil (evita coluna estreita no cartão largo) */
+div[data-testid="stDataFrame"],
+div[data-testid="stDataFrame"] > div,
+div[data-testid="stDataFrameResizable"] {{
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+}}
+[data-testid="stMain"] {{
+  padding-left: clamp(2px, 0.9vw, 14px) !important;
+  padding-right: clamp(2px, 0.9vw, 14px) !important;
+  padding-top: clamp(12px, 3.5vh, 40px) !important;
+  padding-bottom: clamp(14px, 4vh, 44px) !important;
+  box-sizing: border-box !important;
+  background: transparent !important;
+}}
+section.main > div {{
+  padding-top: 0.25rem !important;
+  padding-bottom: 0.35rem !important;
+}}
+.block-container {{
+  max-width: var(--pv-content-max) !important;
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  margin-top: clamp(4px, 1vh, 14px) !important;
+  margin-bottom: clamp(4px, 1vh, 14px) !important;
+  padding: 1rem clamp(0.5rem, 1.6vw, 1.1rem) 1.1rem clamp(0.5rem, 1.6vw, 1.1rem) !important;
+  background: rgba(255, 255, 255, 0.97) !important;
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border-radius: 18px !important;
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
+  box-shadow:
+    0 4px 6px -1px rgba({RGB_AZUL_CSS}, 0.08),
+    0 24px 48px -12px rgba({RGB_AZUL_CSS}, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  animation: fichaFadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}}
+div[data-testid="stHorizontalBlock"] {{
+  width: 100% !important;
+}}
+h1, h2, h3 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+  text-align: center;
+}}
+h4, h5, h6 {{
+  font-family: 'Montserrat', sans-serif !important;
+  color: {COR_AZUL_ESC} !important;
+  text-align: center !important;
+}}
+.katex-display {{
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+.pv-section-title {{
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 800;
+  color: {COR_AZUL_ESC};
+  font-size: 1.05rem;
+  margin-top: 0.85rem;
+  margin-bottom: 0.5rem;
+  text-justify: auto !important;
+  hyphens: none !important;
+}}
+.pv-interpret-wrap {{
+  max-width: 100%;
+  margin: 0.35rem auto 0.85rem auto;
+  padding: 0 0.15rem;
+  box-sizing: border-box;
+  text-align: center;
+}}
+.pv-interpret-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-weight: 700;
+  font-size: 0.92rem;
+  color: {COR_AZUL_ESC};
+  margin: 0.4rem 0 0.25rem 0;
+  text-align: center !important;
+}}
+.pv-interpret-text {{
+  font-size: 0.86rem;
+  color: #475569 !important;
+  line-height: 1.5;
+  margin: 0 0 0.5rem 0;
+  text-align: center !important;
+  text-justify: none !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"] p.pv-interpret-title,
+[data-testid="stMarkdownContainer"] p.pv-interpret-text {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+div[data-testid="stTabs"] {{
+  margin-top: 0.4rem;
+  margin-bottom: 0.65rem;
+}}
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+  gap: 8px;
+  background: transparent;
+  border-bottom: 2px solid #e2e8f0;
+  padding-bottom: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+}}
+div[data-testid="stTabs"] button[data-baseweb="tab"] {{
+  border-radius: 12px 12px 0 0 !important;
+  font-family: 'Montserrat', sans-serif !important;
+  font-weight: 600 !important;
+  font-size: 0.9rem !important;
+  color: {COR_TEXTO_MUTED} !important;
+  background: #f1f5f9 !important;
+  border: 1px solid #e2e8f0 !important;
+  padding: 0.45rem 0.85rem !important;
+}}
+div[data-testid="stTabs"] [aria-selected="true"] {{
+  color: #ffffff !important;
+  background: linear-gradient(180deg, {COR_AZUL_ESC} 0%, #063572 100%) !important;
+  border-color: rgba({RGB_AZUL_CSS}, 0.45) !important;
+}}
+[data-testid="stDialog"] {{
+  border-radius: 20px !important;
+  border: 2px solid rgba({RGB_AZUL_CSS}, 0.2) !important;
+}}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li {{
+  color: #334155 !important;
+  line-height: 1.55;
+  text-align: justify;
+  text-justify: inter-word;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}}
+[data-testid="stMarkdownContainer"] p.pv-section-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-title,
+[data-testid="stMarkdownContainer"] p.pv-hero-sub,
+[data-testid="stMarkdownContainer"] p.pv-foot,
+[data-testid="stMarkdownContainer"] .pv-hero-block,
+[data-testid="stMarkdownContainer"] .pv-foot-wrap {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+}}
+[data-testid="stMarkdownContainer"]:has(.pv-hero-block),
+[data-testid="stMarkdownContainer"]:has(.pv-foot-wrap) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+[data-testid="stMarkdownContainer"] h1,
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3,
+[data-testid="stMarkdownContainer"] h4,
+[data-testid="stMarkdownContainer"] h5,
+[data-testid="stMarkdownContainer"] h6 {{
+  text-align: center !important;
+}}
+[data-testid="stMetric"] {{
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  text-align: center !important;
+}}
+[data-testid="stMetric"] [data-testid="stMarkdownContainer"] p {{
+  text-align: center !important;
+  text-justify: auto !important;
+}}
+[data-testid="stMetric"] label,
+[data-testid="stMetric"] [data-testid="stMetricLabel"] {{
+  text-align: center !important;
+  justify-content: center !important;
+}}
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] p {{
+  text-align: justify;
+  text-justify: inter-word;
+}}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] * {{
+  color: #475569 !important;
+}}
+/* Legenda sob métricas (Análises): matriz diária — centrada */
+[data-testid="stMarkdownContainer"] p.pv-caption-center {{
+  text-align: center !important;
+  text-justify: auto !important;
+  hyphens: none !important;
+  -webkit-hyphens: none !important;
+  color: #475569 !important;
+  font-size: 0.875rem !important;
+  line-height: 1.5 !important;
+  margin: 0.35rem auto 0.85rem auto !important;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}}
+[data-testid="stMarkdownContainer"]:has(p.pv-caption-center) {{
+  text-align: center !important;
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+[data-testid="stWidgetLabel"] label,
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextArea"] label,
+div[data-testid="stSelectbox"] label,
+div[data-testid="stMultiSelect"] label,
+div[data-testid="stCheckbox"] label {{
+  color: {COR_TEXTO_LABEL} !important;
+}}
+div[data-testid="stExpander"] {{
+  background: rgba(255, 255, 255, 0.98) !important;
+  border: 1px solid #e2e8f0 !important;
+  border-radius: 16px !important;
+}}
+div[data-testid="stExpander"] summary {{
+  color: #0f172a !important;
+}}
+div[data-testid="stAlert"] {{
+  border-radius: 14px !important;
+  border: 2px solid {COR_AZUL_ESC} !important;
+  background: #ffffff !important;
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1) !important;
+}}
+div[data-testid="stAlert"] p,
+div[data-testid="stAlert"] span,
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"],
+div[data-testid="stAlert"] div[data-testid="stMarkdownContainer"] * {{
+  color: {COR_AZUL_ESC} !important;
+}}
+div[data-testid="stAlert"] svg {{
+  fill: {COR_AZUL_ESC} !important;
+  color: {COR_AZUL_ESC} !important;
+}}
+[data-testid="stVerticalBlockBorderWrapper"] {{
+  border-radius: 16px !important;
+}}
+[data-testid="stDataFrame"],
+[data-testid="stDataFrame"] > div {{
+  background: #ffffff !important;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid {COR_BORDA};
+}}
+[data-testid="stPlotlyChart"],
+[data-testid="stPlotlyChart"] > div,
+[data-testid="stPlotlyChart"] .js-plotly-plot,
+[data-testid="stPlotlyChart"] .plot-container {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+div[data-baseweb="input"] {{
+  border-radius: 10px !important;
+  border: 1px solid #e2e8f0 !important;
+  background-color: {COR_INPUT_BG} !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}}
+div[data-baseweb="input"]:focus-within {{
+  border-color: rgba({RGB_AZUL_CSS}, 0.35) !important;
+  box-shadow: 0 0 0 3px rgba({RGB_AZUL_CSS}, 0.08) !important;
+}}
+.stButton > button,
+div[data-testid="stButton"] > button {{
+  border-radius: 12px !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+}}
+.stButton > button:hover,
+div[data-testid="stButton"] > button:hover {{
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px -6px rgba({RGB_AZUL_CSS}, 0.25) !important;
+}}
+/* Botão primário (vermelho): texto e filhos em branco (Streamlit usa p/span e baseButton-primary). */
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="baseButton-primary"],
+div[data-testid="stButton"] > button[kind="primary"],
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] {{
+  background: linear-gradient(180deg, {COR_VERMELHO} 0%, {COR_VERMELHO_ESCURO} 100%) !important;
+  color: #ffffff !important;
+  border: none !important;
+  font-weight: 700 !important;
+  font-family: 'Montserrat', sans-serif !important;
+  border-radius: 12px !important;
+  padding: 0.65rem 2rem !important;
+  min-height: 3rem !important;
+  font-size: 1rem !important;
+  letter-spacing: 0.02em;
+}}
+.stButton > button[kind="primary"] p,
+.stButton > button[kind="primary"] span,
+.stButton > button[data-testid="baseButton-primary"] p,
+.stButton > button[data-testid="baseButton-primary"] span,
+div[data-testid="stButton"] > button[kind="primary"] p,
+div[data-testid="stButton"] > button[kind="primary"] span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"] span {{
+  color: #ffffff !important;
+}}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[kind="primary"]:focus,
+.stButton > button[kind="primary"]:focus-visible,
+.stButton > button[kind="primary"]:active,
+.stButton > button[data-testid="baseButton-primary"]:hover,
+.stButton > button[data-testid="baseButton-primary"]:focus,
+.stButton > button[data-testid="baseButton-primary"]:focus-visible,
+.stButton > button[data-testid="baseButton-primary"]:active,
+div[data-testid="stButton"] > button[kind="primary"]:hover,
+div[data-testid="stButton"] > button[kind="primary"]:focus,
+div[data-testid="stButton"] > button[kind="primary"]:focus-visible,
+div[data-testid="stButton"] > button[kind="primary"]:active,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:focus-visible,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:active {{
+  color: #ffffff !important;
+  box-shadow: 0 8px 22px -6px rgba({RGB_VERMELHO_CSS}, 0.45) !important;
+}}
+.stButton > button[kind="primary"]:hover p,
+.stButton > button[kind="primary"]:hover span,
+.stButton > button[data-testid="baseButton-primary"]:hover p,
+.stButton > button[data-testid="baseButton-primary"]:hover span,
+div[data-testid="stButton"] > button[kind="primary"]:hover p,
+div[data-testid="stButton"] > button[kind="primary"]:hover span,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover p,
+div[data-testid="stButton"] > button[data-testid="baseButton-primary"]:hover span {{
+  color: #ffffff !important;
+}}
+a[href*="whatsapp.com"],
+a[href*="wa.me"] {{
+  background-color: #25D366 !important;
+  color: #ffffff !important;
+  border: 1px solid #1ebe57 !important;
+  border-radius: 12px !important;
+  font-weight: 600 !important;
+}}
+.ficha-alert {{
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin: 0 0 12px 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  box-sizing: border-box;
+}}
+.ficha-alert--azul {{
+  border: 2px solid {COR_AZUL_ESC};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_AZUL_CSS}, 0.1);
+}}
+.ficha-alert--vermelho {{
+  border: 2px solid {COR_VERMELHO};
+  background: #ffffff;
+  color: {COR_AZUL_ESC};
+  box-shadow: 0 2px 12px rgba({RGB_VERMELHO_CSS}, 0.12);
+}}
+/* Bloco do título principal: ocupa a largura e centra texto (evita herdar alinhamento do Streamlit) */
+.pv-hero-block {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  box-sizing: border-box !important;
+  text-align: center !important;
+  display: block !important;
+}}
+.pv-hero-block p {{
+  text-align: center !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}}
+[data-testid="element-container"]:has(.pv-hero-block),
+[data-testid="stVerticalBlock"] [data-testid="stMarkdownContainer"]:has(.pv-hero-block) {{
+  width: 100% !important;
+  max-width: 100% !important;
+}}
+.pv-logo-wrap, .ficha-logo-wrap {{
+  text-align: center;
+  padding: 0.1rem 0 0.45rem 0;
+}}
+.pv-logo-wrap img, .ficha-logo-wrap img {{
+  max-height: 72px;
+  width: auto;
+  max-width: min(280px, 85vw);
+  height: auto;
+  object-fit: contain;
+  display: inline-block;
+  vertical-align: middle;
+}}
+.pv-hero-title, .ficha-title {{
+  font-family: 'Montserrat', sans-serif;
+  font-size: clamp(1.35rem, 3.5vw, 1.75rem);
+  font-weight: 900;
+  color: {COR_AZUL_ESC};
+  text-align: center;
+  margin: 0;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}}
+.pv-hero-sub, .ficha-sub {{
+  text-align: center;
+  color: #475569;
+  font-size: 0.95rem;
+  margin: 0.45rem 0 0 0;
+  line-height: 1.45;
+}}
+.pv-bar-wrap, .ficha-hero-bar-wrap {{
+  width: 100%;
+  max-width: 100%;
+  margin: clamp(0.85rem, 2.4vw, 1.2rem) 0;
+  padding: 0;
+  box-sizing: border-box;
+}}
+.pv-bar, .ficha-hero-bar {{
+  height: 4px;
+  width: 100%;
+  margin: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, {COR_AZUL_ESC}, {COR_VERMELHO}, {COR_AZUL_ESC});
+  background-size: 200% 100%;
+  animation: fichaShimmer 4s ease-in-out infinite alternate;
+}}
+.pv-status-pill {{
+  display: inline-block;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.85rem;
+}}
+.pv-status-ok {{ background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }}
+.pv-status-warn {{ background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }}
+div.metric-card {{
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  background: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+  border-radius: 16px;
+  padding: 1.1rem 1.35rem 1rem 1.35rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba({RGB_AZUL_CSS}, 0.06);
+  border-left: 3px solid {COR_AZUL_ESC};
+  transition: box-shadow 0.35s ease, transform 0.35s ease;
+  animation: fichaFadeIn 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+  text-align: center;
+}}
+div.metric-card:hover {{
+  box-shadow: 0 8px 24px -6px rgba({RGB_AZUL_CSS}, 0.12);
+  transform: translateY(-1px);
+}}
+div.metric-card h4 {{
+  font-family: 'Montserrat', sans-serif;
+  color: {COR_TEXTO_MUTED};
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 800;
+  margin: 0 0 0.35rem 0;
+  text-align: center;
+}}
+div.metric-card .val {{
+  color: #0f172a;
+  font-size: 1.28rem;
+  font-weight: 800;
+  font-family: 'Montserrat', sans-serif;
+  text-align: center;
+}}
+.stDownloadButton > button {{
+  border-radius: 12px !important;
+  border: 2px solid {COR_AZUL_ESC} !important;
+  color: {COR_AZUL_ESC} !important;
+  font-weight: 600 !important;
+}}
+.pv-foot-wrap {{
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 auto !important;
+  text-align: center !important;
+  display: block !important;
+  box-sizing: border-box !important;
+}}
+.pv-foot, .footer {{
+  text-align: center !important;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.85rem 0 0.35rem 0;
+  color: {COR_TEXTO_MUTED};
+  font-size: 0.82rem;
+  margin: 1rem auto 0 auto;
+  border-top: 1px solid {COR_BORDA};
+}}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _merge_spreadsheet_config_from_google_sheets(
+    ids: dict[str, str], hints: dict[str, list[str]]
+) -> None:
+    """IDs e *hints* opcionais dentro de `[google_sheets]` (mesmo padrão da Ficha: uma secção só)."""
+    try:
+        gs = st.secrets.get("google_sheets")
+    except Exception:
+        return
+    if not isinstance(gs, dict):
+        return
+    for k, v in gs.items():
+        kl = str(k).strip().lower()
+        if kl in _GOOGLE_SHEETS_RESERVED_LOWER:
+            continue
+        if k in ids and str(v).strip():
+            ids[k] = str(v).strip()
+    sid_map = gs.get("spreadsheet_ids")
+    if isinstance(sid_map, dict):
+        for k, v in dict(sid_map).items():
+            if k in ids:
+                ids[k] = str(v).strip()
+    sh_map = gs.get("sheets")
+    if isinstance(sh_map, dict):
+        for k, v in dict(sh_map).items():
+            if k not in ids:
+                continue
+            if isinstance(v, (list, tuple)) and len(v) >= 1:
+                ids[k] = str(v[0]).strip()
+                if len(v) >= 2:
+                    g = str(v[1]).strip()
+                    cur = hints.get(k, [])
+                    hints[k] = [g] + [x for x in cur if x != g]
+    gh = gs.get("csv_gid_hints")
+    if isinstance(gh, dict):
+        for k, v in dict(gh).items():
+            if k in hints and isinstance(v, list):
+                hints[k] = [str(x) for x in v]
+
+
+def _data_source_config() -> tuple[dict[str, str], dict[str, list[str]]]:
+    ids = dict(DEFAULT_SPREADSHEET_IDS)
+    hints = {k: list(v) for k, v in CSV_GID_HINTS.items()}
+    try:
+        _merge_spreadsheet_config_from_google_sheets(ids, hints)
+        if "spreadsheet_ids" in st.secrets:
+            for k, v in dict(st.secrets["spreadsheet_ids"]).items():
+                if k in ids:
+                    ids[k] = str(v).strip()
+        if "sheets" in st.secrets:
+            for k, v in dict(st.secrets["sheets"]).items():
+                if k not in ids:
+                    continue
+                if isinstance(v, (list, tuple)) and len(v) >= 1:
+                    ids[k] = str(v[0]).strip()
+                    if len(v) >= 2:
+                        g = str(v[1]).strip()
+                        cur = hints.get(k, [])
+                        hints[k] = [g] + [x for x in cur if x != g]
+        if "csv_gid_hints" in st.secrets:
+            for k, v in dict(st.secrets["csv_gid_hints"]).items():
+                if k in hints and isinstance(v, list):
+                    hints[k] = [str(x) for x in v]
+    except Exception:
+        pass
+    return ids, hints
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_one_role_cached(
+    sa_fp: str,
+    spreadsheet_id: str,
+    role_key: str,
+    hints_tuple: tuple[str, ...],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    # Sempre tenta API se as credenciais existirem (não depender de use_sa calculado fora do cache).
+    gc = gspread_client_from_streamlit()
+    return load_role_dataframe(
+        gc,
+        spreadsheet_id,
+        role_key,
+        csv_gid_hints=list(hints_tuple) if hints_tuple else None,
+    )
+
+
+def build_data_bundle() -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]], bool]:
+
+    ids, hints = _data_source_config()
+    gc = gspread_client_from_streamlit()
+    use_sa = gc is not None
+    sa_fp = _sa_fingerprint_for_cache()
+    json_ok = (
+        service_account_info_from_streamlit_secrets() is not None
+        or _service_account_info_from_env() is not None
+    )
+
+    out: dict[str, pd.DataFrame] = {}
+    metas: dict[str, dict[str, Any]] = {}
+    mapping = [
+        ("leads", "leads"),
+        ("agendamentos", "agendamentos"),
+        ("pastas", "pastas"),
+        ("vendas", "vendas"),
+        ("formulario_previsao", "formulario_previsao"),
+    ]
+    errors: list[str] = []
+    for key, cfg_key in mapping:
+        human = ROLE_LABELS.get(cfg_key, cfg_key)
+        sid = ids[cfg_key]
+        htuple = tuple(hints.get(cfg_key, []))
+        try:
+            df, meta = _load_one_role_cached(sa_fp, sid, cfg_key, htuple)
+            out[key] = df
+            metas[cfg_key] = meta
+        except Exception as e:
+            errors.append(f"**{human}** (`{sid[:12]}…`): {e}")
+    if errors:
+        if json_ok and not use_sa:
+            modo = (
+                "**Conta de serviço:** o JSON foi reconhecido nas secrets, mas o cliente **gspread não iniciou** "
+                "(chave privada inválida, JSON truncado ou formato incorreto). Valide o ficheiro no Google Cloud Console.\n\n"
+                "Se o cliente iniciar mas a leitura falhar: ative as APIs **Google Sheets** e **Google Drive** no projeto, "
+                "e partilhe **cada** planilha com o e-mail `client_email` do JSON como **Leitor**."
+            )
+        elif use_sa:
+            modo = (
+                "**Conta de serviço ativa:** confirme partilha **Leitor** com o e-mail `client_email` em **todas** as planilhas "
+                "e que o ID na configuração corresponde ao livro correto."
+            )
+        else:
+            modo = (
+                "**Sem API:** configure `GOOGLE_SERVICE_ACCOUNT_JSON` na raiz das secrets **ou** dentro de `[google_sheets]` "
+                "(string com o JSON completo da conta de serviço). O export CSV anónimo costuma **falhar em servidores na nuvem** "
+                "(respostas HTTP 403 ou HTML); a API é o método suportado em produção."
+            )
+        st.error("Não foi possível carregar todas as fontes.\n\n" + modo + "\n\n" + "\n\n".join(errors))
+        st.stop()
+    return out, metas, use_sa
+
+
+def _build_ml_dossie_pack(df_master: pd.DataFrame) -> dict[str, Any]:
+    """
+    Agregados para o dossiê ML: descritivas, outliers (IQR), correlação, VIF, balanceamento.
+    Evita guardar a matriz completa no session_state.
+    """
+    if df_master is None or len(df_master) < 5:
+        return {"erro": "Série insuficiente para o dossiê estatístico."}
+    dm = df_master
+    idx = pd.DatetimeIndex(pd.to_datetime(dm.index).normalize())
+
+    core = [
+        c
+        for c in (
+            "vol_leads",
+            "vol_agend",
+            "vol_visit",
+            "vol_pastas",
+            "target_qtd",
+            "target_valor",
+        )
+        if c in dm.columns
+    ]
+    num = dm.select_dtypes(include=[np.number])
+    fb_cols = [
+        c
+        for c in num.columns
+        if str(c).startswith("fb_vgv_") or str(c).startswith("fb_qtd_")
+    ]
+    seen = set(core) | set(fb_cols)
+    cols_extra = [c for c in num.columns if c not in seen][:30]
+    focus_cols = core + fb_cols + cols_extra
+
+    rows_stats: list[dict[str, Any]] = []
+    outliers_iqr: list[dict[str, Any]] = []
+    for c in focus_cols:
+        s = pd.to_numeric(dm[c], errors="coerce").dropna()
+        if len(s) < 5:
+            continue
+        q1_f = float(s.quantile(0.25))
+        q3_f = float(s.quantile(0.75))
+        iqr = q3_f - q1_f
+        lo, hi = q1_f - 1.5 * iqr, q3_f + 1.5 * iqr
+        n_out = int(((s < lo) | (s > hi)).sum())
+        mode_v = s.mode()
+        mode_f = float(mode_v.iloc[0]) if len(mode_v) else float("nan")
+        rows_stats.append(
+            {
+                "variavel": c,
+                "n": int(len(s)),
+                "media": float(s.mean()),
+                "mediana": float(s.median()),
+                "moda": mode_f,
+                "desvio_padrao": float(s.std()),
+                "variancia": float(s.var()),
+                "min": float(s.min()),
+                "p01": float(s.quantile(0.01)),
+                "p05": float(s.quantile(0.05)),
+                "q1": q1_f,
+                "q2": float(s.quantile(0.50)),
+                "q3": q3_f,
+                "p95": float(s.quantile(0.95)),
+                "p99": float(s.quantile(0.99)),
+                "max": float(s.max()),
+                "assimetria": float(s.skew()),
+                "curtose_excesso": float(s.kurtosis()),
+            }
+        )
+        outliers_iqr.append(
+            {
+                "variavel": c,
+                "n_outliers_iqr": n_out,
+                "pct_outliers": float(100.0 * n_out / len(s)),
+            }
+        )
+
+    sub = dm[focus_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    corr_labels: list[str] = []
+    corr_z: list[list[float]] = []
+    pares_mc: list[dict[str, Any]] = []
+    if len(sub) > 2 and sub.shape[1] >= 2:
+        cm = sub.corr().fillna(0.0)
+        corr_labels = [str(x) for x in cm.columns]
+        corr_z = [
+            [float(cm.iloc[i, j]) for j in range(len(corr_labels))]
+            for i in range(len(corr_labels))
+        ]
+        for i in range(len(cm.columns)):
+            for j in range(i + 1, len(cm.columns)):
+                v = float(cm.iloc[i, j])
+                if abs(v) >= 0.85:
+                    pares_mc.append(
+                        {
+                            "a": str(cm.columns[i]),
+                            "b": str(cm.columns[j]),
+                            "r_pearson": v,
+                        }
+                    )
+        pares_mc.sort(key=lambda x: -abs(float(x["r_pearson"])))
+
+    vif_rows: list[dict[str, Any]] = []
+    try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from statsmodels.tools.tools import add_constant
+
+        vif_cols = focus_cols[: min(16, len(focus_cols))]
+        Xv = dm[vif_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        Xv = Xv.loc[:, Xv.std() > 1e-12]
+        if Xv.shape[1] >= 2 and len(Xv) > Xv.shape[1] + 2:
+            Xc = add_constant(Xv.values, has_constant="add")
+            for i in range(1, Xc.shape[1]):
+                try:
+                    vi = float(variance_inflation_factor(Xc, i))
+                except Exception:
+                    vi = float("nan")
+                vif_rows.append({"variavel": str(Xv.columns[i - 1]), "vif": vi})
+    except Exception:
+        pass
+
+    balance: dict[str, Any] = {}
+    hist_qtd: dict[str, Any] = {}
+    hist_vgv: dict[str, Any] = {}
+    if "target_qtd" in dm.columns:
+        tq = pd.to_numeric(dm["target_qtd"], errors="coerce").fillna(0.0)
+        med = float(tq.median())
+        above = int((tq > med).sum())
+        below = int((tq <= med).sum())
+        balance = {
+            "mediana_referencia": med,
+            "dias_acima_mediana": above,
+            "dias_abaixo_igual_mediana": below,
+            "proporcao_classe_minoritaria": float(min(above, below) / max(len(tq), 1)),
+        }
+        counts, edges = np.histogram(tq.to_numpy(dtype=float), bins=min(32, max(8, len(tq) // 5)))
+        hist_qtd = {
+            "counts": [int(x) for x in counts],
+            "edges": [float(x) for x in edges],
+        }
+    if "target_valor" in dm.columns:
+        tv = pd.to_numeric(dm["target_valor"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if len(tv) > 5 and np.nanmax(tv) > 0:
+            counts, edges = np.histogram(tv, bins=min(28, max(8, len(tv) // 6)))
+            hist_vgv = {
+                "counts": [int(x) for x in counts],
+                "edges": [float(x) for x in edges],
+            }
+
+    return {
+        "descritivas": rows_stats,
+        "outliers_iqr": outliers_iqr,
+        "correlation_labels": corr_labels,
+        "correlation_matrix": corr_z,
+        "pares_multicolinearidade": pares_mc[:45],
+        "vif": vif_rows,
+        "balanceamento_qtd": balance,
+        "hist_target_qtd": hist_qtd,
+        "hist_target_valor": hist_vgv,
+        "n_linhas": int(len(dm)),
+        "n_colunas": int(dm.shape[1]),
+        "primeira_data": idx.min().strftime("%Y-%m-%d"),
+        "ultima_data": idx.max().strftime("%Y-%m-%d"),
+    }
+
+
+def run_training_pipeline(
+    dfs: dict[str, pd.DataFrame],
+    custom_previsao: dict[str, Any] | None = None,
+    horizontes: list[int] | None = None,
+) -> tuple[
+    dict[str, float],
+    float,
+    float,
+    dict[Any, dict[str, Any]],
+    dict[Any, dict[str, dict[str, Any]]],
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
+    df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
+    dossie_ml = _build_ml_dossie_pack(df_master)
+
+    stats_base = {
+        "leads": float(df_master["vol_leads"].sum()),
+        "agend": float(df_master["vol_agend"].sum()),
+        "visit": float(df_master["vol_visit"].sum()),
+        "pastas": float(df_master["vol_pastas"].sum()),
+        "vendas": float(df_master["target_qtd"].sum()),
+        "vgv": float(df_master["target_valor"].sum()),
+    }
+    ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
+    conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
+
+    if horizontes is None:
+        horizontes = list(HORIZONTES_PREVISAO_DISPONIVEIS)
+    else:
+        horizontes = normalize_horizontes_previsao(horizontes)
+    por_horizonte: dict[Any, dict[str, Any]] = {}
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]] = {}
+
+    def pack(r: Any, pred_last: float) -> dict[str, Any]:
+        return {
+            "metrics_val": r.metrics_val,
+            "metrics_test": r.metrics_test,
+            "importance_names": r.importance.index.tolist() if len(r.importance) else [],
+            "importance_vals": r.importance.values.tolist() if len(r.importance) else [],
+            "y_test": r.y_test.tolist(),
+            "pred_test": r.y_test_pred.tolist(),
+            "dates_test": [d.strftime("%Y-%m-%d") for d in r.dates_test],
+            "pred_ultimo_dia": pred_last,
+            "model_label": r.model_label,
+            "full_period_train": r.full_period_train,
+            "chart_dates": r.chart_dates,
+            "chart_y_real": r.chart_y_real,
+            "chart_y_pred": r.chart_y_pred,
+            "chart_split_index": r.chart_split_index,
+            "benchmark_appendix": r.benchmark_appendix,
+        }
+
+    cvals: list[Any] = []
+    if isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) != "range":
+        cvals = list(custom_previsao.get("values") or [])
+    range_mode = (
+        isinstance(custom_previsao, dict) and str(custom_previsao.get("mode")) == "range"
+    )
+    ds_raw = (custom_previsao or {}).get("date_start") if range_mode else None
+    de_raw = (custom_previsao or {}).get("date_end") if range_mode else None
+    range_ok = range_mode and bool(ds_raw) and bool(de_raw)
+    vals_ok = isinstance(custom_previsao, dict) and not range_mode and bool(cvals)
+    have_custom = range_ok or vals_ok
+    extra_custom = 1 if have_custom else 0
+    progress = st.progress(0, text="A preparar modelos…")
+    total_steps = len(horizontes) + extra_custom
+    step = 0
+
+    for h in horizontes:
+        Xq, yq = build_xy_for_horizon(df_master, "target_qtd", h)
+
+        progress.progress(
+            (step + 0.5) / total_steps,
+            text=f"Volume — {h} dias…",
+        )
+        rq = train_one_target(
+            Xq,
+            yq,
+            horizon=h,
+            target_name="qtd",
+            n_trials=OPTUNA_TRIALS_AUTO,
+            random_state=RANDOM_SEED,
+            optuna_seed=RANDOM_SEED,
+            blend_top_k=BLEND_TOP_K_FIXO,
+            show_progress=SHOW_ML_PROGRESS,
+            full_period_train=FULL_PERIOD_TRAIN_FIXO,
+            train_frac=TRAIN_FRAC_FIXO,
+        )
+        step += 1
+        progress.progress(step / total_steps, text=f"Concluído H={h}d")
+
+        pred_q = predict_last_row(df_master, rq.pipeline, h)
+
+        por_horizonte[h] = {"qtd": pack(rq, pred_q)}
+        best_params_preview[h] = {"qtd": rq.best_params}
+
+    por_custom: dict[str, Any] | None = None
+    if have_custom:
+        if range_ok:
+            d_lo = pd.Timestamp(ds_raw).normalize()
+            d_hi = pd.Timestamp(de_raw).normalize()
+            if d_hi < d_lo:
+                d_lo, d_hi = d_hi, d_lo
+            span = int((d_hi - d_lo).days) + 1
+            hz_eff = max(14, min(120, span * 2))
+            lbl = (
+                f"Soma no intervalo [{d_lo.date()} → {d_hi.date()}] "
+                "(dias da série estritamente após t)"
+            )
+            Xqc, yqc = build_xy_custom_date_range(df_master, "target_qtd", d_lo, d_hi)
+            mode = "range"
+            vals: list[Any] = []
+        else:
+            mode = str((custom_previsao or {}).get("mode") or "offsets")
+            vals = list(cvals)
+            if mode == "offsets":
+                hz_eff = max(vals)
+                Xqc, yqc = build_xy_custom_offsets(df_master, "target_qtd", vals)
+                lbl = "Soma nas defasagens t+k (dias): " + ", ".join(str(v) for v in vals)
+            else:
+                hz_eff = 18
+                Xqc, yqc = build_xy_custom_dom(df_master, "target_qtd", vals)
+                lbl = "Soma nos dias do mês (estritamente após o dia corrente): " + ", ".join(
+                    str(v) for v in vals
+                )
+
+        if len(Xqc) < 22:
+            dossie_ml["aviso_previsao_custom"] = (
+                "Cenário personalizado ignorado: menos de 22 observações válidas após alinhar o alvo."
+            )
+        else:
+            progress.progress(
+                max(0.01, (step + 0.5) / total_steps),
+                text="Cenário personalizado — volume…",
+            )
+            rqc = train_one_target(
+                Xqc,
+                yqc,
+                horizon=hz_eff,
+                target_name="qtd",
+                n_trials=OPTUNA_TRIALS_AUTO,
+                random_state=RANDOM_SEED,
+                optuna_seed=RANDOM_SEED + 7,
+                blend_top_k=BLEND_TOP_K_FIXO,
+                show_progress=SHOW_ML_PROGRESS,
+                full_period_train=FULL_PERIOD_TRAIN_FIXO,
+                train_frac=TRAIN_FRAC_FIXO,
+            )
+            step += 1
+            progress.progress(step / total_steps, text="Cenário personalizado concluído")
+            if mode == "range":
+                pqc = predict_last_row_custom_date_range(
+                    df_master, rqc.pipeline, d_lo, d_hi
+                )
+            elif mode == "offsets":
+                pqc = predict_last_row_custom_offsets(df_master, rqc.pipeline, vals)
+            else:
+                pqc = predict_last_row_custom_dom(df_master, rqc.pipeline, vals)
+            por_custom = {
+                "label": lbl,
+                "mode": mode,
+                "values": vals,
+                "horizon_effective": hz_eff,
+                "qtd": pack(rqc, pqc),
+            }
+            if mode == "range":
+                por_custom["date_start"] = str(d_lo.date())
+                por_custom["date_end"] = str(d_hi.date())
+            best_params_preview["custom"] = {
+                "qtd": rqc.best_params,
+            }
+
+    daily_pack = _daily_pack_from_master(df_master)
+    progress.progress(1.0, text="A gerar relatório…")
+    html_out = render_dashboard(
+        stats_base,
+        ticket,
+        conv,
+        horizontes,
+        por_horizonte,
+        best_params_preview,
+        out_path=None,
+        full_period_train=FULL_PERIOD_TRAIN_FIXO,
+        daily_pack=daily_pack,
+        blend_top_k=BLEND_TOP_K_FIXO,
+        random_seed=RANDOM_SEED,
+    )
+    return (
+        stats_base,
+        ticket,
+        conv,
+        por_horizonte,
+        best_params_preview,
+        html_out,
+        daily_pack,
+        dossie_ml,
+        por_custom,
+    )
+
+
+def run_analytics_only_pipeline(
+    dfs: dict[str, pd.DataFrame],
+) -> tuple[dict[str, float], float, float, dict[str, Any], dict[str, Any]]:
+    """Consolida matriz diária, *daily_pack* e dossiê EDA — sem treino de modelos preditivos."""
+    df_master = build_daily_master(dfs, show_progress=SHOW_ML_PROGRESS)
+    dossie_ml = _build_ml_dossie_pack(df_master)
+    stats_base = {
+        "leads": float(df_master["vol_leads"].sum()),
+        "agend": float(df_master["vol_agend"].sum()),
+        "visit": float(df_master["vol_visit"].sum()),
+        "pastas": float(df_master["vol_pastas"].sum()),
+        "vendas": float(df_master["target_qtd"].sum()),
+        "vgv": float(df_master["target_valor"].sum()),
+    }
+    ticket = stats_base["vgv"] / stats_base["vendas"] if stats_base["vendas"] > 0 else 0.0
+    conv = (stats_base["vendas"] / stats_base["leads"] * 100) if stats_base["leads"] > 0 else 0.0
+    daily_pack = _daily_pack_from_master(df_master)
+    return stats_base, ticket, conv, daily_pack, dossie_ml
+
+
+def _streamlit_carregar_dados_exploratorios() -> None:
+    """Lê planilhas, constrói matriz diária e preenche `dados_exploratorios` (sem treino ML)."""
+    with st.spinner("A carregar e consolidar dados…"):
+        dfs_e, sheet_e, used_e = build_data_bundle()
+    st.session_state["sheet_metas"] = sheet_e
+    st.session_state["used_service_account"] = used_e
+    try:
+        with st.spinner("A preparar indicadores e série diária…"):
+            sb, tk, cv, dpk, dml = run_analytics_only_pipeline(dfs_e)
+        st.session_state.dados_exploratorios = {
+            "stats_base": sb,
+            "ticket": tk,
+            "conv": cv,
+            "daily_pack": dpk,
+            "dossie_ml": dml,
+            "sheet_metas": sheet_e,
+            "df_formulario": dfs_e.get("formulario_previsao"),
+        }
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao preparar análises: {e}")
+        st.exception(e)
+
+
+def _render_tab_formulario_previsao_humano() -> None:
+    """Painéis a partir da planilha de respostas ao formulário (previsão vs real, filtros)."""
+    import plotly.colors as plc
+    import plotly.graph_objects as go
+
+    st.markdown(
+        '<p class="pv-section-title">Formulário — previsão humana</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='text-align:justify;color:#64748b;font-size:0.92rem;margin:0 auto 1rem auto;max-width:100%'>"
+        "Respostas ao <strong>Esboço — formulário</strong>: quantidades e VGV previstos versus realizados, por "
+        "<em>empreendimento</em>, <em>canal</em>, <em>regional</em> e <em>data de referência</em> (sábado). "
+        "Utilize <strong>Análises → Carregar dados</strong> ou <strong>Previsões → Gerar previsões</strong>, "
+        "ou o botão abaixo para sincronizar as planilhas.</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "Sincronizar planilhas (inclui formulário)",
+        key="pv_form_reload",
+        width="stretch",
+    ):
+        with st.spinner("A ler Google Sheets…"):
+            dfs_f, meta_f, ua_f = build_data_bundle()
+        st.session_state["sheet_metas"] = meta_f
+        st.session_state["used_service_account"] = ua_f
+        st.session_state["formulario_snapshot"] = dfs_f.get("formulario_previsao")
+        st.success("Formulário atualizado a partir das fontes configuradas.")
+        st.rerun()
+
+    df_raw = _formulario_df_from_state()
+    if df_raw is None or df_raw.empty:
+        st.info(
+            "Nenhuma base do formulário em memória. Carregue os dados na aba **Análises** ou **Previsões**, "
+            "ou clique em **Sincronizar planilhas** acima."
+        )
+        return
+
+    fn = normalize_dataframe_columns(df_raw.copy())
+    mc = _formulario_map_columns(fn)
+
+    def _ref_series() -> pd.Series:
+        if not mc.get("ref") or mc["ref"] not in fn.columns:
+            return pd.Series(pd.NaT, index=fn.index)
+        return pd.to_datetime(fn[mc["ref"]], errors="coerce")
+
+    rs = _ref_series()
+    fn["_ref_d"] = rs.dt.normalize()
+
+    emp_c = mc.get("empreendimento")
+    reg_c = mc.get("regional")
+    canal_c = mc.get("canal")
+    regiao_c = mc.get("regiao")
+
+    st.markdown("##### Filtros")
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        emp_opts: list[str] = []
+        if emp_c and emp_c in fn.columns:
+            emp_opts = sorted({str(x).strip() for x in fn[emp_c].dropna().unique() if str(x).strip()})
+        sel_emp = st.multiselect("Empreendimento", options=emp_opts, default=[], key="pv_ff_emp")
+    with f2:
+        dlist = sorted({_ for _ in fn["_ref_d"].dropna().unique()})
+        d_labels = [pd.Timestamp(x).strftime("%Y-%m-%d") for x in dlist]
+        sel_d = st.multiselect("Data de referência (sábado)", options=d_labels, default=[], key="pv_ff_dt")
+    with f3:
+        canal_opts: list[str] = []
+        if canal_c and canal_c in fn.columns:
+            canal_opts = sorted({_formulario_canon_canal(x) for x in fn[canal_c].unique()})
+        sel_canal = st.multiselect("Canal", options=canal_opts, default=[], key="pv_ff_canal")
+    with f4:
+        reg_opts: list[str] = []
+        if reg_c and reg_c in fn.columns:
+            reg_opts = sorted({str(x).strip() for x in fn[reg_c].dropna().unique() if str(x).strip()})
+        sel_reg = st.multiselect("Regional ou IMOB", options=reg_opts, default=[], key="pv_ff_reg")
+
+    dff = fn.copy()
+    if sel_emp and emp_c and emp_c in dff.columns:
+        dff = dff[dff[emp_c].astype(str).isin(sel_emp)]
+    if sel_d:
+        pick = {pd.Timestamp(s).normalize() for s in sel_d}
+        dff = dff[dff["_ref_d"].isin(pick)]
+    if sel_canal and canal_c and canal_c in dff.columns:
+        dff = dff[dff[canal_c].map(_formulario_canon_canal).isin(sel_canal)]
+    if sel_reg and reg_c and reg_c in dff.columns:
+        dff = dff[dff[reg_c].astype(str).isin(sel_reg)]
+
+    if dff.empty:
+        st.warning("Sem linhas após aplicar os filtros.")
+        return
+
+    st.caption(f"**{len(dff):,}** linhas (após filtros) · **{dff.shape[1]}** colunas na base bruta.")
+
+    qfp, qfr = mc.get("q_fac_p"), mc.get("q_fac_r")
+    qnp, qnr = mc.get("q_norm_p"), mc.get("q_norm_r")
+    vgp, vgr = mc.get("vgv_prev"), mc.get("vgv_real")
+    vprev, vreal = mc.get("vendas_prev"), mc.get("vendas_real")
+    nf_p = mc.get("nf_prev")
+
+    s_qfp = _formulario_num_series(dff, qfp)
+    s_qfr = _formulario_num_series(dff, qfr)
+    s_qnp = _formulario_num_series(dff, qnp)
+    s_qnr = _formulario_num_series(dff, qnr)
+    s_vgp = _formulario_num_series(dff, vgp)
+    s_vgr = _formulario_num_series(dff, vgr)
+
+    tot_fac_p = float(s_qfp.sum())
+    tot_fac_r = float(s_qfr.sum())
+    tot_norm_p = float(s_qnp.sum())
+    tot_norm_r = float(s_qnr.sum())
+    tot_vgv_p = float(s_vgp.sum())
+    tot_vgv_r = float(s_vgr.sum())
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("QTD facilitadas — previstas", f"{tot_fac_p:,.0f}")
+    with m2:
+        st.metric("QTD facilitadas — reais", f"{tot_fac_r:,.0f}")
+    with m3:
+        st.metric("QTD normais — previstas", f"{tot_norm_p:,.0f}")
+    with m4:
+        st.metric("QTD normais — reais", f"{tot_norm_r:,.0f}")
+    with m5:
+        st.metric("VGV previsto (soma)", f"R$ {tot_vgv_p/1e6:.2f} mi")
+    with m6:
+        st.metric("VGV real (soma)", f"R$ {tot_vgv_r/1e6:.2f} mi")
+
+    if mc.get("erro") and mc["erro"] in dff.columns:
+        err = pd.to_numeric(dff[mc["erro"]], errors="coerce").dropna()
+        if len(err):
+            e1, e2 = st.columns(2)
+            with e1:
+                st.metric("Erro de previsão — média |·|", f"{float(err.abs().mean()):,.2f}")
+            with e2:
+                st.metric("Erro de previsão — mediana", f"{float(err.median()):,.2f}")
+
+    _ipc = {"displayModeBar": True, "displaylogo": False}
+    pal = plc.qualitative.Bold + plc.qualitative.Pastel1 + plc.qualitative.Dark24
+
+    def _stack_xy_color(
+        title: str,
+        xcol: str | None,
+        ccol: str | None,
+        yser: pd.Series,
+        *,
+        height: int = 400,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns or not ccol or ccol not in dff.columns:
+            return None
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), ccol: dff[ccol].astype(str), "_y": yser})
+        sub = sub.groupby([xcol, ccol], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if sub.empty:
+            return None
+        xcats = sorted(sub[xcol].unique().tolist())
+        colors = sorted(sub[ccol].unique().tolist())
+        fig = go.Figure()
+        for i, lab in enumerate(colors):
+            chunk = sub[sub[ccol] == lab]
+            yv = chunk.set_index(xcol)["_y"].reindex(xcats).fillna(0).values
+            fig.add_trace(
+                go.Bar(
+                    name=str(lab)[:46],
+                    x=xcats,
+                    y=yv,
+                    marker_color=pal[i % len(pal)],
+                    text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                    textposition="inside",
+                    insidetextfont=dict(color="white", size=10),
+                )
+            )
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="stack",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(240, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
+        )
+        return fig
+
+    def _group_prev_real(
+        title: str,
+        xcol: str | None,
+        s_pre: pd.Series,
+        s_re: pd.Series,
+        lab_p: str,
+        lab_r: str,
+        *,
+        height: int = 380,
+    ) -> go.Figure | None:
+        if not xcol or xcol not in dff.columns:
+            return None
+        sub = pd.DataFrame({xcol: dff[xcol].astype(str), "_p": s_pre, "_r": s_re})
+        g = sub.groupby(xcol, as_index=False).agg(_p=("_p", "sum"), _r=("_r", "sum"))
+        if g.empty:
+            return None
+        g = g.sort_values("_p", ascending=False)
+        xcats = g[xcol].tolist()
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                name=lab_p,
+                x=xcats,
+                y=g["_p"],
+                marker_color=PLOT_AZUL,
+                text=[f"{v:.0f}" for v in g["_p"]],
+                textposition="outside",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                name=lab_r,
+                x=xcats,
+                y=g["_r"],
+                marker_color=PLOT_ACCENT,
+                text=[f"{v:.0f}" for v in g["_r"]],
+                textposition="outside",
+            )
+        )
+        fig.update_layout(
+            **_plotly_layout_direcional(
+                title=title,
+                height=height,
+                barmode="group",
+                legend=_plotly_legend_bottom(),
+                xaxis_tickangle=-34,
+                margin=dict(t=100, l=52, r=36, b=max(128, min(260, 28 + 7 * max((len(str(x)) for x in xcats), default=0)))),
+            )
+        )
+        return fig
+
+    st.markdown("##### Previsão por regional — empilhado (QTD)")
+    st.caption("Cada cor é um **empreendimento**; o eixo X é **Regional ou IMOB**.")
+    ra, rb = st.columns(2)
+    with ra:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas facilitadas (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qfp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with rb:
+        fg = _stack_xy_color(
+            "Previsão por produto — Vendas normais (QTD previstas)",
+            reg_c,
+            emp_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    st.markdown("##### Previsão por produto — canal (QTD e VGV)")
+    st.caption("Eixo X: **empreendimento**; empilhamento por **canal** (DV / IMOB).")
+    if canal_c and emp_c:
+        sc = dff[canal_c].map(_formulario_canon_canal)
+        ca, cb = st.columns(2)
+        with ca:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_qnp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=10),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — Normais (QTD)",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+        with cb:
+            sub = pd.DataFrame({emp_c: dff[emp_c].astype(str), "__canal__": sc, "_y": s_vgp})
+            sub = sub.groupby([emp_c, "__canal__"], as_index=False)["_y"].sum()
+            sub = sub[sub["_y"] != 0]
+            if not sub.empty:
+                xcats = sorted(sub[emp_c].unique().tolist())
+                fig = go.Figure()
+                for i, lab in enumerate(sorted(sub["__canal__"].unique().tolist())):
+                    chunk = sub[sub["__canal__"] == lab]
+                    yv = chunk.set_index(emp_c)["_y"].reindex(xcats).fillna(0).values
+                    lbl_txt = [f"{float(v)/1e3:.1f} mil" if v > 0 else "" for v in yv]
+                    fig.add_trace(
+                        go.Bar(
+                            name=str(lab),
+                            x=xcats,
+                            y=yv,
+                            marker_color=pal[i % len(pal)],
+                            text=lbl_txt,
+                            textposition="inside",
+                            insidetextfont=dict(color="white", size=9),
+                        )
+                    )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title="Previsão por produto — VGV",
+                        height=400,
+                        barmode="stack",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-34,
+                        yaxis_title="R$",
+                        margin=dict(t=100, l=52, r=36, b=168),
+                    )
+                )
+                st.plotly_chart(fig, width="stretch", config=_ipc)
+            else:
+                st.caption("—")
+    else:
+        st.caption("Colunas de empreendimento ou canal ausentes — gráficos por canal omitidos.")
+
+    st.markdown("##### Previsão por produto — empilhado por regional (QTD)")
+    st.caption("Eixo X: **empreendimento**; cores: **Regional ou IMOB**.")
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        fg = _stack_xy_color(
+            "Previsão por produto — Facilitadas",
+            emp_c,
+            reg_c,
+            s_qfp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with pc2:
+        fg = _stack_xy_color(
+            "Previsão por produto — Normais",
+            emp_c,
+            reg_c,
+            s_qnp,
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    if nf_p and nf_p in dff.columns and reg_c and reg_c in dff.columns:
+        st.markdown("##### Previsão agregada por tipo (Normal / Facilitada / …)")
+        vp = (
+            _formulario_num_series(dff, vprev)
+            if vprev
+            else pd.Series(1.0, index=dff.index, dtype=float)
+        )
+        sub = pd.DataFrame(
+            {
+                reg_c: dff[reg_c].astype(str),
+                nf_p: dff[nf_p].astype(str).replace("nan", "(vazio)"),
+                "_y": vp,
+            }
+        )
+        sub = sub.groupby([reg_c, nf_p], as_index=False)["_y"].sum()
+        sub = sub[sub["_y"] != 0]
+        if not sub.empty:
+            xcats = sorted(sub[reg_c].unique().tolist())
+            fig = go.Figure()
+            for i, lab in enumerate(sorted(sub[nf_p].unique().tolist())):
+                chunk = sub[sub[nf_p] == lab]
+                yv = chunk.set_index(reg_c)["_y"].reindex(xcats).fillna(0).values
+                fig.add_trace(
+                    go.Bar(
+                        name=str(lab)[:40],
+                        x=xcats,
+                        y=yv,
+                        marker_color=pal[i % len(pal)],
+                        text=[f"{v:.0f}" if v > 0 else "" for v in yv],
+                        textposition="outside",
+                    )
+                )
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    title="Previsão — soma de «Vendas Previsão» por regional e tipo",
+                    height=400,
+                    barmode="stack",
+                    legend=_plotly_legend_bottom(),
+                    xaxis_tickangle=-28,
+                    margin=dict(t=100, l=52, r=36, b=138),
+                )
+            )
+            st.plotly_chart(fig, width="stretch", config=_ipc)
+        else:
+            st.caption("Sem dados para o gráfico de tipos.")
+
+    st.markdown("##### Previsão × Real — por **Regional ou IMOB**")
+    gx1, gx2 = st.columns(2)
+    with gx1:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Facilitadas (QTD)",
+            reg_c,
+            s_qfp,
+            s_qfr,
+            "QTD facilitadas previstas",
+            "QTD facilitadas reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+    with gx2:
+        fg = _group_prev_real(
+            "Vendas Previsão × Real — Normais (QTD)",
+            reg_c,
+            s_qnp,
+            s_qnr,
+            "QTD normais previstas",
+            "QTD normais reais",
+        )
+        if fg:
+            st.plotly_chart(fg, width="stretch", config=_ipc)
+        else:
+            st.caption("—")
+
+    st.markdown("##### Previsão × Real — por **empreendimento** (top por volume previsto)")
+    if emp_c and emp_c in dff.columns:
+        sub = pd.DataFrame(
+            {
+                emp_c: dff[emp_c].astype(str),
+                "_p": s_qnp + s_qfp,
+                "_pf": s_qfp,
+                "_pr": s_qfr,
+                "_qn": s_qnp,
+                "_qr": s_qnr,
+            }
+        )
+        g = sub.groupby(emp_c, as_index=False).agg(
+            _p=("_p", "sum"),
+            _pf=("_pf", "sum"),
+            _pr=("_pr", "sum"),
+            _qn=("_qn", "sum"),
+            _qr=("_qr", "sum"),
+        )
+        g = g.sort_values("_p", ascending=False).head(22)
+        if not g.empty:
+            xcats = g[emp_c].tolist()
+
+            def _pair_fig(title: str, yp: str, yr: str, npref: str, nrref: str) -> go.Figure:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        name=npref,
+                        x=xcats,
+                        y=g[yp],
+                        marker_color=PLOT_AZUL,
+                        text=[f"{v:.0f}" for v in g[yp]],
+                        textposition="outside",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        name=nrref,
+                        x=xcats,
+                        y=g[yr],
+                        marker_color=PLOT_ACCENT,
+                        text=[f"{v:.0f}" for v in g[yr]],
+                        textposition="outside",
+                    )
+                )
+                fig.update_layout(
+                    **_plotly_layout_direcional(
+                        title=title,
+                        height=440,
+                        barmode="group",
+                        legend=_plotly_legend_bottom(),
+                        xaxis_tickangle=-40,
+                        margin=dict(t=100, l=52, r=36, b=188),
+                    )
+                )
+                return fig
+
+            gy1, gy2 = st.columns(2)
+            with gy1:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Facilitadas — previstas × reais",
+                        "_pf",
+                        "_pr",
+                        "QTD facilitadas previstas",
+                        "QTD facilitadas reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+            with gy2:
+                st.plotly_chart(
+                    _pair_fig(
+                        "Normais — previstas × reais",
+                        "_qn",
+                        "_qr",
+                        "QTD normais previstas",
+                        "QTD normais reais",
+                    ),
+                    width="stretch",
+                    config=_ipc,
+                )
+    else:
+        st.caption("—")
+
+    st.markdown("##### Tabelas resumo — **Região** × canal (DV / IMOB)")
+    if regiao_c and regiao_c in dff.columns and canal_c and canal_c in dff.columns:
+        dpx = dff[[regiao_c, canal_c]].copy()
+        dpx["_can"] = dpx[canal_c].map(_formulario_canon_canal)
+        dpx["_q_prev"] = s_qnp + s_qfp
+        dpx["_q_real"] = s_qnr + s_qfr
+        pv = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_prev",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pr = (
+            dpx.pivot_table(
+                index=regiao_c,
+                columns="_can",
+                values="_q_real",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+        pv.columns = [str(c) if c != regiao_c else "Região" for c in pv.columns]
+        pr.columns = [str(c) if c != regiao_c else "Região" for c in pr.columns]
+
+        def _add_total_row(tab: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+            if tab.empty:
+                return tab
+            row = {tab.columns[0]: "Total geral"}
+            for c in num_cols:
+                if c in tab.columns:
+                    row[c] = pd.to_numeric(tab[c], errors="coerce").fillna(0).sum()
+            return pd.concat([tab, pd.DataFrame([row])], ignore_index=True)
+
+        num_p = [c for c in pv.columns if c != "Região"]
+        num_r = [c for c in pr.columns if c != "Região"]
+        st.caption("Totais de **QTD** (normais + facilitadas) por região e canal.")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown("**Previsão (QTD)**")
+            st.dataframe(_add_total_row(pv, num_p), width="stretch", hide_index=True)
+        with t2:
+            st.markdown("**Realizado (QTD)**")
+            st.dataframe(_add_total_row(pr, num_r), width="stretch", hide_index=True)
+
+        if vgp and vgr:
+            dpx["_v_prev"] = s_vgp
+            dpx["_v_real"] = s_vgr
+            pv2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_prev",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pr2 = (
+                dpx.pivot_table(
+                    index=regiao_c,
+                    columns="_can",
+                    values="_v_real",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            pv2.columns = [str(c) if c != regiao_c else "Região" for c in pv2.columns]
+            pr2.columns = [str(c) if c != regiao_c else "Região" for c in pr2.columns]
+            st.markdown("**VGV por região e canal (R$)**")
+            t3, t4 = st.columns(2)
+            with t3:
+                st.caption("Previsão")
+                n3 = [c for c in pv2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pv2, n3), width="stretch", hide_index=True)
+            with t4:
+                st.caption("Realizado")
+                n4 = [c for c in pr2.columns if c != "Região"]
+                st.dataframe(_add_total_row(pr2, n4), width="stretch", hide_index=True)
+    else:
+        st.caption("Defina colunas **Região** e **Canal** na planilha para ver as tabelas cruzadas.")
+
+    with st.expander("Pré-visualização dos dados filtrados (primeiras linhas)", expanded=False):
+        show_cols = [
+            c
+            for c in [
+                mc.get("ref"),
+                emp_c,
+                reg_c,
+                canal_c,
+                regiao_c,
+                qfp,
+                qfr,
+                qnp,
+                qnr,
+                vgp,
+                vgr,
+                vprev,
+                vreal,
+                mc.get("erro"),
+            ]
+            if c and c in dff.columns
+        ]
+        st.dataframe(dff[show_cols].head(200), width="stretch", hide_index=True)
+
+
+def _render_tab_introducao() -> None:
+    """Secção estática: metodologia, métricas, modelos e exemplos (sem dados reais)."""
+    import plotly.graph_objects as go
+
+    def _ix(html: str) -> None:
+        st.markdown(
+            f'<div style="text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 1rem auto;color:#334155;line-height:1.65;font-size:0.95rem;box-sizing:border-box">{html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    def _lx(s: str) -> None:
+        st.latex(s)
+
+    _ipc = {"displayModeBar": True, "displaylogo": False}
+    st.markdown(
+        '<p class="pv-section-title">Introdução</p>',
+        unsafe_allow_html=True,
+    )
+    _ix(
+        "A <strong>previsão por machine learning</strong> estima apenas a <strong>quantidade</strong> de vendas (unidades) a partir da matriz diária; "
+        "o VGV continua a aparecer nas <strong>análises descritivas</strong> e indicadores históricos, mas não é alvo do modelo preditivo. "
+        "Em cada instante <em>t</em>, o vetor <strong>X</strong> usa exclusivamente informação até <em>t</em>."
+    )
+
+    st.markdown("#### 1 · Problema e alvos")
+    _ix(
+        "Trata-se de um problema de regressão ao longo do tempo: o alvo <strong>Y</strong> é escalar e o preditor "
+        "<strong>X</strong> é vetorial, ambos indexados por <em>t</em>. Ademais, cada componente de <strong>X</strong> "
+        "deve depender apenas do passado observado até <em>t</em>, sob pena de enviesar a validação fora da amostra."
+    )
+    _ix(
+        "<strong>Horizonte H.</strong> Na aba <strong>Previsões</strong> escolhe-se <strong>um ou mais</strong> valores "
+        "entre <strong>3</strong>, <strong>7</strong> e <strong>30</strong> dias. Para cada <em>t</em>, o alvo <strong>Y</strong> "
+        "é a soma da <strong>quantidade</strong> de vendas nos <strong>H</strong> primeiros dias da série "
+        "imediatamente posteriores a <em>t</em> (apenas dias presentes no índice temporal)."
+    )
+    _ix(
+        "<strong>Intervalo [d₁, d₂].</strong> Na mesma aba, quando indicadas duas datas, define-se um alvo adicional "
+        "correspondente à soma no calendário entre esses limites, <em>além</em> dos horizontes H que tiver selecionado."
+    )
+    _ix("Exemplo simbólico (H = 7, quantidade <em>q</em>):")
+    _lx(r"Y_t^{(7)} = \sum_{d \in \mathcal{D}_{t,7}} q_d")
+    _ix(
+        "O conjunto 𝒟<sub>t,7</sub> reúne, por ordem temporal, até <strong>sete</strong> instantes da série "
+        "<strong>estritamente posteriores</strong> a <em>t</em>, ou seja, o primeiro dia útil após <em>t</em> e os seis seguintes "
+        "no índice observado."
+    )
+
+    st.markdown("#### 2 · Métricas de erro (regressão)")
+    _ix(
+        "No conjunto de <strong>teste</strong> — tipicamente os últimos ~30% da série, preservando a ordem cronológica — "
+        "consideram-se <em>n</em> pares (<em>yᵢ</em>, <em>ŷᵢ</em>) para as definições seguintes:"
+    )
+    _lx(r"\mathrm{MAE} = \frac{1}{n}\sum_{i=1}^{n} \left| y_i - \hat{y}_i \right|")
+    _ix("O MAE mede o erro médio absoluto e exprime-se na mesma unidade que o alvo, facilitando, assim, a leitura em escala de negócio.")
+    _lx(r"\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum_{i=1}^{n} (y_i - \hat{y}_i)^2}")
+    _ix("O RMSE penaliza de forma mais acentuada os erros grandes; consequentemente, é mais sensível a outliers do que o MAE.")
+    _lx(r"R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2}")
+    _ix(
+        "O R² compara o modelo a uma referência ingênua que prediz sempre a média <em>ȳ</em> do bloco de teste; "
+        "valores mais altos indicam melhor ajuste, embora devam ser interpretados em conjunto com MAE e RMSE."
+    )
+
+    st.markdown("#### 3 · Acurácia direcional (auxiliar)")
+    _ix(
+        "<strong>Acurácia direcional:</strong> calcula-se a mediana de <em>Y</em> no treino e, em teste, compara-se se "
+        "<em>y</em> e <em>ŷ</em> ficam ambos acima ou ambos abaixo dessa mediana. Este indicador complementa, portanto, "
+        "MAE, RMSE e R², focando na capacidade de antever a direção do desvio face ao patamar histórico."
+    )
+    _lx(
+        r"\hat{b}_i = \mathbb{1}\left[ \hat{y}_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right],\quad"
+        r" b_i = \mathbb{1}\left[ y_i > \mathrm{mediana}_{\mathrm{train}}(Y) \right]"
+    )
+    _lx(r"\mathrm{Acc}_{\mathrm{dir}} = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}[\hat{b}_i = b_i]")
+
+    st.markdown("#### 4 · Pré-processamento e validação (previsão de quantidade)")
+    _ix(
+        "Após engenharia de *features* na matriz diária, calcula-se a correlação absoluta de cada coluna com o alvo; "
+        "selecionam-se as <strong>30</strong> mais correlacionadas e aplica-se <strong>PolynomialFeatures</strong> de grau 2 "
+        "(interações e termos quadráticos), sem <strong>MinMaxScaler</strong> neste fluxo."
+    )
+    _ix(
+        "A <strong>partição</strong> é cronológica: aproximadamente <strong>70% treino</strong> e <strong>30% teste</strong>. "
+        "Cada candidato é ajustado no treino e comparado no teste pelo <strong>MAE</strong>; o modelo com menor MAE "
+        "é re-treinado em toda a série histórica válida para gerar a previsão do último dia."
+    )
+    _ix(
+        "Não há <strong>Optuna</strong> nem *TimeSeriesSplit* adicional neste percurso: os hiperparâmetros dos regressores "
+        "são os fixos definidos no *pipeline* executivo (abaixo)."
+    )
+
+    st.markdown("#### 5 · Modelos utilizados na previsão (fixos)")
+    rows_mod = [
+        {
+            "Modelo": "XGBoost",
+            "Implementação": "`XGBRegressor`",
+            "Notas": "n_estimators=100, learning_rate=0.05, max_depth=4, random_state fixo.",
+        },
+        {
+            "Modelo": "Random Forest",
+            "Implementação": "`RandomForestRegressor`",
+            "Notas": "n_estimators=100, max_depth=5, random_state fixo.",
+        },
+        {
+            "Modelo": "Gradient Boosting",
+            "Implementação": "`GradientBoostingRegressor`",
+            "Notas": "n_estimators=100, learning_rate=0.05, max_depth=4, random_state fixo.",
+        },
+        {
+            "Modelo": "Ridge Linear",
+            "Implementação": "`Ridge`",
+            "Notas": "alpha=1.0 (regularização L2).",
+        },
+        {
+            "Modelo": "Ensemble (Voting)",
+            "Implementação": "`VotingRegressor`",
+            "Notas": "Média das previsões dos quatro modelos anteriores (quando XGBoost está disponível).",
+        },
+    ]
+    st.dataframe(pd.DataFrame(rows_mod), width="stretch", hide_index=True)
+    _ix(
+        "A <strong>previsão oficial</strong> corresponde ao estimador com menor MAE no teste entre estes cinco; "
+        "os restantes servem de referência no relatório HTML (*benchmark*)."
+    )
+
+    st.markdown("##### Ilustrações por tipo de modelo (dados sintéticos, 1D)")
+    _ix(
+        "Ilustração pedagógica com dados fictícios: na aplicação, a previsão de quantidade usa apenas o conjunto fixo da secção 5. "
+        "O vetor <strong>X</strong> real tem muitas dimensões; estes painéis ajudam a <strong>intuir a forma</strong> "
+        "das funções (reta, degraus, *kernel*, vizinhos, árvores, *boosting*)."
+    )
+    try:
+        from sklearn.ensemble import (
+            GradientBoostingRegressor,
+            RandomForestRegressor,
+        )
+        from sklearn.linear_model import LinearRegression
+        from sklearn.neighbors import KNeighborsRegressor
+        from sklearn.svm import SVR
+        from sklearn.tree import DecisionTreeRegressor
+        from plotly.subplots import make_subplots
+
+        rng = np.random.default_rng(42)
+        n_pt = 55
+        xs = np.sort(rng.uniform(0, 10, n_pt))
+        y_true = 2.0 + 0.82 * xs
+        ys = y_true + rng.normal(0, 1.05, n_pt)
+        x_col = xs.reshape(-1, 1)
+        x_grid = np.linspace(0, 10, 200).reshape(-1, 1)
+
+        def _lo_intro(
+            title: str, *, yl: str = "y", xl: str = "x", height: int = 300
+        ) -> dict[str, Any]:
+            return _plotly_layout_direcional(
+                title=title,
+                height=height,
+                xaxis_title=f"Eixo X — {xl}",
+                yaxis_title=f"Eixo Y — {yl}",
+                margin=dict(t=88, l=48, r=28, b=118),
+                legend=_plotly_legend_bottom(),
+            )
+
+        sc_d = dict(size=7, color=PLOT_MUTED, opacity=0.72, line=dict(width=0.5, color="#fff"))
+
+        lr = LinearRegression().fit(x_col, ys)
+        y_lin = lr.predict(x_grid)
+        y_on_pts = lr.predict(x_col)
+        xx_res: list[Any] = []
+        yy_res: list[Any] = []
+        for i in range(n_pt):
+            xx_res.extend([xs[i], xs[i], None])
+            yy_res.extend([ys[i], float(y_on_pts[i]), None])
+        fig_lin = go.Figure()
+        fig_lin.add_trace(
+            go.Scatter(
+                x=xx_res,
+                y=yy_res,
+                mode="lines",
+                line=dict(color="rgba(148,163,184,0.55)", width=1.2),
+                name="Resíduo (vertical)",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig_lin.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_lin.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_lin,
+                mode="lines",
+                name="ŷ = β₀ + β₁x",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_lin.update_layout(**_lo_intro("Regressão linear (ideia Ridge / ElasticNet)"))
+
+        knn = KNeighborsRegressor(n_neighbors=5, weights="distance").fit(x_col, ys)
+        y_knn = knn.predict(x_grid)
+        _xq_demo = np.array([[5.0]], dtype=float)
+        _, kn_ix = knn.kneighbors(_xq_demo)
+        _x_band = xs[kn_ix[0]]
+        b_lo, b_hi = float(_x_band.min()), float(_x_band.max())
+        fig_knn = go.Figure()
+        fig_knn.add_vrect(
+            x0=b_lo,
+            x1=b_hi,
+            fillcolor="rgba(14, 116, 144, 0.14)",
+            layer="below",
+            line_width=0,
+        )
+        fig_knn.add_vline(
+            x=5.0,
+            line_width=1.5,
+            line_dash="dash",
+            line_color=PLOT_VERMELHO,
+        )
+        fig_knn.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_knn.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_knn,
+                mode="lines",
+                name="Média local (vizinhos)",
+                line=dict(color=PLOT_VERMELHO, width=2.8),
+            )
+        )
+        fig_knn.update_layout(**_lo_intro("k-NN — vizinhança em x (exemplo em x = 5)"))
+
+        dt = DecisionTreeRegressor(max_depth=3, random_state=42).fit(x_col, ys)
+        y_dt = dt.predict(x_grid)
+        fig_dt = go.Figure()
+        fig_dt.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_dt.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_dt,
+                mode="lines",
+                name="Predição em degraus",
+                line=dict(color=PLOT_AZUL, width=2.5),
+            )
+        )
+        for th in _sklearn_tree_split_thresholds_x0(dt):
+            fig_dt.add_vline(
+                x=th,
+                line_width=1.2,
+                line_dash="dot",
+                line_color="rgba(100,116,139,0.72)",
+            )
+        fig_dt.update_layout(**_lo_intro("Árvore de decisão — cortes em x e patamares"))
+
+        rf = RandomForestRegressor(
+            n_estimators=60, max_depth=4, random_state=42, n_jobs=-1
+        ).fit(x_col, ys)
+        y_rf = rf.predict(x_grid)
+        tricol = [PLOT_AZUL, PLOT_VERMELHO, PLOT_ACCENT]
+        fig_rf = make_subplots(
+            rows=2,
+            cols=1,
+            row_heights=[0.36, 0.64],
+            vertical_spacing=0.13,
+            subplot_titles=(
+                "Três árvores de decisão do ensemble (cada curva = degraus)",
+                "Random Forest: muitas árvores (cinza) + média agregada",
+            ),
+        )
+        for j, est in enumerate(rf.estimators_[:3]):
+            ytj = est.predict(x_grid)
+            fig_rf.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=ytj,
+                    mode="lines",
+                    name=f"Árvore {j + 1}",
+                    line=dict(width=2.6, color=tricol[j % len(tricol)]),
+                ),
+                row=1,
+                col=1,
+            )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                name="Observações",
+                marker=sc_d,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        for est in rf.estimators_[:12]:
+            yt = est.predict(x_grid)
+            fig_rf.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=yt,
+                    mode="lines",
+                    line=dict(width=0.9, color="rgba(100,116,139,0.28)"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=2,
+                col=1,
+            )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=x_grid.ravel(),
+                y=y_rf,
+                mode="lines",
+                name="Média das árvores",
+                line=dict(color=PLOT_AZUL, width=3),
+            ),
+            row=2,
+            col=1,
+        )
+        fig_rf.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=sc_d,
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=2,
+            col=1,
+        )
+        fig_rf.update_layout(
+            **_plotly_layout_direcional(
+                title="Random Forest — árvores de decisão e voto pela média",
+                height=560,
+                margin=dict(t=92, l=48, r=28, b=138),
+                legend=_plotly_legend_bottom(),
+            )
+        )
+        fig_rf.update_xaxes(title_text="Eixo X — x", row=1, col=1)
+        fig_rf.update_xaxes(title_text="Eixo X — x", row=2, col=1)
+        fig_rf.update_yaxes(title_text="Eixo Y — ŷ", row=1, col=1)
+        fig_rf.update_yaxes(title_text="Eixo Y — ŷ", row=2, col=1)
+
+        gbr = GradientBoostingRegressor(
+            n_estimators=14,
+            max_depth=2,
+            learning_rate=0.45,
+            subsample=0.9,
+            random_state=42,
+        ).fit(x_col, ys)
+        staged = list(gbr.staged_predict(x_grid))
+        fig_gb = go.Figure()
+        fig_gb.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        show_st = [0, 3, 7, len(staged) - 1]
+        dash_c = ["dot", "dash", "longdash", "solid"]
+        for i, si in enumerate(show_st):
+            lab = f"Após árvore {si + 1}" if si < len(staged) - 1 else "Modelo completo"
+            fig_gb.add_trace(
+                go.Scatter(
+                    x=x_grid.ravel(),
+                    y=staged[si],
+                    mode="lines",
+                    name=lab,
+                    line=dict(
+                        width=2.4 if i == len(show_st) - 1 else 1.6,
+                        color=PLOT_VERMELHO if i == len(show_st) - 1 else PLOT_ACCENT,
+                        dash=dash_c[i],
+                    ),
+                )
+            )
+        fig_gb.update_layout(**_lo_intro("Gradient boosting — soma progressiva de árvores fracas"))
+
+        svr = SVR(kernel="rbf", C=12.0, epsilon=0.2, gamma=0.28).fit(x_col, ys)
+        y_svr = svr.predict(x_grid)
+        eps_svr = float(getattr(svr, "epsilon", 0.2) or 0.2)
+        xg1 = x_grid.ravel()
+        y_up = y_svr.ravel() + eps_svr
+        y_lo = y_svr.ravel() - eps_svr
+        fig_svr = go.Figure()
+        fig_svr.add_trace(
+            go.Scatter(
+                x=np.concatenate([xg1, xg1[::-1]]),
+                y=np.concatenate([y_up, y_lo[::-1]]),
+                fill="toself",
+                fillcolor="rgba(14, 116, 144, 0.16)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name=f"Tubo insensível ε = {eps_svr:g}",
+                hoverinfo="skip",
+            )
+        )
+        fig_svr.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_svr.add_trace(
+            go.Scatter(
+                x=xg1,
+                y=y_svr,
+                mode="lines",
+                name="Kernel RBF (f)",
+                line=dict(color=PLOT_AZUL, width=3),
+            )
+        )
+        fig_svr.update_layout(**_lo_intro("SVR — tubo ε e curva suave (kernel RBF)"))
+
+        r1a, r1b = st.columns(2)
+        with r1a:
+            st.plotly_chart(fig_lin, width="stretch", config=_ipc)
+            st.caption(
+                "**Lineares:** reta que minimiza o erro; os traços verticais cinzentos mostram o **resíduo** em cada ponto. "
+                "Com Ridge/ElasticNet, os coeficientes encolhem (L2/L1)."
+            )
+        with r1b:
+            st.plotly_chart(fig_knn, width="stretch", config=_ipc)
+            st.caption(
+                "**k-NN:** a **faixa esbatida** contém os *k*=5 pontos de treino mais próximos de *x*=5 (linha tracejada); "
+                "a curva vermelha é a média **ponderada pela distância** ao longo de todo o eixo."
+            )
+
+        r2a, r2b = st.columns(2)
+        with r2a:
+            st.plotly_chart(fig_dt, width="stretch", config=_ipc)
+            st.caption(
+                "**Árvore única:** as **linhas tracejadas** marcam os cortes em *x*; entre dois cortes consecutivos a predição é **constante** (degraus)."
+            )
+        with r2b:
+            st.plotly_chart(fig_rf, width="stretch", config=_ipc)
+            st.caption(
+                "**Random Forest:** em cima, **três árvores** reais do modelo (cada cor = uma função em degraus). "
+                "Em baixo, dezenas de árvores (cinza) e a **média** (linha forte) — é assim que o *ensemble* reduz variância."
+            )
+
+        r3a, r3b = st.columns(2)
+        with r3a:
+            st.plotly_chart(fig_gb, width="stretch", config=_ipc)
+            st.caption(
+                "**Boosting (LightGBM / XGBoost / CatBoost):** cada curva tracejada acumula mais uma **árvore fraca** que mexe nos resíduos; "
+                "a linha vermelha final é o modelo completo."
+            )
+        with r3b:
+            st.plotly_chart(fig_svr, width="stretch", config=_ipc)
+            st.caption(
+                "**SVR:** a faixa semitransparente é o **tubo ε** (erros pequenos não penalizam); a linha azul é a função suave dada pelo **kernel RBF**."
+            )
+
+        med_y = float(np.median(ys))
+        fig_base = go.Figure()
+        fig_base.add_trace(
+            go.Scatter(x=xs, y=ys, mode="markers", name="Observações", marker=sc_d)
+        )
+        fig_base.add_trace(
+            go.Scatter(
+                x=[0, 10],
+                y=[med_y, med_y],
+                mode="lines",
+                name="Baseline mediana",
+                line=dict(color=PLOT_VERMELHO, width=2.8, dash="dash"),
+            )
+        )
+        fig_base.update_layout(**_lo_intro("Baseline — predição constante (mediana)"))
+        st.plotly_chart(fig_base, width="stretch", config=_ipc)
+        st.caption(
+            "**Stack / ensemble:** combina predições de vários modelos (por média ponderada ou meta-modelo); "
+            "a mediana é a referência ingénua mais simples."
+        )
+    except Exception as _e_intro_viz:
+        st.caption(
+            f"Não foi possível gerar as ilustrações automáticas (dependências ou ambiente: {_e_intro_viz!s}). "
+            "Instale `scikit-learn` e confirme a versão compatível com o projeto."
+        )
+
+    st.markdown("#### 6 · LightGBM — parâmetros (referência)")
+    _ix(
+        "A tabela seguinte resume nomes usuais de hiperparâmetros; os valores efetivos resultam, contudo, "
+        "da otimização via Optuna e podem variar entre execuções."
+    )
+    ex_hp = pd.DataFrame(
+        [
+            {"Parâmetro": "n_estimators", "Significado": "Número de árvores na sequência", "Exemplo": "200–2000"},
+            {"Parâmetro": "learning_rate", "Significado": "Passo de cada árvore", "Exemplo": "0.01–0.2"},
+            {"Parâmetro": "num_leaves", "Significado": "Complexidade folhas (2^profundidade efetiva)", "Exemplo": "16–256"},
+            {"Parâmetro": "min_child_samples", "Significado": "Mínimo de amostras por folha", "Exemplo": "5–120"},
+            {"Parâmetro": "subsample / colsample", "Significado": "Amostragem de linhas / colunas", "Exemplo": "0.6–1.0"},
+            {"Parâmetro": "reg_alpha / reg_lambda", "Significado": "Regularização L1 / L2", "Exemplo": "1e-8–10"},
+        ]
+    )
+    st.dataframe(ex_hp, width="stretch", hide_index=True)
+
+    st.markdown("#### 7 · Dossiê (EDA)")
+    _ix(
+        "O <strong>Dossiê</strong> agrega, de forma estruturada, estatísticas descritivas, análise de outliers, "
+        "matrizes de correlação, VIF, histogramas e o perfil semanal — permitindo, assim, uma leitura integrada da qualidade dos dados."
+    )
+    st.markdown(
+        """
+<div class="pv-fullbleed-table-wrap">
+<table style="font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:10px 12px;text-align:left;width:22%">Bloco</th>
+<th style="padding:10px 12px;text-align:left">Conteúdo típico</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Descritivas</td>
+<td style="padding:10px 12px;text-align:left">Média, mediana, moda, DP, quartis, percentis, curtose</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Outliers IQR</td>
+<td style="padding:10px 12px;text-align:left">Limites Q1−1,5·IQR e Q3+1,5·IQR</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Correlação</td>
+<td style="padding:10px 12px;text-align:left">Pearson entre <em>features</em> e alvos amostrados</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">VIF</td>
+<td style="padding:10px 12px;text-align:left">Redundância linear (subconjunto de colunas)</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 12px;text-align:left;vertical-align:top">Distribuições</td>
+<td style="padding:10px 12px;text-align:left">Histogramas de qtd e VGV diários</td></tr>
+<tr><td style="padding:10px 12px;text-align:left;vertical-align:top">Perfil semanal</td>
+<td style="padding:10px 12px;text-align:left">Médias por dia da semana</td></tr>
+</tbody></table></div>
+""",
+        unsafe_allow_html=True,
+    )
+    _ix("<strong>Correlação de Pearson</strong> (amostral) entre variáveis <em>x</em> e <em>y</em>:")
+    _lx(
+        r"r_{xy} = \frac{\sum_i (x_i - \bar{x})(y_i - \bar{y})}"
+        r"{\sqrt{\sum_i (x_i-\bar{x})^2}\,\sqrt{\sum_i (y_i-\bar{y})^2}}"
+    )
+    _ix("<strong>VIF</strong> da variável <em>j</em> (via regressão OLS de <em>xⱼ</em> nas demais colunas do subconjunto):")
+    _lx(r"\mathrm{VIF}_j = \frac{1}{1 - R^2_j}")
+    _ix(
+        "Aqui, R²ⱼ designa o coeficiente de determinação dessa regressão auxiliar; assim, valores de VIF elevados "
+        "(&gt; 5–10) sugerem colinearidade potencialmente problemática."
+    )
+    _ix(
+        "<strong>Outliers (regra IQR):</strong> define-se IQR = Q3 − Q1; os pontos fora de [L<sub>inf</sub>, L<sub>sup</sub>] "
+        "são destacados para análise, todavia <strong>não</strong> são eliminados automaticamente do alvo de negócio."
+    )
+    _lx(
+        r"L_{\mathrm{inf}} = Q_1 - 1.5 \cdot \mathrm{IQR},\quad "
+        r"L_{\mathrm{sup}} = Q_3 + 1.5 \cdot \mathrm{IQR}"
+    )
+
+    st.markdown("#### 8 · Gráficos de exemplo")
+    _ix(
+        "Os gráficos abaixo replicam os tipos utilizados na aba <strong>Análises</strong>; porém, os dados são sintéticos "
+        "e destinam-se apenas a ilustrar a leitura visual."
+    )
+    g1, g2 = st.columns(2)
+    with g1:
+        fig_ex = go.Figure(
+            go.Bar(
+                x=[0.28, 0.19, 0.14, 0.11, 0.09, 0.08, 0.06],
+                y=[
+                    "Lag vendas 1d",
+                    "Leads méd. 7d",
+                    "Dia da semana",
+                    "Feriado (fwd)",
+                    "Macro (z)",
+                    "Ticket lag",
+                    "Outras",
+                ],
+                orientation="h",
+                marker_color=PLOT_AZUL,
+            )
+        )
+        fig_ex.update_layout(
+            **_plotly_layout_direcional(
+                title="Importância relativa (exemplo)",
+                height=360,
+                showlegend=False,
+                margin=dict(l=160, r=24, t=52, b=40),
+                xaxis_title="Peso relativo",
+            ),
+        )
+        st.plotly_chart(fig_ex, width="stretch", config=_ipc)
+    with g2:
+        lbl = ["A", "B", "C", "D"]
+        z = [[1.0, 0.35, -0.12, 0.08], [0.35, 1.0, 0.22, -0.05], [-0.12, 0.22, 1.0, 0.41], [0.08, -0.05, 0.41, 1.0]]
+        fig_c = go.Figure(
+            go.Heatmap(
+                z=z,
+                x=lbl,
+                y=lbl,
+                colorscale=[[0, PLOT_VERMELHO], [0.5, "#f1f5f9"], [1, PLOT_AZUL]],
+                zmin=-1,
+                zmax=1,
+                zmid=0,
+            )
+        )
+        fig_c.update_layout(
+            **_plotly_layout_direcional(
+                title="Correlação (exemplo)",
+                height=360,
+                margin=dict(l=48, r=48, t=52, b=48),
+            ),
+        )
+        st.plotly_chart(fig_c, width="stretch", config=_ipc)
+
+    fig_ser = go.Figure()
+    fig_ser.add_trace(
+        go.Scatter(
+            y=[12, 15, 11, 18, 22, 19, 24, 21, 26, 23],
+            mode="lines+markers",
+            name="Série A",
+            line=dict(color=PLOT_AZUL, width=2.5),
+        )
+    )
+    fig_ser.add_trace(
+        go.Scatter(
+            y=[13, 14, 13, 17, 21, 20, 23, 22, 25, 24],
+            mode="lines",
+            name="Série B",
+            line=dict(color=PLOT_VERMELHO, width=2, dash="dot"),
+        )
+    )
+    fig_ser.update_layout(
+        **_plotly_layout_direcional(
+            title="Duas séries (exemplo)",
+            height=340,
+            xaxis_title="Eixo X — ordem no tempo",
+            yaxis_title="Eixo Y — valor",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=48, b=108),
+        ),
+    )
+    st.plotly_chart(fig_ser, width="stretch", config=_ipc)
+
+    st.markdown("#### 9 · Abas")
+    _ix("Segue-se um resumo orientativo das secções da aplicação:")
+    st.markdown(
+        """
+<div class="pv-fullbleed-table-wrap" style="margin-bottom:1.5rem !important">
+<table style="font-size:0.92rem;color:#334155">
+<thead><tr style="border-bottom:2px solid #e2e8f0">
+<th style="padding:10px 14px;text-align:left;width:22%">Secção</th>
+<th style="padding:10px 14px;text-align:left">Conteúdo</th>
+</tr></thead>
+<tbody>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Introdução</strong></td>
+<td style="padding:10px 14px;text-align:left">Conceitos e notação</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Análises</strong></td>
+<td style="padding:10px 14px;text-align:left">Indicadores e gráficos da série diária</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Formulário</strong></td>
+<td style="padding:10px 14px;text-align:left">Previsões humanas do Esboço: gráficos previsão × real, filtros e tabelas por região/canal</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Previsões</strong></td>
+<td style="padding:10px 14px;text-align:left">Treino, tabela e exportação HTML</td></tr>
+<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Dossiê</strong></td>
+<td style="padding:10px 14px;text-align:left">EDA; métricas e importância de <em>features</em> na sub-aba <strong>Modelos</strong> (com treino)</td></tr>
+<tr><td style="padding:10px 14px;text-align:left;vertical-align:top"><strong>Apêndice</strong></td>
+<td style="padding:10px 14px;text-align:left">Metodologia e hiperparâmetros</td></tr>
+</tbody></table></div>
+""",
+        unsafe_allow_html=True,
+    )
+    _ix(
+        "Repare-se que a opção <em>Carregar dados</em>, nas abas <strong>Análises</strong>, <strong>Dossiê</strong> e <strong>Apêndice</strong>, "
+        "atualiza apenas a matriz e os resumos exploratórios, <strong>sem</strong> executar o treino preditivo."
+    )
+
+
+def _render_streamlit_ml_feature_importance(
+    por_h: dict[Any, dict[str, Any]],
+    plot_config: dict[str, Any],
+) -> None:
+    """Gráficos de importância de *features* por horizonte (dados do pipeline após treino)."""
+    import plotly.graph_objects as go
+
+    hz_keys = _chaves_horizonte_em_por_h(por_h)
+    _tem_imp = any(
+        (por_h.get(h) or {}).get("qtd", {}).get("importance_names")
+        for h in hz_keys
+    )
+    if _tem_imp:
+        st.markdown(
+            '<p class="pv-section-title">Importância de features (quantidade, por horizonte)</p>',
+            unsafe_allow_html=True,
+        )
+        for h in hz_keys:
+            sub = por_h.get(h) or {}
+            st.caption(f"**H={h}d** — volume (quantidade)")
+            names = sub.get("qtd", {}).get("importance_names") or []
+            vals = sub.get("qtd", {}).get("importance_vals") or []
+            if names and vals:
+                top_n = min(18, len(names))
+                fig_i = go.Figure(
+                    go.Bar(
+                        x=vals[:top_n][::-1],
+                        y=names[:top_n][::-1],
+                        orientation="h",
+                        marker_color=PLOT_AZUL,
+                        marker_line=dict(width=0),
+                    )
+                )
+                fig_i.update_layout(
+                    **_plotly_layout_direcional(
+                        height=28 * top_n + 88,
+                        margin=dict(l=220, r=40, t=40, b=48),
+                        xaxis_title="Importância",
+                        showlegend=False,
+                    ),
+                )
+                st.plotly_chart(fig_i, width="stretch", config=plot_config)
+            else:
+                st.caption("— (modelo atual não expõe importância)")
+        st.divider()
+    else:
+        st.markdown(
+            '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin-top:0.5rem">'
+            "Importância de <em>features</em> por horizonte: disponível após <strong>Gerar previsões</strong>.</p>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+
+def _render_streamlit_tab_analises(
+    daily: dict[str, Any],
+    stats_base: dict[str, float],
+    ticket: float,
+    conv: float,
+) -> None:
+    import plotly.graph_objects as go
+
+    st.markdown(
+        '<p class="pv-section-title">Indicadores consolidados (histórico diário)</p>',
+        unsafe_allow_html=True,
+    )
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Leads", f"{stats_base['leads']:,.0f}")
+    with k2:
+        st.metric("Agendamentos", f"{stats_base['agend']:,.0f}")
+    with k3:
+        st.metric("Visitas", f"{stats_base['visit']:,.0f}")
+    with k4:
+        st.metric("Pastas", f"{stats_base['pastas']:,.0f}")
+    with k5:
+        st.metric("Vendas (qtd)", f"{stats_base['vendas']:,.0f}")
+
+    k6, k7, k8 = st.columns(3)
+    with k6:
+        st.metric("VGV acumulado", f"R$ {stats_base['vgv']/1e6:.2f} M")
+    with k7:
+        st.metric("Ticket médio", f"R$ {ticket/1e3:,.0f} k")
+    with k8:
+        st.metric("Conversão leads → vendas", f"{conv:.2f} %")
+
+    st.markdown(
+        "<p class=\"pv-caption-center\">"
+        f"A matriz diária subjacente contém {daily.get('n_rows', 0):,} dias e {daily.get('n_features', 0)} colunas "
+        "após engenharia de atributos.</p>",
+        unsafe_allow_html=True,
+    )
+
+    dates = daily.get("dates") or []
+    if not dates:
+        st.warning("Não há datas na série temporal; portanto, os gráficos não podem ser exibidos.")
+        return
+
+    _pc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
+    fig_f = go.Figure()
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_leads"],
+            name="Leads",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(4, 66, 143, 0.42)",
+            hovertemplate="<b>Leads</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_agend"],
+            name="Agend.",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(203, 9, 53, 0.32)",
+            hovertemplate="<b>Agend.</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_visit"],
+            name="Visitas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(14, 116, 144, 0.38)",
+            hovertemplate="<b>Visitas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["vol_pastas"],
+            name="Pastas",
+            stackgroup="one",
+            mode="lines",
+            line=dict(width=0),
+            fillcolor="rgba(4, 66, 143, 0.22)",
+            hovertemplate="<b>Pastas</b><br>%{x}<br>%{y:,.0f}<extra></extra>",
+        )
+    )
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=daily["target_qtd"],
+            name="Vendas (linha)",
+            yaxis="y2",
+            mode="lines",
+            line=dict(color=PLOT_AZUL, width=2.8),
+            hovertemplate="%{x}<br>Quantidade: %{y:,.0f}<extra></extra>",
+        )
+    )
+    vgv_mi = [float(v) / 1e6 for v in daily["target_valor"]]
+    fig_f.add_trace(
+        go.Scatter(
+            x=dates,
+            y=vgv_mi,
+            name="VGV (linha)",
+            yaxis="y3",
+            mode="lines",
+            line=dict(color=PLOT_VERMELHO, width=2.2, dash="dot"),
+            hovertemplate="%{x}<br>Valor: %{y:.3f} mi R$<extra></extra>",
+        )
+    )
+    _lo_f = _plotly_layout_direcional(
+        title="Funil diário (empilhado) e alvos",
+        height=500,
+        legend=_plotly_legend_bottom(),
+        margin=dict(t=108, l=58, r=62, b=120),
+    )
+    _xr_f = _plotly_xaxis_range_from_dates(dates)
+    if _xr_f:
+        _lo_f = {**_lo_f, "xaxis": {**_lo_f["xaxis"], "range": _xr_f}}
+    fig_f.update_layout(
+        **_lo_f,
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y₁ — contagens do funil (empilhadas, / dia)",
+        yaxis2=dict(
+            overlaying="y",
+            side="right",
+            title=dict(
+                text="Eixo Y₂ — quantidade vendida (/ dia)",
+                font=dict(size=12, color=PLOT_AZUL),
+            ),
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
+        yaxis3=dict(
+            anchor="free",
+            overlaying="y",
+            side="right",
+            position=0.97,
+            title=dict(
+                text="Eixo Y₃ — valor vendido (mi R$ / dia)",
+                font=dict(size=12, color=PLOT_VERMELHO),
+            ),
+            showgrid=False,
+            tickfont=dict(size=11),
+        ),
+    )
+    st.plotly_chart(fig_f, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Funil e alvos", _interpret_text_funil_vendas(daily))
+
+    tq = pd.to_numeric(pd.Series(daily["target_qtd"]), errors="coerce").fillna(0.0)
+    roll7 = tq.rolling(7, min_periods=1).mean()
+    fig_roll = go.Figure()
+    fig_roll.add_trace(
+        go.Scatter(
+            x=dates,
+            y=tq.tolist(),
+            name="Observado (dia a dia)",
+            line=dict(color=PLOT_MUTED, width=1.2),
+        )
+    )
+    fig_roll.add_trace(
+        go.Scatter(
+            x=dates,
+            y=roll7.tolist(),
+            name="Suavização (MM7)",
+            line=dict(color=PLOT_AZUL, width=2.8),
+        )
+    )
+    _lo_roll = _plotly_layout_direcional(
+        title="Vendas diárias e suavização (7 dias)",
+        height=380,
+        xaxis_title="Eixo X — data",
+        yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+        legend=_plotly_legend_bottom(),
+        margin=dict(t=100, l=56, r=52, b=112),
+    )
+    _xr_roll = _plotly_xaxis_range_from_dates(dates)
+    if _xr_roll:
+        _lo_roll = {**_lo_roll, "xaxis": {**_lo_roll["xaxis"], "range": _xr_roll}}
+    fig_roll.update_layout(**_lo_roll)
+    st.plotly_chart(fig_roll, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Vendas e média móvel 7 dias", _interpret_text_rolagem_7d(daily))
+
+    fig_sc = go.Figure()
+    fig_sc.add_trace(
+        go.Scatter(
+            x=daily["vol_leads"],
+            y=daily["target_qtd"],
+            mode="markers",
+            marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
+            name="Leads × vendas (mesmo dia)",
+        )
+    )
+    fig_sc.update_layout(
+        **_plotly_layout_direcional(
+            title="Dispersão: leads vs vendas (mesmo dia)",
+            height=400,
+            xaxis_title="Eixo X — leads (/ dia)",
+            yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+        ),
+    )
+    st.plotly_chart(fig_sc, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Leads × vendas (mesmo dia)", _interpret_text_leads_vendas(daily))
+
+    dl = daily.get("dow_labels") or []
+    fig_d = go.Figure()
+    fig_d.add_trace(
+        go.Bar(
+            x=dl,
+            y=daily.get("dow_mean_qtd") or [],
+            name="Barras — quantidade",
+            marker_color=PLOT_AZUL,
+            marker_line=dict(width=0),
+        )
+    )
+    fig_d.add_trace(
+        go.Bar(
+            x=dl,
+            y=[float(v) / 1e6 for v in (daily.get("dow_mean_valor") or [])],
+            name="Barras — VGV",
+            marker_color=PLOT_VERMELHO,
+            marker_line=dict(width=0),
+            yaxis="y2",
+        )
+    )
+    fig_d.update_layout(
+        **_plotly_layout_direcional(
+            title="Perfil por dia da semana (média histórica)",
+            height=420,
+            barmode="group",
+            xaxis_title="Eixo X — dia da semana",
+            yaxis_title="Eixo Y₁ — média de quantidade (/ dia)",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=52, b=112),
+            yaxis2=dict(
+                overlaying="y",
+                side="right",
+                title="Eixo Y₂ — média de VGV (mi R$ / dia)",
+                showgrid=False,
+                tickfont=dict(size=11),
+            ),
+        ),
+    )
+    st.plotly_chart(fig_d, width="stretch", config=_pc)
+    _st_interpretacao_grafico("Média por dia da semana", _interpret_text_dow(daily))
+
+    cl = daily.get("corr_labels") or []
+    cz = daily.get("corr_z") or []
+    if len(cl) >= 2 and cz:
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=cz,
+                x=cl,
+                y=cl,
+                colorscale=[
+                    [0.0, PLOT_VERMELHO],
+                    [0.5, "#f1f5f9"],
+                    [1.0, PLOT_AZUL],
+                ],
+                zmid=0,
+                zmin=-1,
+                zmax=1,
+                hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
+            )
+        )
+        fig_h.update_layout(
+            **_plotly_layout_direcional(
+                title="Correlação (Pearson) — variáveis-chave",
+                height=max(340, 30 * len(cl)),
+                margin=dict(l=130, r=48, t=56, b=130),
+            ),
+        )
+        st.plotly_chart(fig_h, width="stretch", config=_pc)
+        _st_interpretacao_grafico("Matriz de correlação (Pearson)", _interpret_text_correlation_matrix(cl, cz))
+        st.caption(
+            "A matriz resume associações lineares entre pares de variáveis; para ver a nuvem de pontos entre **quaisquer duas** "
+            "colunas numéricas (incluindo `target_qtd` e `target_valor`), utilize a secção **Dispersão — par de variáveis** abaixo — "
+            "ou o gráfico fixo **leads × vendas** mais acima nesta aba."
+        )
+    else:
+        st.markdown(
+            '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível, '
+            "seja por falta de colunas numéricas suficientes, seja por dados insuficientes.</p>",
+            unsafe_allow_html=True,
+        )
+
+    ns_pick = daily.get("numeric_series_for_picker") or {}
+    n_pick_cols = len(ns_pick)
+    if n_pick_cols >= 2:
+        ref_len = len(next(iter(ns_pick.values())))
+        if any(len(v) != ref_len for v in ns_pick.values()):
+            st.warning(
+                "As séries numéricas do seletor têm comprimentos inconsistentes; volte a carregar ou a regenerar a matriz diária."
+            )
+        else:
+            st.markdown(
+                '<p class="pv-section-title">Dispersão — par de variáveis</p>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Escolha duas colunas numéricas da matriz diária: cada ponto corresponde ao mesmo dia civil (pares alinhados por data). "
+                "O coeficiente r de Pearson resume a associação linear da nuvem. "
+                "Para cruzar com vendas, utilize `target_qtd` ou `target_valor` em X ou em Y; para comparar métricas do funil, "
+                "selecione, por exemplo, `vol_leads` e `vol_visit`."
+            )
+            opts_pick = sorted(ns_pick.keys())
+            ix_x = opts_pick.index("vol_leads") if "vol_leads" in opts_pick else 0
+            ix_y = opts_pick.index("target_qtd") if "target_qtd" in opts_pick else min(1, len(opts_pick) - 1)
+            if ix_y == ix_x and len(opts_pick) > 1:
+                ix_y = (ix_x + 1) % len(opts_pick)
+            cxa, cxb = st.columns(2)
+            with cxa:
+                sel_x = st.selectbox(
+                    "Variável — eixo horizontal (X)",
+                    options=opts_pick,
+                    index=ix_x,
+                    key="pv_pair_var_x",
+                )
+            with cxb:
+                sel_y = st.selectbox(
+                    "Variável — eixo vertical (Y)",
+                    options=opts_pick,
+                    index=ix_y,
+                    key="pv_pair_var_y",
+                )
+            if sel_x == sel_y:
+                st.warning("Selecione duas variáveis distintas para exibir a dispersão e o coeficiente de correlação.")
+            else:
+                xv = ns_pick.get(sel_x) or []
+                yv = ns_pick.get(sel_y) or []
+                if len(xv) != len(yv):
+                    st.warning(
+                        "O comprimento das séries escolhidas não coincide; por favor, volte a carregar os dados."
+                    )
+                else:
+                    r_xy, n_xy = _pearson_pairwise_complete(xv, yv)
+                    mxa, mxb = st.columns(2)
+                    with mxa:
+                        st.metric("r de Pearson (X, Y)", f"{r_xy:+.3f}" if r_xy is not None else "—")
+                    with mxb:
+                        st.metric("Observações válidas (ambas finitas)", f"{n_xy:,}")
+                    xlab = str(sel_x) if len(str(sel_x)) <= 48 else str(sel_x)[:45] + "…"
+                    ylab = str(sel_y) if len(str(sel_y)) <= 48 else str(sel_y)[:45] + "…"
+                    use_dates = len(dates) == len(xv) == len(yv)
+                    htempl = (
+                        f"Data=%{{customdata}}<br>{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                        if use_dates
+                        else f"{xlab}=%{{x:.4g}}<br>{ylab}=%{{y:.4g}}<extra></extra>"
+                    )
+                    fig_pair = go.Figure(
+                        data=go.Scatter(
+                            x=xv,
+                            y=yv,
+                            mode="markers",
+                            marker=dict(
+                                size=8,
+                                opacity=0.55,
+                                color=PLOT_AZUL,
+                                line=dict(width=0.45, color="#fff"),
+                            ),
+                            customdata=dates if use_dates else None,
+                            hovertemplate=htempl,
+                        )
+                    )
+                    fig_pair.update_layout(
+                        **_plotly_layout_direcional(
+                            title=f"Dispersão: {xlab} × {ylab}",
+                            height=440,
+                            xaxis_title=f"Eixo X — {xlab}",
+                            yaxis_title=f"Eixo Y — {ylab}",
+                            margin=dict(t=56, l=56, r=48, b=100),
+                        ),
+                    )
+                    st.plotly_chart(fig_pair, width="stretch", config=_pc)
+                    _txt_r = (
+                        f"O coeficiente de Pearson estimado é r = {r_xy:+.3f}, com n = {n_xy} dias em que ambos os valores são finitos."
+                        if r_xy is not None
+                        else "O coeficiente de Pearson não é definido (poucos pontos ou variância nula num dos eixos)."
+                    )
+                    _st_interpretacao_grafico(
+                        "Leitura",
+                        f"«{sel_x}» (eixo X) e «{sel_y}» (eixo Y) estão emparelhados por dia civil. {_txt_r} "
+                        "Trata-se de correlação linear contemporânea; assim, não implica causalidade nem substitui modelos com defasagem explícita.",
+                    )
+    elif n_pick_cols == 1:
+        st.caption(
+            "Para comparar duas variáveis na dispersão, a matriz diária precisa de pelo menos **duas** colunas numéricas além do índice."
+        )
+    elif not ns_pick:
+        st.caption(
+            "Para habilitar o seletor de pares numéricos, execute novamente **Carregar dados** ou **Gerar previsões**, "
+            "pois resultados antigos em cache podem não incluir `numeric_series_for_picker`."
+        )
+
+    macro = daily.get("macro") or {}
+    if macro:
+        fig_m = go.Figure()
+        for name, series in macro.items():
+            s = pd.to_numeric(pd.Series(series), errors="coerce").fillna(0.0)
+            if s.std() and float(s.std()) > 0:
+                z = ((s - s.mean()) / s.std()).tolist()
+            else:
+                z = [0.0] * len(s)
+            fig_m.add_trace(
+                go.Scatter(
+                    x=dates,
+                    y=z,
+                    name=str(name),
+                    mode="lines",
+                    line=dict(width=2),
+                )
+            )
+        _lo_m = _plotly_layout_direcional(
+            title="Indicadores macro (z-score por série)",
+            height=400,
+            xaxis_title="Eixo X — data",
+            yaxis_title="Eixo Y — desvio em σ (por série)",
+            legend=_plotly_legend_bottom(),
+            margin=dict(t=100, l=56, r=52, b=112),
+        )
+        _xr_m = _plotly_xaxis_range_from_dates(dates)
+        if _xr_m:
+            _lo_m = {**_lo_m, "xaxis": {**_lo_m["xaxis"], "range": _xr_m}}
+        fig_m.update_layout(**_lo_m)
+        st.plotly_chart(fig_m, width="stretch", config=_pc)
+        _st_interpretacao_grafico("Indicadores macro", _interpret_text_macro(macro))
+
+    st.divider()
+    oa_key, oa_model = _openai_key_and_model()
+    if oa_key:
+        with st.expander("Síntese em prosa (OpenAI)", expanded=False):
+            st.caption(
+                f"Modelo configurado: `{oa_model}`. O texto gerado baseia-se exclusivamente nos resumos automáticos desta aba."
+            )
+            if st.button("Gerar síntese", key="pv_eda_openai_btn"):
+                facts = _facts_eda_compact(daily)
+                with st.spinner("A contactar a API…"):
+                    syn = _openai_eda_synopsis(facts)
+                if syn:
+                    st.session_state["pv_eda_openai_syn"] = syn
+                else:
+                    st.error(
+                        "Não foi obtida resposta válida da API; verifique a rede, quotas ou a chave de autenticação."
+                    )
+            if st.session_state.get("pv_eda_openai_syn"):
+                st.markdown(st.session_state["pv_eda_openai_syn"])
+
+
+def _render_streamlit_tab_apendice(
+    por_h: dict[int, dict[str, Any]],
+    best_params_preview: dict[Any, dict[str, dict[str, Any]]],
+    full_period_train: bool,
+    blend_top_k: int,
+    random_seed: int,
+    daily: dict[str, Any],
+) -> None:
+    hz_keys_ap = _chaves_horizonte_em_por_h(por_h)
+    hz_txt = ", ".join(str(x) for x in (hz_keys_ap or list(HORIZONTES_PREVISAO_DISPONIVEIS)))
+    modo = (
+        "Neste modo, o modelo final é reajustado sobre **100%** da série histórica; todavia, uma fatia final (~8%) "
+        "utiliza-se unicamente para ordenar os candidatos ao *ensemble*, sem constituir um holdout formal das métricas principais."
+        if full_period_train
+        else "Adota-se uma divisão **70% treino / 30% teste** segundo a ordem cronológica; ademais, nos 70% iniciais, "
+        "reserva-se cerca de 8% no extremo temporal para validação interna na escolha do *ensemble*. "
+        "Neste cenário, as métricas principais (MAE, RMSE, R², entre outras) reportam-se ao **bloco de teste (30%)**."
+    )
+    st.markdown(
+        '<p class="pv-section-title">Apêndice</p>',
+        unsafe_allow_html=True,
+    )
+    _tab_labels = ["Metodologia"] + [f"H = {h} dias" for h in hz_keys_ap] + ["Personalizado"]
+    ap_tabs = st.tabs(_tab_labels)
+    with ap_tabs[0]:
+        st.markdown(
+            f"""
+#### Resumo
+
+- **Alvo (previsão):** apenas **quantidade** — soma de vendas (unidades) nos **H** dias seguintes a *t*, com *H* ∈ {{{hz_txt}}}. Na aba **Previsões**, um intervalo de datas pode definir um alvo **complementar** também em quantidade.
+- **Dados:** **{daily.get("n_rows", 0):,}** dias · **{daily.get("n_features", 0)}** colunas após engenharia (as abas de análise continuam a usar VGV onde aplicável).
+- **Validação:** {modo}
+- **Modelos (fixos):** **XGBoost**, **Random Forest**, **Gradient Boosting**, **Ridge** (`alpha=1.0`) e **VotingRegressor**; competição por MAE no teste cronológico; **PolynomialFeatures** (grau 2) sobre as 30 variáveis mais correlacionadas com o alvo. Semente: **{random_seed}**.
+- **Tabelas binárias no HTML:** comparam-se previsões à mediana de *y* no treino do benchmark.
+
+O relatório HTML na aba **Previsões** inclui gráficos, curvas ROC e *benchmark* dos modelos de quantidade.
+"""
+        )
+
+    def _ap_horizon_block(h: int) -> None:
+        sub = por_h.get(h) or {}
+        qd = sub.get("qtd", {})
+        st.markdown(
+            f'<p class="pv-section-title">Horizonte {h} dias — quantidade</p>'
+            f"<p style='text-align:center;color:#64748b;font-size:0.9rem;margin-top:-0.25rem'>"
+            f"{qd.get('model_label', '—')}</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("**Volume (quantidade)** — modelo")
+        st.code(str(qd.get("model_label", "—")), language=None)
+        bp = best_params_preview.get(h, {}) if isinstance(best_params_preview, dict) else {}
+        st.markdown("**Parâmetros / metadados**")
+        st.json(bp.get("qtd") or {})
+
+    for _ti, _h in enumerate(hz_keys_ap, start=1):
+        with ap_tabs[_ti]:
+            _ap_horizon_block(_h)
+
+    with ap_tabs[len(hz_keys_ap) + 1]:
+        bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
+        if bpc:
+            st.markdown(
+                '<p class="pv-section-title">Cenário personalizado (referência Optuna)</p>',
+                unsafe_allow_html=True,
+            )
+            st.json({"volume (qtd)": bpc.get("qtd") or {}})
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem">'
+                "Sem cenário personalizado nesta execução.</p>",
+                unsafe_allow_html=True,
+            )
+
+
+def _render_streamlit_dossie_ml(
+    dossie: dict[str, Any],
+    por_h: dict[Any, dict[str, Any]],
+    daily_pack: dict[str, Any],
+    por_custom: dict[str, Any] | None,
+) -> None:
+    import plotly.graph_objects as go
+
+    _dpc = {"displayModeBar": True, "displaylogo": False, "scrollZoom": True}
+
+    st.markdown(
+        "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;max-width:100%;margin:0 auto 0.85rem auto;color:#475569;font-size:0.95rem;line-height:1.55'>"
+        "O Dossiê consolida estatísticas descritivas, análise IQR, matrizes de correlação, VIF, histogramas e, "
+        "quando aplicável, métricas de modelo — oferecendo, desta forma, uma visão integrada da qualidade dos dados e do ajuste.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if dossie.get("erro"):
+        st.error(str(dossie["erro"]))
+        return
+
+    if dossie.get("aviso_previsao_custom"):
+        st.warning(str(dossie["aviso_previsao_custom"]))
+
+    td1, td2, td3, td4, td5 = st.tabs(
+        [
+            "Dados e tratamento",
+            "Descritivas e outliers",
+            "Correlação e VIF",
+            "Distribuições e perfil",
+            "Modelos e personalizado",
+        ]
+    )
+
+    with td1:
+        st.markdown(
+            """
+**Tratamento**
+- O índice diário é deduplicado, conservando a última linha por data.
+- Nos alvos, eliminam-se apenas as linhas sem `target_qtd` ou `target_valor`; valores não finitos são tratados antes da agregação.
+- Nas *features*, `inf` é convertido para valor finito e a ausência de dados imputa-se a 0 após a engenharia (lags utilizam exclusivamente o passado).
+- Na **previsão de quantidade**, utilizam-se modelos **sem** `MinMaxScaler`: correlação → top 30 → `PolynomialFeatures(2)` e regressores **XGBoost, Random Forest, Gradient Boosting, Ridge e Voting**, com competição por MAE.
+- Os outliers no alvo não são truncados; o *cap* aplicado às previsões deriva, portanto, do próprio treino.
+
+**Validação / tuning (quantidade)**
+- *Split* cronológico 70/30 (e zona interna para escolha do vencedor), sem Optuna neste fluxo.
+"""
+        )
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Observações na matriz diária", f"{dossie.get('n_linhas', 0):,}")
+        with m2:
+            st.metric("Colunas após engenharia", f"{dossie.get('n_colunas', 0):,}")
+        st.caption(
+            f"Período coberto pela matriz: de **{dossie.get('primeira_data', '—')}** a **{dossie.get('ultima_data', '—')}**."
+        )
+
+    desc = dossie.get("descritivas") or []
+    oi = dossie.get("outliers_iqr") or []
+    with td2:
+        if desc:
+            st.markdown("##### Estatísticas descritivas")
+            st.caption(
+                "A curtose reportada corresponde ao excesso (definição *pandas*); a moda corresponde ao primeiro valor modal encontrado."
+            )
+            st.dataframe(pd.DataFrame(desc), width="stretch", hide_index=True)
+        else:
+            st.caption("Não há tabela descritiva disponível para o conjunto atual.")
+        st.divider()
+        if oi:
+            st.markdown("##### Outliers (regra IQR — 1,5×IQR)")
+            st.dataframe(pd.DataFrame(oi), width="stretch", hide_index=True)
+        else:
+            st.caption("Não foi possível gerar o resumo de outliers para estes dados.")
+
+    cl = dossie.get("correlation_labels") or []
+    cz = dossie.get("correlation_matrix") or []
+    pares = dossie.get("pares_multicolinearidade") or []
+    vifs = dossie.get("vif") or []
+    with td3:
+        if len(cl) >= 2 and cz:
+            st.markdown("##### Matriz de correlação (Pearson)")
+            fig_h = go.Figure(
+                data=go.Heatmap(
+                    z=cz,
+                    x=cl,
+                    y=cl,
+                    colorscale=[
+                        [0.0, PLOT_VERMELHO],
+                        [0.5, "#f1f5f9"],
+                        [1.0, PLOT_AZUL],
+                    ],
+                    zmid=0,
+                    zmin=-1,
+                    zmax=1,
+                    hovertemplate="%{y} × %{x}<br>r = %{z:.2f}<extra></extra>",
+                )
+            )
+            fig_h.update_layout(
+                **_plotly_layout_direcional(
+                    title="Correlação entre variáveis-chave",
+                    height=max(360, 28 * len(cl)),
+                    margin=dict(l=130, r=48, t=56, b=130),
+                ),
+            )
+            st.plotly_chart(fig_h, width="stretch", config=_dpc)
+            _st_interpretacao_grafico(
+                "Correlações (leitura automática)",
+                _interpret_text_correlation_matrix(cl, cz),
+            )
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#94a3b8;font-size:0.88rem">A matriz de correlação não está disponível neste subconjunto (colunas ou dados insuficientes).</p>',
+                unsafe_allow_html=True,
+            )
+
+        _vl3 = daily_pack.get("vol_leads") or []
+        _tq3 = daily_pack.get("target_qtd") or []
+        _tv3 = daily_pack.get("target_valor") or []
+        if len(_vl3) == len(_tq3) == len(_tv3) and len(_vl3) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
+            st.caption(
+                "Além dos valores agregados na matriz de correlação, a dispersão posiciona cada dia no plano "
+                "leads × volume, permitindo visualizar dispersão, aglomerados e observações atípicas que o coeficiente r resume de forma sintética."
+            )
+            from plotly.subplots import make_subplots
+
+            _tv3_mi = [float(v) / 1e6 for v in _tv3]
+            fig_td3 = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=("Quantidade diária", "VGV (mi R$ / dia)"),
+                horizontal_spacing=0.12,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tq3,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_AZUL, line=dict(width=0.5, color="#ffffff")),
+                    name="qtd",
+                    hovertemplate="Leads=%{x:.4g}<br>qtd=%{y:,.0f}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+            fig_td3.add_trace(
+                go.Scatter(
+                    x=_vl3,
+                    y=_tv3_mi,
+                    mode="markers",
+                    marker=dict(size=7, opacity=0.5, color=PLOT_VERMELHO, line=dict(width=0.5, color="#ffffff")),
+                    name="VGV",
+                    hovertemplate="Leads=%{x:.4g}<br>VGV mi=%{y:.3f}<extra></extra>",
+                ),
+                row=1,
+                col=2,
+            )
+            base_td3 = _plotly_layout_direcional(height=420, showlegend=False)
+            fig_td3.update_layout(
+                **{
+                    k: v
+                    for k, v in base_td3.items()
+                    if k not in ("xaxis", "yaxis", "margin", "title")
+                },
+                title=dict(
+                    text="Dispersão (eixo horizontal: leads; mesmos dias da série diária)",
+                    font=dict(size=15, color=PLOT_AZUL, family="Montserrat, sans-serif"),
+                    x=0.5,
+                    xanchor="center",
+                ),
+                margin=dict(t=56, l=56, r=48, b=56),
+            )
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=1)
+            fig_td3.update_xaxes(title_text="Eixo X — leads (/ dia)", row=1, col=2)
+            fig_td3.update_yaxes(title_text="Eixo Y₁ — qtd vendida (/ dia)", row=1, col=1)
+            fig_td3.update_yaxes(title_text="Eixo Y₂ — VGV (mi R$ / dia)", row=1, col=2)
+            st.plotly_chart(fig_td3, width="stretch", config=_dpc)
+
+        st.divider()
+        if pares:
+            st.markdown("##### Pares com |r| ≥ 0,85")
+            st.dataframe(pd.DataFrame(pares), width="stretch", hide_index=True)
+        if vifs:
+            st.markdown("##### VIF (subconjunto de *features*)")
+            st.caption(
+                "Valores de VIF superiores a 5–10 sugerem possível redundância linear entre *features*; interprete-as em conjunto com a matriz de correlação."
+            )
+            st.dataframe(pd.DataFrame(vifs), width="stretch", hide_index=True)
+            _st_interpretacao_grafico("VIF (leitura automática)", _interpret_text_vif_rows(vifs))
+        if not pares and not vifs:
+            st.caption("Não há tabelas de multicolinearidade para apresentar nesta execução.")
+        facts_cv = _facts_corr_vif_for_llm(cl, cz, vifs)
+        oa_key_d, oa_model_d = _openai_key_and_model()
+        if oa_key_d and facts_cv.strip():
+            st.divider()
+            with st.expander("Síntese: correlação e VIF (OpenAI)", expanded=False):
+                st.caption(f"Modelo: `{oa_model_d}`.")
+                if st.button("Gerar síntese", key="pv_dossie_openai_btn"):
+                    with st.spinner("A contactar a API…"):
+                        syn_d = _openai_eda_synopsis(facts_cv)
+                    if syn_d:
+                        st.session_state["pv_dossie_openai_syn"] = syn_d
+                    else:
+                        st.error("Sem resposta ou erro na API.")
+                if st.session_state.get("pv_dossie_openai_syn"):
+                    st.markdown(st.session_state["pv_dossie_openai_syn"])
+
+    bal = dossie.get("balanceamento_qtd") or {}
+    hq = dossie.get("hist_target_qtd") or {}
+    hv = dossie.get("hist_target_valor") or {}
+    dates = daily_pack.get("dates") or []
+    vl = daily_pack.get("vol_leads") or []
+    tq = daily_pack.get("target_qtd") or []
+    dow_lbl = daily_pack.get("dow_labels") or []
+    dow_q = daily_pack.get("dow_mean_qtd") or []
+    with td4:
+        if bal:
+            st.markdown("##### Balanceamento do volume diário (vs mediana)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Dias acima da mediana", f"{bal.get('dias_acima_mediana', 0):,}")
+            with c2:
+                st.metric("Dias ≤ mediana", f"{bal.get('dias_abaixo_igual_mediana', 0):,}")
+            with c3:
+                st.metric(
+                    "Proporção classe minoritária",
+                    f"{bal.get('proporcao_classe_minoritaria', 0)*100:.1f}%",
+                )
+            fig_p = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=["Acima da mediana", "Abaixo ou igual"],
+                        values=[
+                            bal.get("dias_acima_mediana", 0),
+                            bal.get("dias_abaixo_igual_mediana", 0),
+                        ],
+                        hole=0.38,
+                        marker=dict(colors=[PLOT_AZUL, PLOT_MUTED], line=dict(color="#fff", width=2)),
+                        textinfo="percent+label",
+                    )
+                ]
+            )
+            fig_p.update_layout(
+                **_plotly_layout_direcional(
+                    title="Partilha de dias por regime de volume", height=420, showlegend=False
+                ),
+            )
+            st.plotly_chart(fig_p, width="stretch", config=_dpc)
+        if hq.get("counts") and hq.get("edges"):
+            st.markdown("##### Histograma — vendas diárias (qtd)")
+            edges = hq["edges"]
+            cnt = hq["counts"]
+            xs = [(edges[i] + edges[i + 1]) / 2 for i in range(len(cnt))]
+            fig = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
+            )
+            fig.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="Volume (qtd)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(fig, width="stretch", config=_dpc)
+        if hv.get("counts") and hv.get("edges"):
+            st.markdown("##### Histograma — VGV diário")
+            edges = hv["edges"]
+            cnt = hv["counts"]
+            xs = [((edges[i] + edges[i + 1]) / 2) / 1e6 for i in range(len(cnt))]
+            figv = go.Figure(
+                go.Bar(
+                    x=xs,
+                    y=cnt,
+                    marker_color=PLOT_VERMELHO,
+                    marker_line=dict(width=0),
+                )
+            )
+            figv.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    xaxis_title="VGV (mi R$)",
+                    yaxis_title="Frequência",
+                ),
+            )
+            st.plotly_chart(figv, width="stretch", config=_dpc)
+        if len(dates) == len(vl) == len(tq) and len(dates) > 5:
+            st.markdown("##### Dispersão: leads × vendas (mesmo dia)")
+            fig_s = go.Figure(
+                go.Scatter(
+                    x=vl,
+                    y=tq,
+                    mode="markers",
+                    marker=dict(
+                        size=7,
+                        opacity=0.45,
+                        color=PLOT_AZUL,
+                        line=dict(width=0.5, color="#ffffff"),
+                    ),
+                )
+            )
+            fig_s.update_layout(
+                **_plotly_layout_direcional(
+                    height=420,
+                    xaxis_title="Eixo X — leads (/ dia)",
+                    yaxis_title="Eixo Y — quantidade vendida (/ dia)",
+                ),
+            )
+            st.plotly_chart(fig_s, width="stretch", config=_dpc)
+        if dow_lbl and dow_q:
+            st.markdown("##### Média de volume por dia da semana")
+            fig_b = go.Figure(
+                go.Bar(
+                    x=dow_lbl,
+                    y=dow_q,
+                    marker_color=PLOT_AZUL,
+                    marker_line=dict(width=0),
+                )
+            )
+            fig_b.update_layout(
+                **_plotly_layout_direcional(
+                    height=400,
+                    yaxis_title="Qtd média",
+                ),
+            )
+            st.plotly_chart(fig_b, width="stretch", config=_dpc)
+
+    with td5:
+        _render_streamlit_ml_feature_importance(por_h, _dpc)
+        st.markdown("##### Métricas dos modelos (holdout) e acurácia direcional")
+        st.markdown(
+            "**Acurácia dir.:** no conjunto de teste, corresponde à percentagem de dias em que o valor real e a previsão "
+            "se situam do mesmo lado da mediana de *Y* estimada no treino; assim, complementa MAE, RMSE e R² sem os substituir."
+        )
+        rows_m = []
+        for h in _chaves_horizonte_em_por_h(por_h):
+            sub = por_h.get(h) or {}
+            m = (sub.get("qtd") or {}).get("metrics_test") or {}
+            rows_m.append(
+                {
+                    "Horizonte": f"{h}d",
+                    "Alvo": "Quantidade",
+                    "MAE": m.get("MAE"),
+                    "RMSE": m.get("RMSE"),
+                    "R²": m.get("R2"),
+                    "Acurácia dir.": m.get("Acc_dir_mediana"),
+                }
+            )
+        if por_custom:
+            m = (por_custom.get("qtd") or {}).get("metrics_test") or {}
+            rows_m.append(
+                {
+                    "Horizonte": "Personalizado",
+                    "Alvo": "Quantidade",
+                    "MAE": m.get("MAE"),
+                    "RMSE": m.get("RMSE"),
+                    "R²": m.get("R2"),
+                    "Acurácia dir.": m.get("Acc_dir_mediana"),
+                }
+            )
+        _hay_metricas = any(r.get("MAE") is not None for r in rows_m)
+        if _hay_metricas:
+            st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
+        else:
+            st.markdown(
+                '<p style="text-align:center;color:#64748b;font-size:0.88rem;margin:0.5rem 0">'
+                "As métricas detalhadas surgirão nesta secção após executar <strong>Gerar previsões</strong>.</p>",
+                unsafe_allow_html=True,
+            )
+        low_acc: list[dict[str, Any]] = []
+        for r in rows_m:
+            ad = r.get("Acurácia dir.")
+            if ad is None:
+                continue
+            try:
+                adf = float(ad)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(adf) and adf < 0.8:
+                low_acc.append(r)
+        if _hay_metricas and low_acc:
+            st.warning(
+                "A acurácia direcional é inferior a 80% em, pelo menos, um horizonte (quantidade); analise o conjunto de métricas "
+                "antes de utilizar as previsões como único critério de decisão."
+            )
+        st.divider()
+        if por_custom:
+            st.markdown("##### Intervalo personalizado")
+            st.markdown(f"**{por_custom.get('label', '—')}**")
+            qc = por_custom.get("qtd") or {}
+            st.markdown(
+                f"- **Qtd prevista (último dia):** {float(qc.get('pred_ultimo_dia', 0)):,.2f} · "
+                f"MAE teste: {float((qc.get('metrics_test') or {}).get('MAE', 0)):.3f} · "
+                f"Acurácia dir.: {float((qc.get('metrics_test') or {}).get('Acc_dir_mediana', 0))*100:.1f}%"
+            )
+            st.caption(
+                "As variáveis `fwd_*` incorporam fins de semana e feriados brasileiros dentro do horizonte da soma, quando aplicável."
+            )
+        else:
+            st.caption("Não foi definido cenário personalizado por intervalo de datas nesta execução.")
+
+
+def main() -> None:
+    fav = _resolver_png_raiz(FAVICON_ARQUIVO)
+    st.set_page_config(
+        page_title="Previsão de vendas | Direcional",
+        page_icon=str(fav) if fav else "📊",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    _configure_streamlit_progress()
+    inject_css()
+    _exibir_logo_topo()
+
+    st.markdown(
+        '<div class="pv-hero-block">'
+        '<p class="pv-hero-title">Direcional Engenharia · Previsão de vendas</p>'
+        '<p class="pv-hero-sub">Matriz diária, previsão de <strong>quantidade</strong> (horizontes 3, 7 e/ou 30 dias), análises exploratórias e relatório HTML.</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="pv-bar-wrap"><div class="pv-bar"></div></div>', unsafe_allow_html=True)
+
+    if "resultado" not in st.session_state:
+        st.session_state.resultado = None
+    if "dados_exploratorios" not in st.session_state:
+        st.session_state.dados_exploratorios = None
+    if "formulario_snapshot" not in st.session_state:
+        st.session_state.formulario_snapshot = None
+
+    tab_intro, tab_analises, tab_form, tab_previsoes, tab_dossie, tab_apendice = st.tabs(
+        ["Introdução", "Análises", "Formulário", "Previsões", "Dossiê", "Apêndice"]
+    )
+
+    with tab_intro:
+        _render_tab_introducao()
+
+    with tab_form:
+        _render_tab_formulario_previsao_humano()
+
+    with tab_previsoes:
+        st.markdown(
+            '<p class="pv-section-title">Previsões e relatório</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='text-align:justify;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;color:#64748b;font-size:0.92rem;width:100%;margin:0 auto 1rem auto'>"
+            "A previsão ML é apenas de <strong>quantidade</strong> (VGV não é modelado). Escolha <strong>um ou mais</strong> horizontes "
+            "(<strong>3</strong>, <strong>7</strong> e/ou <strong>30</strong> dias). Opcionalmente, indique um intervalo de datas para um cenário adicional em quantidade.</div>",
+            unsafe_allow_html=True,
+        )
+        hz_sel = st.multiselect(
+            "Horizontes de previsão (soma nos próximos H dias da série)",
+            options=list(HORIZONTES_PREVISAO_DISPONIVEIS),
+            default=list(HORIZONTES_PREVISAO_DISPONIVEIS),
+            format_func=lambda x: f"{x} dias",
+            key="pv_horizontes_multiselect",
+            help="Apenas os valores selecionados são treinados (menos tempo de execução se escolher só um).",
+        )
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            d_ini = st.date_input(
+                "Dia inicial do intervalo (opcional)",
+                value=None,
+                key="pv_interval_start",
+            )
+        with ic2:
+            d_fim = st.date_input(
+                "Dia final do intervalo (opcional)",
+                value=None,
+                key="pv_interval_end",
+            )
+        if d_ini is not None and d_fim is not None:
+            a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+            st.info(
+                f"Foi definido um intervalo adicional de **{a.isoformat()}** a **{b.isoformat()}**, além dos horizontes que selecionar acima."
+            )
+        elif d_ini is None and d_fim is None:
+            pass
+        else:
+            st.warning(
+                "Indique **ambas** as datas (início e fim) ou, então, deixe **as duas** em branco, de forma consistente."
+            )
+
+        run_btn = st.button("Gerar previsões", type="primary", width="stretch", key="pv_gerar")
+
+        if run_btn:
+            if not hz_sel:
+                st.error("Selecione pelo menos um horizonte: 3, 7 ou 30 dias.")
+            elif (d_ini is None) ^ (d_fim is None):
+                st.error("Intervalo incompleto: são necessárias duas datas válidas ou nenhuma (deixe ambos os campos vazios).")
+            else:
+                with st.spinner("A carregar e analisar as planilhas…"):
+                    dfs, sheet_metas, used_sa = build_data_bundle()
+                st.session_state["sheet_metas"] = sheet_metas
+                st.session_state["used_service_account"] = used_sa
+                try:
+                    custom_previsao = None
+                    if d_ini is not None and d_fim is not None:
+                        a, b = (d_ini, d_fim) if d_ini <= d_fim else (d_fim, d_ini)
+                        custom_previsao = {
+                            "mode": "range",
+                            "date_start": a.isoformat(),
+                            "date_end": b.isoformat(),
+                        }
+                    with st.spinner("A treinar modelos e gerar o relatório…"):
+                        (
+                            stats_base,
+                            ticket,
+                            conv,
+                            por_h,
+                            bpp,
+                            html_out,
+                            daily_pack,
+                            dossie_ml,
+                            por_custom,
+                        ) = run_training_pipeline(
+                            dfs,
+                            custom_previsao=custom_previsao,
+                            horizontes=normalize_horizontes_previsao(hz_sel),
+                        )
+                    st.session_state.resultado = {
+                        "stats_base": stats_base,
+                        "ticket": ticket,
+                        "conv": conv,
+                        "por_h": por_h,
+                        "best_params_preview": bpp,
+                        "html": html_out,
+                        "daily_pack": daily_pack,
+                        "dossie_ml": dossie_ml,
+                        "por_custom": por_custom,
+                        "full_train": FULL_PERIOD_TRAIN_FIXO,
+                        "sheet_metas": sheet_metas,
+                        "used_sa": used_sa,
+                        "df_formulario": dfs.get("formulario_previsao"),
+                        "horizontes": normalize_horizontes_previsao(hz_sel),
+                    }
+                    st.success("Execução concluída com sucesso.")
+                    st.session_state.dados_exploratorios = None
+                except Exception as e:
+                    st.error(f"Ocorreu um erro durante a execução: {e}")
+                    st.exception(e)
+
+        res = st.session_state.resultado
+        if res is None:
+            pass
+        else:
+            stats_base = res["stats_base"]
+            ticket = res["ticket"]
+            conv = res["conv"]
+            por_h = res["por_h"]
+            html_out = res["html"]
+            full_train = res["full_train"]
+            sheet_metas = res.get("sheet_metas") or st.session_state.get("sheet_metas")
+
+            if sheet_metas:
+                st.markdown(
+                    '<p class="pv-section-title">Fontes carregadas</p>',
+                    unsafe_allow_html=True,
+                )
+                rows_m = []
+                for k, m in sheet_metas.items():
+                    rows_m.append(
+                        {
+                            "Base": k,
+                            "Método": m.get("method", "—"),
+                            "Livro": m.get("spreadsheet_title") or "—",
+                            "Aba": m.get("worksheet_title") or "—",
+                            "gid": m.get("gid", "—"),
+                            "Cabeçalho (linha)": m.get("header_row_index", "—"),
+                            "Pontuação": m.get("score", "—"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(rows_m), width="stretch", hide_index=True)
+
+            c1, c2 = st.columns(2)
+            c3, c4 = st.columns(2)
+            with c1:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Vendas (histórico)</h4><div class="val">{stats_base["vendas"]:,.0f}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f'<div class="metric-card"><h4>VGV acumulado</h4><div class="val">R$ {stats_base["vgv"]/1e6:.2f} M</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Ticket médio</h4><div class="val">R$ {ticket/1e3:,.0f} k</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown(
+                    f'<div class="metric-card"><h4>Conversão leads → vendas</h4><div class="val">{conv:.2f} %</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                '<p class="pv-section-title">Previsões (último dia da série)</p>',
+                unsafe_allow_html=True,
+            )
+            rows = []
+            lbl = "In-sample" if full_train else "Holdout 30%"
+            for h in res.get("horizontes") or _chaves_horizonte_em_por_h(por_h):
+                q = por_h[h]["qtd"]
+                acc_q = q.get("metrics_test", {}).get("Acc_dir_mediana")
+                rows.append(
+                    {
+                        "Horizonte (dias)": h,
+                        "Qtd prevista": f"{float(q['pred_ultimo_dia']):,.1f}",
+                        f"MAE ({lbl})": f"{q['metrics_test']['MAE']:.2f}",
+                        "Acurácia dir.": f"{acc_q*100:.1f}%"
+                        if acc_q is not None and np.isfinite(acc_q)
+                        else "—",
+                        "Modelo": q["model_label"],
+                    }
+                )
+            pc = res.get("por_custom")
+            if pc:
+                qc = pc.get("qtd") or {}
+                aq = (qc.get("metrics_test") or {}).get("Acc_dir_mediana")
+                rows.append(
+                    {
+                        "Horizonte (dias)": f"Personalizado: {(pc.get('label') or '')[:52]}",
+                        "Qtd prevista": f"{float(qc.get('pred_ultimo_dia', 0)):,.1f}",
+                        f"MAE ({lbl})": f"{float((qc.get('metrics_test') or {}).get('MAE', 0)):.2f}",
+                        "Acurácia dir.": f"{aq*100:.1f}%"
+                        if aq is not None and np.isfinite(aq)
+                        else "—",
+                        "Modelo": qc.get("model_label", "—"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            acc_warn = False
+            for h in res.get("horizontes") or _chaves_horizonte_em_por_h(por_h):
+                m = (por_h.get(h) or {}).get("qtd", {}).get("metrics_test") or {}
+                a = m.get("Acc_dir_mediana")
+                if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    acc_warn = True
+            if pc:
+                m = (pc.get("qtd") or {}).get("metrics_test") or {}
+                a = m.get("Acc_dir_mediana")
+                if a is not None and np.isfinite(float(a)) and float(a) < 0.8:
+                    acc_warn = True
+            if acc_warn:
+                st.warning(
+                    "A acurácia direcional situa-se abaixo de 80% em, pelo menos, um horizonte (quantidade); recomenda-se "
+                    "cruzar este sinal com MAE, RMSE e estabilidade temporal antes de decisões operacionais."
+                )
+
+            st.download_button(
+                label="Descarregar relatório HTML",
+                data=html_out.encode("utf-8"),
+                file_name="dashboard_previsao_vendas.html",
+                mime="text/html; charset=utf-8",
+                width="stretch",
+            )
+
+            st.caption(
+                "O detalhe do esquema de métricas encontra-se no **Apêndice**; o ficheiro HTML inclui, adicionalmente, "
+                "o *benchmark* de modelos e as curvas ROC."
+            )
+
+        st.divider()
+        if st.button(
+            "Limpar cenário opcional",
+            width="stretch",
+            key="pv_clear_cfg",
+        ):
+            for _k in ("pv_interval_start", "pv_interval_end"):
+                st.session_state.pop(_k, None)
+            st.session_state.pop("pv_custom_cfg", None)
+            st.rerun()
+        if st.button(
+            "Limpar cache das planilhas",
+            width="stretch",
+            key="pv_clear_cache",
+        ):
+            _load_one_role_cached.clear()
+            st.success("O cache das planilhas foi limpo; na próxima leitura, os ficheiros serão obtidos novamente.")
+
+    with tab_analises:
+        st.markdown(
+            '<p class="pv-section-title">Análises</p>',
+            unsafe_allow_html=True,
+        )
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_a = st.session_state.resultado
+        dex_a = st.session_state.get("dados_exploratorios")
+        fonte_a: dict[str, Any] | None = None
+        if res_a and res_a.get("daily_pack"):
+            fonte_a = res_a
+        elif isinstance(dex_a, dict) and dex_a.get("daily_pack"):
+            fonte_a = dex_a
+        if fonte_a:
+            _render_streamlit_tab_analises(
+                fonte_a["daily_pack"],
+                fonte_a["stats_base"],
+                fonte_a["ticket"],
+                fonte_a["conv"],
+            )
+
+    with tab_dossie:
+        st.markdown('<p class="pv-section-title">Dossiê</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda_dossie",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_d = st.session_state.resultado
+        dex_d = st.session_state.get("dados_exploratorios")
+        if res_d and res_d.get("dossie_ml") and res_d.get("daily_pack"):
+            _render_streamlit_dossie_ml(
+                res_d["dossie_ml"],
+                res_d["por_h"],
+                res_d["daily_pack"],
+                res_d.get("por_custom"),
+            )
+        elif isinstance(dex_d, dict) and dex_d.get("dossie_ml") and dex_d.get("daily_pack"):
+            _render_streamlit_dossie_ml(
+                dex_d["dossie_ml"],
+                {},
+                dex_d["daily_pack"],
+                None,
+            )
+
+    with tab_apendice:
+        st.markdown('<p class="pv-section-title">Apêndice</p>', unsafe_allow_html=True)
+        if st.button(
+            "Carregar dados (sem treino)",
+            type="primary",
+            width="stretch",
+            key="pv_load_eda_apendice",
+        ):
+            _streamlit_carregar_dados_exploratorios()
+
+        res_ap = st.session_state.resultado
+        dex_ap = st.session_state.get("dados_exploratorios")
+        if res_ap and res_ap.get("daily_pack"):
+            bpp = res_ap.get("best_params_preview") or {}
+            _render_streamlit_tab_apendice(
+                res_ap["por_h"],
+                bpp,
+                res_ap["full_train"],
+                BLEND_TOP_K_FIXO,
+                RANDOM_SEED,
+                res_ap["daily_pack"],
+            )
+        elif isinstance(dex_ap, dict) and dex_ap.get("daily_pack"):
+            _render_streamlit_tab_apendice(
+                {},
+                {},
+                FULL_PERIOD_TRAIN_FIXO,
+                BLEND_TOP_K_FIXO,
+                RANDOM_SEED,
+                dex_ap["daily_pack"],
+            )
+
+    st.markdown(
+        '<div class="pv-foot-wrap">'
+        '<p class="pv-foot">Direcional Engenharia · Previsão de vendas</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
