@@ -818,7 +818,7 @@ import numpy as np
 import optuna
 import pandas as pd
 from tqdm.auto import tqdm
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import (
@@ -835,7 +835,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.svm import SVR
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, PolynomialFeatures
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -882,6 +882,53 @@ class TrainResult:
     chart_y_pred: list[float] = field(default_factory=list)
     chart_split_index: int = 0
     benchmark_appendix: dict[str, Any] | None = None
+
+
+class PrevHtmlPolyEnricher(BaseEstimator, TransformerMixin):
+    """
+    Correlação absoluta com y → top 30 colunas + PolynomialFeatures(grau=2),
+    como em prevhtml.py (sem bias polinomial).
+    """
+
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("PrevHtmlPolyEnricher requer y no fit.")
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        y_s = pd.Series(np.asarray(y).ravel(), index=X_df.index).astype(float)
+        X_num = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        corr = X_num.corrwith(y_s).abs().fillna(0.0)
+        k = min(30, max(1, X_num.shape[1]))
+        self.top_cols_: list[Any] = corr.nlargest(k).index.tolist()
+        self.rest_cols_: list[Any] = [c for c in X_num.columns if c not in self.top_cols_]
+        self._in_columns_: list[Any] = list(X_num.columns)
+        self.poly_ = PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)
+        self.poly_.fit(X_num[self.top_cols_].astype(np.float32))
+        return self
+
+    def transform(self, X):
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        X_aligned = X_df.reindex(columns=self._in_columns_, fill_value=0.0)
+        X_num = X_aligned.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        P = self.poly_.transform(X_num[self.top_cols_].astype(np.float32))
+        names = [
+            str(n).replace(" ", "_X_").replace(":", "")
+            for n in self.poly_.get_feature_names_out(self.top_cols_)
+        ]
+        poly_df = pd.DataFrame(P, columns=names, index=X_num.index)
+        return pd.concat([X_num[self.rest_cols_], poly_df], axis=1)
+
+
+class _PrevHtmlQtdPredictor:
+    """Regressor + enriquecimento prevhtml já ajustados (apenas .predict)."""
+
+    def __init__(self, enricher: PrevHtmlPolyEnricher, regressor: Any) -> None:
+        self._enricher = enricher
+        self._regressor = regressor
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        Xt = self._enricher.transform(X)
+        pr = np.asarray(self._regressor.predict(Xt), dtype=float).ravel()
+        return np.maximum(0.0, np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0))
 
 
 class _FittedBlend:
@@ -1519,58 +1566,80 @@ def _score_val_mae(
 
 def _collect_candidate_specs(
     target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
-) -> list[tuple[str, Any, bool]]:
-    """Candidatos alinhados a prevhtml.py: XGBoost, RF, GBR, Ridge e VotingRegressor."""
-    # Mesma assinatura do pipeline; Optuna/LGBM não alimentam mais estes modelos (hiperparâmetros fixos).
-    _ = (target_name, best_params, horizon)
+) -> list[tuple[str, Pipeline, bool]]:
+    """Nome, pipeline (template), usar sample_weight recency (alvo valor / VGV)."""
+    out: list[tuple[str, Pipeline, bool]] = []
+    long_h = int(horizon) >= 21
 
-    out: list[tuple[str, Any, bool]] = []
+    out.append(("Ridge", build_ridge_pipe(rs), False))
+    out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
+    out.append(("RandomForest", build_random_forest_pipe(rs, horizon), False))
 
-    if XGBRegressor is not None:
+    if LGBMRegressor is not None:
+        out.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
+        out.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
+        out.append(("LGBM+q0.78", build_lgbm_quantile_pipe(best_params, 0.78, rs), True))
+        if long_h:
+            out.append(
+                ("LGBM+q0.85", build_lgbm_quantile_pipe(best_params, 0.85, rs), True)
+            )
+        if target_name == "valor":
+            out.append(("LGBM+q0.82", build_lgbm_quantile_pipe(best_params, 0.82, rs), True))
+            if long_h:
+                out.append(
+                    ("LGBM+q0.90", build_lgbm_quantile_pipe(best_params, 0.90, rs), True)
+                )
+            out.append(("LGBM+log1p", build_lgbm_only_pipe(best_params, True, rs), True))
+
+    out.append(("TS-linear", build_ts_linear_bridge_pipe(), False))
+    if LGBMRegressor is not None:
         out.append(
             (
-                "XGBoost",
-                XGBRegressor(
-                    n_estimators=100,
-                    learning_rate=0.05,
-                    max_depth=4,
-                    random_state=rs,
-                ),
+                "Med+High-LGBM",
+                build_median_quantile_blend_pipe(best_params, rs, target_name, horizon),
                 False,
             )
         )
 
-    out.append(
-        (
-            "Random Forest",
-            RandomForestRegressor(
-                n_estimators=100, max_depth=5, random_state=rs
-            ),
-            False,
-        )
-    )
-    out.append(
-        (
-            "Gradient Boosting",
-            GradientBoostingRegressor(
-                n_estimators=100,
-                learning_rate=0.05,
-                max_depth=4,
-                random_state=rs,
-            ),
-            False,
-        )
-    )
-    out.append(("Ridge Linear", Ridge(alpha=1.0), False))
+    out.append(("HGB", build_hgb_pipe(rs, target_name), False))
 
-    voting_estimators = [(n, m) for n, m, _ in out]
-    out.append(
-        (
-            "Ensemble (Voting)",
-            VotingRegressor(estimators=voting_estimators),
-            False,
+    xgbp = build_xgb_only_pipe(best_params, False, rs, horizon)
+    if xgbp is not None:
+        out.append(("XGB", xgbp, True))
+        if target_name == "valor":
+            xl = build_xgb_only_pipe(best_params, True, rs, horizon)
+            if xl is not None:
+                out.append(("XGB+log1p", xl, True))
+
+    cb = build_catboost_pipe(False, rs, target_name)
+    if cb is not None:
+        out.append(("CatBoost", cb, False))
+        if target_name == "valor":
+            cb_log = build_catboost_pipe(True, rs, target_name)
+            if cb_log is not None:
+                out.append(("CatBoost+log1p", cb_log, False))
+
+    out.append(("ExtraTrees", build_extratrees_pipe(best_params, False, rs, horizon), True))
+    if target_name == "valor":
+        out.append(
+            ("ExtraTrees+log1p", build_extratrees_pipe(best_params, True, rs, horizon), True)
         )
-    )
+        ngbp = build_ngboost_pipe(rs)
+        if ngbp is not None:
+            out.append(("NGBoost", ngbp, False))
+
+    lstack = build_light_stack_pipe(best_params, False, rs, target_name)
+    if lstack is not None:
+        out.append(("Stack(LGBM+HGB)", lstack, False))
+        if target_name == "valor":
+            ls2 = build_light_stack_pipe(best_params, True, rs, target_name)
+            if ls2 is not None:
+                out.append(("Stack+log1p", ls2, False))
+
+    out.append(("SVM (SVR)", build_svm_pipe(rs, target_name), False))
+    out.append(("k-NN", build_knn_pipe(rs, target_name), False))
+
+    out.append(("Baseline mediana", build_dummy_median_pipe(), False))
     return out
 
 
@@ -1677,6 +1746,246 @@ def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
     return base
 
 
+def _prevhtml_model_templates(random_state: int) -> dict[str, Any]:
+    """Mesmos estimadores e VotingRegressor que prevhtml.py."""
+    bases: list[tuple[str, Any]] = []
+    if XGBRegressor is not None:
+        bases.append(
+            (
+                "XGBoost",
+                XGBRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
+            )
+        )
+    bases.extend(
+        [
+            (
+                "Random Forest",
+                RandomForestRegressor(
+                    n_estimators=100, max_depth=5, random_state=random_state
+                ),
+            ),
+            (
+                "Gradient Boosting",
+                GradientBoostingRegressor(
+                    n_estimators=100,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=random_state,
+                ),
+            ),
+            ("Ridge Linear", Ridge(alpha=1.0)),
+        ]
+    )
+    out = dict(bases)
+    out["Ensemble (Voting)"] = VotingRegressor(
+        estimators=[(n, clone(e)) for n, e in bases]
+    )
+    return out
+
+
+def _train_one_target_prevhtml(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    random_state: int,
+    show_progress: bool,
+    full_period_train: bool,
+    train_frac: float,
+) -> TrainResult:
+    """
+    Estratégia prevhtml.py: correlação → top-30 → polinômio grau 2;
+    split cronológico 70/30 dentro da zona de treino para competição por MAE;
+    vencedor reajustado em toda a zona de treino; modelo final em toda a série (como o app).
+    """
+    hz = int(horizon)
+    idx = X.index.intersection(y.index)
+    Xa = X.loc[idx].copy()
+    ya = pd.to_numeric(y.loc[idx], errors="coerce").astype(float)
+
+    if not full_period_train:
+        sl_tr, sl_te = temporal_train_test_indices(len(Xa), float(train_frac))
+        X_fit_zone = Xa.iloc[sl_tr]
+        y_fit_zone = ya.iloc[sl_tr]
+        X_outer = Xa.iloc[sl_te]
+        y_outer = ya.iloc[sl_te]
+    else:
+        X_fit_zone = Xa
+        y_fit_zone = ya
+        X_outer = Xa
+        y_outer = ya
+
+    enrich = PrevHtmlPolyEnricher()
+    enrich.fit(X_fit_zone, y_fit_zone)
+    Xef = enrich.transform(X_fit_zone)
+
+    n_in = len(Xef)
+    split_i = int(n_in * 0.7)
+    if split_i < 1 or (n_in - split_i) < 1:
+        raise ValueError(
+            "Série curta demais para o split interno 70/30 (estratégia prevhtml, alvo quantidade)."
+        )
+
+    X_p_tr = Xef.iloc[:split_i]
+    X_p_te = Xef.iloc[split_i:]
+    y_p_tr = y_fit_zone.iloc[:split_i]
+    y_p_te = y_fit_zone.iloc[split_i:]
+
+    templates = _prevhtml_model_templates(random_state)
+    maes: dict[str, float] = {}
+    loop = list(templates.items())
+    if show_progress:
+        loop = list(tqdm(loop, desc="Prevhtml (qtd)", leave=False, unit="modelo"))
+    for name, tpl in loop:
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            maes[name] = float(mean_absolute_error(y_p_te, pv))
+        except Exception:
+            continue
+
+    if not maes:
+        dm = DummyRegressor(strategy="median")
+        dm.fit(X_p_tr, y_p_tr)
+        pv0 = np.maximum(0.0, dm.predict(X_p_te))
+        win_name = "Baseline mediana (fallback)"
+        templates = {win_name: dm}
+        maes = {win_name: float(mean_absolute_error(y_p_te, pv0))}
+
+    win_name = min(maes, key=lambda k: maes[k])
+    win_tpl = templates[win_name]
+
+    reg_fit_zone = clone(win_tpl)
+    reg_fit_zone.fit(Xef, y_fit_zone)
+
+    X_all_enr = enrich.transform(Xa)
+    reg_prod = clone(win_tpl)
+    reg_prod.fit(X_all_enr, ya)
+
+    pipe = _PrevHtmlQtdPredictor(enrich, reg_prod)
+
+    reg_eval = clone(win_tpl)
+    reg_eval.fit(X_p_tr, y_p_tr)
+    pred_inner_te = np.maximum(0.0, reg_eval.predict(X_p_te))
+    y_max_tr = float(np.percentile(y_p_tr, 99.5)) if len(y_p_tr) else 0.0
+    long_hz = hz >= 21
+    cap_mult = 2.75 if long_hz else 2.35
+    cap = max(y_max_tr * cap_mult, 1.0)
+    pred_inner_te = np.clip(
+        np.nan_to_num(pred_inner_te, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+
+    thr = float(np.median(y_p_tr))
+
+    if full_period_train:
+        pred_outer = pred_inner_te
+        yo = y_p_te
+        do = X_p_te.index
+    else:
+        X_outer_enr = enrich.transform(X_outer)
+        pred_outer = np.maximum(0.0, reg_fit_zone.predict(X_outer_enr))
+        pred_outer = np.clip(
+            np.nan_to_num(pred_outer, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+        )
+        yo = y_outer
+        do = X_outer.index
+
+    metrics_val = _metrics_dict(y_p_te.values, pred_inner_te, "qtd")
+    metrics_test = _metrics_dict(np.asarray(yo, dtype=float), np.asarray(pred_outer, dtype=float), "qtd")
+    metrics_val["n_features"] = float(Xa.shape[1])
+    metrics_test["n_features"] = float(Xa.shape[1])
+
+    pred_chart = pipe.predict(Xa)
+    pred_chart = np.clip(
+        np.nan_to_num(pred_chart, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap
+    )
+    chart_dates = [d.strftime("%Y-%m-%d") for d in Xa.index]
+    chart_y_real = ya.tolist()
+    chart_y_pred = pred_chart.tolist()
+    chart_split_index = int(len(X_fit_zone)) if not full_period_train else split_i
+
+    y_tr_ref = np.asarray(y_p_tr, dtype=float)
+    metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        y_p_te.values, pred_inner_te, y_tr_ref
+    )
+    metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
+        np.asarray(yo, dtype=float), pred_outer, y_tr_ref
+    )
+
+    bench_rows: list[dict[str, Any]] = []
+    for name, tpl in templates.items():
+        m = clone(tpl)
+        try:
+            m.fit(X_p_tr, y_p_tr)
+            pv = np.maximum(0.0, m.predict(X_p_te))
+            if full_period_train:
+                pt = pv
+                y_te_b = y_p_te
+            else:
+                pt = np.maximum(0.0, m.predict(enrich.transform(X_outer)))
+                y_te_b = y_outer
+            bench_rows.append(
+                {
+                    "name": name,
+                    "mae_val": float(mean_absolute_error(y_p_te, pv)),
+                    "reg_val": regression_metrics(y_p_te.values, pv),
+                    "reg_test": regression_metrics(np.asarray(y_te_b, dtype=float), pt),
+                    "bin_val": binary_from_regression(y_p_te.values, pv, thr),
+                    "bin_test": binary_from_regression(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                    "roc_test": roc_curve_data(
+                        np.asarray(y_te_b, dtype=float), pt, thr
+                    ),
+                }
+            )
+        except Exception:
+            continue
+    bench_rows.sort(key=lambda r: r["mae_val"])
+    benchmark_appendix = _sanitize_benchmark_appendix(
+        {
+            "rows": bench_rows,
+            "winner_label": win_name,
+            "winner_names": [win_name],
+            "winner_weights": [1.0],
+            "threshold_y": thr,
+        }
+    )
+
+    best_params: dict[str, Any] = {
+        "estrategia": "prevhtml_poly_correlacao_70_30",
+        "modelo_vencedor": win_name,
+        "mae_split_interno": maes,
+        "horizonte_alvo": hz,
+    }
+
+    return TrainResult(
+        pipeline=pipe,
+        metrics_val=metrics_val,
+        metrics_test=metrics_test,
+        importance=pd.Series(dtype=float),
+        y_val=y_p_te,
+        y_val_pred=pred_inner_te,
+        y_test=pd.Series(np.asarray(yo, dtype=float), index=do),
+        y_test_pred=np.asarray(pred_outer, dtype=float),
+        best_params=best_params,
+        dates_val=X_p_te.index,
+        dates_test=do,
+        model_label=f"Prevhtml: {win_name}",
+        full_period_train=full_period_train,
+        chart_dates=chart_dates,
+        chart_y_real=chart_y_real,
+        chart_y_pred=chart_y_pred,
+        chart_split_index=chart_split_index,
+        benchmark_appendix=benchmark_appendix,
+    )
+
+
 def train_one_target(
     X: pd.DataFrame,
     y: pd.Series,
@@ -1691,6 +2000,17 @@ def train_one_target(
     full_period_train: bool = False,
     train_frac: float = 0.7,
 ) -> TrainResult:
+    if target_name == "qtd":
+        return _train_one_target_prevhtml(
+            X,
+            y,
+            horizon=horizon,
+            random_state=random_state,
+            show_progress=show_progress,
+            full_period_train=full_period_train,
+            train_frac=train_frac,
+        )
+
     n = len(X)
     hz = int(horizon)
 
