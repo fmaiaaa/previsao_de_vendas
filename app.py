@@ -300,53 +300,6 @@ def eda_dataframe(df: pd.DataFrame, name: str) -> dict[str, Any]:
     summary["colunas_data_candidatas"] = date_cols[:20]
     return summary
 
-# ----- inlined: weights.py -----
-
-import numpy as np
-import pandas as pd
-
-
-def recency_weights(n: int, exp_scale: float = 2.45) -> np.ndarray:
-    """
-    Mais peso nas observações recentes: curva exponencial em t∈[0,1]
-    (t=0 mais antigo, t=1 mais recente). exp_scale maior = contraste mais forte.
-    """
-    if n <= 0:
-        return np.array([])
-    if n == 1:
-        return np.ones(1)
-    t = np.linspace(0.0, 1.0, n)
-    w = np.exp(exp_scale * t)
-    return (w * (n / w.sum())).astype(float)
-
-
-def sample_weights(
-    y: pd.Series,
-    use_recency: bool,
-    target_name: str,
-    horizon: int | None = None,
-) -> np.ndarray:
-    yv = np.asarray(y, dtype=float).ravel()
-    n = len(yv)
-    base = np.ones(n)
-    long_h = horizon is not None and int(horizon) >= 21
-    if use_recency:
-        base = recency_weights(n, exp_scale=2.75 if long_h else 2.45)
-    if target_name == "valor":
-        exp = 0.5 if long_h else 0.42
-        hi = 9.0 if long_h else 6.0
-        lo = 0.3 if long_h else 0.35
-        scale = np.power(np.maximum(yv, np.percentile(yv, 15)), exp)
-        scale = scale / (np.median(scale) + 1e-9)
-        base = base * np.clip(scale, lo, hi)
-    elif target_name == "qtd":
-        exp = 0.62 if long_h else 0.55
-        hi = 6.8 if long_h else 5.0
-        scale = np.power(np.maximum(yv, 0.35), exp)
-        scale = scale / (np.median(scale) + 1e-9)
-        base = base * np.clip(scale, 0.38, hi)
-    return (base * (n / (base.sum() + 1e-12))).astype(float)
-
 # ----- inlined: metric_suite.py -----
 
 from typing import Any
@@ -429,384 +382,6 @@ def roc_curve_data(
         "auc": auc,
     }
 
-# ----- inlined: benchmark_runner.py -----
-
-from typing import Any, Callable
-
-import numpy as np
-import pandas as pd
-from sklearn.base import clone
-from sklearn.metrics import mean_absolute_error
-from tqdm.auto import tqdm
-
-
-def _pv_tqdm(*args: Any, **kwargs: Any) -> Any:
-    """tqdm com flush frequente e intervalo curto — no Streamlit a barra deixa de parecer congelada."""
-    import sys
-
-    kwargs.setdefault("file", sys.stderr)
-    kwargs.setdefault("mininterval", 0.12)
-    kwargs.setdefault("miniters", 1)
-    kwargs.setdefault("dynamic_ncols", True)
-    return tqdm(*args, **kwargs)
-
-
-def _clip_pos(arr: np.ndarray, cap: float) -> np.ndarray:
-    return np.clip(np.nan_to_num(arr, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap)
-
-
-def run_model_benchmark(
-    specs: list[tuple[str, Any, bool]],
-    fit_fn: Callable[[Any, pd.DataFrame, pd.Series, bool], None],
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    X_fit: pd.DataFrame,
-    y_fit: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    show_progress: bool = True,
-) -> dict[str, Any]:
-    """
-    Ajusta cada modelo em X_train, mede MAE em X_val; reajusta em X_fit para métricas de teste.
-    Limiar binário = mediana(y_train) (só treino interno).
-    """
-    y_tr = np.asarray(y_train, dtype=float).ravel()
-    thr = float(np.median(y_tr))
-    cap = float(max(np.percentile(y_tr, 99.5) * 5.0, 1.0))
-
-    preds_val: dict[str, np.ndarray] = {}
-    preds_test: dict[str, np.ndarray] = {}
-    val_mae: dict[str, float] = {}
-    spec_by_name: dict[str, tuple[Any, bool]] = {}
-
-    it = specs
-    if show_progress:
-        it = _pv_tqdm(specs, desc="Benchmark modelos", leave=False, unit="m")
-
-    for name, tpl, use_sw in it:
-        spec_by_name[name] = (tpl, use_sw)
-        try:
-            p = clone(tpl)
-            fit_fn(p, X_train, y_train, use_sw)
-            pv = _clip_pos(np.asarray(p.predict(X_val), dtype=float).ravel(), cap)
-            preds_val[name] = pv
-            val_mae[name] = float(mean_absolute_error(np.asarray(y_val, dtype=float), pv))
-
-            p2 = clone(tpl)
-            fit_fn(p2, X_fit, y_fit, use_sw)
-            pt = _clip_pos(np.asarray(p2.predict(X_test), dtype=float).ravel(), cap)
-            preds_test[name] = pt
-        except Exception:
-            preds_val.pop(name, None)
-            preds_test.pop(name, None)
-            val_mae.pop(name, None)
-            spec_by_name.pop(name, None)
-
-    if not val_mae:
-        return {
-            "rows": [],
-            "roc_traces": [],
-            "winner_names": [],
-            "winner_weights": [],
-            "winner_label": "nenhum",
-            "threshold_y": thr,
-            "spec_by_name": {},
-        }
-
-    ranked = sorted(val_mae.items(), key=lambda x: x[1])
-    names_ord = [n for n, _ in ranked]
-
-    y_va = np.asarray(y_val, dtype=float).ravel()
-    y_te = np.asarray(y_test, dtype=float).ravel()
-    y_fi = np.asarray(y_fit, dtype=float).ravel()
-
-    rows: list[dict[str, Any]] = []
-
-    def add_synthetic_row(
-        label: str,
-        pv: np.ndarray,
-        pt: np.ndarray,
-    ) -> None:
-        rv = regression_metrics(y_va, pv)
-        rt = regression_metrics(y_te, pt)
-        bv = binary_from_regression(y_va, pv, thr)
-        bt = binary_from_regression(y_te, pt, thr)
-        roc_t = roc_curve_data(y_te, pt, thr)
-        rows.append(
-            {
-                "name": label,
-                "mae_val": float(mean_absolute_error(y_va, pv)),
-                "reg_val": rv,
-                "reg_test": rt,
-                "bin_val": bv,
-                "bin_test": bt,
-                "roc_test": roc_t,
-            }
-        )
-        preds_val[label] = pv
-        preds_test[label] = pt
-        val_mae[label] = float(mean_absolute_error(y_va, pv))
-
-    # Ensembles a partir dos melhores na validação
-    top3 = names_ord[: min(3, len(names_ord))]
-    top5 = names_ord[: min(5, len(names_ord))]
-    top7 = names_ord[: min(7, len(names_ord))]
-
-    if len(top3) >= 2:
-        pv = np.mean([preds_val[n] for n in top3], axis=0)
-        pt = np.mean([preds_test[n] for n in top3], axis=0)
-        add_synthetic_row("Ens.Média-Top3", pv, pt)
-
-    if len(top5) >= 3:
-        pv = np.mean([preds_val[n] for n in top5], axis=0)
-        pt = np.mean([preds_test[n] for n in top5], axis=0)
-        add_synthetic_row("Ens.Média-Top5", pv, pt)
-
-    if len(top5) >= 2:
-        ws = np.array([1.0 / (val_mae[n] + 1e-8) for n in top5], dtype=float)
-        ws = ws / (ws.sum() + 1e-12)
-        pv = sum(ws[i] * preds_val[top5[i]] for i in range(len(top5)))
-        pt = sum(ws[i] * preds_test[top5[i]] for i in range(len(top5)))
-        add_synthetic_row("Ens.PesoInvMAE-Top5", pv, pt)
-
-    if len(top7) >= 4:
-        ws = np.array([1.0 / (val_mae[n] + 1e-8) for n in top7], dtype=float)
-        ws = ws / (ws.sum() + 1e-12)
-        pv = sum(ws[i] * preds_val[top7[i]] for i in range(len(top7)))
-        pt = sum(ws[i] * preds_test[top7[i]] for i in range(len(top7)))
-        add_synthetic_row("Ens.PesoInvMAE-Top7", pv, pt)
-
-    if len(top7) >= 5:
-        pv = np.mean([preds_val[n] for n in top7], axis=0)
-        pt = np.mean([preds_test[n] for n in top7], axis=0)
-        add_synthetic_row("Ens.Média-Top7", pv, pt)
-
-    # Linhas dos modelos base
-    for name in names_ord:
-        if name not in preds_val or name not in preds_test:
-            continue
-        pv = preds_val[name]
-        pt = preds_test[name]
-        rv = regression_metrics(y_va, pv)
-        rt = regression_metrics(y_te, pt)
-        bv = binary_from_regression(y_va, pv, thr)
-        bt = binary_from_regression(y_te, pt, thr)
-        roc_t = roc_curve_data(y_te, pt, thr)
-        rows.append(
-            {
-                "name": name,
-                "mae_val": val_mae[name],
-                "reg_val": rv,
-                "reg_test": rt,
-                "bin_val": bv,
-                "bin_test": bt,
-                "roc_test": roc_t,
-            }
-        )
-
-    # Ordenar rows por mae_val
-    rows.sort(key=lambda r: r["mae_val"])
-    best = rows[0]
-    best_name = str(best["name"])
-
-    winner_names: list[str] = []
-    winner_weights: list[float] = []
-
-    if best_name.startswith("Ens."):
-        if best_name == "Ens.Média-Top3":
-            winner_names = top3
-            winner_weights = [1.0 / len(top3)] * len(top3)
-        elif best_name == "Ens.Média-Top5":
-            winner_names = top5
-            winner_weights = [1.0 / len(top5)] * len(top5)
-        elif best_name == "Ens.PesoInvMAE-Top5":
-            winner_names = top5
-            ws = np.array([1.0 / (val_mae[n] + 1e-8) for n in top5], dtype=float)
-            ws = ws / (ws.sum() + 1e-12)
-            winner_weights = ws.tolist()
-        elif best_name == "Ens.PesoInvMAE-Top7":
-            winner_names = top7
-            ws = np.array([1.0 / (val_mae[n] + 1e-8) for n in top7], dtype=float)
-            ws = ws / (ws.sum() + 1e-12)
-            winner_weights = ws.tolist()
-        elif best_name == "Ens.Média-Top7":
-            winner_names = top7
-            winner_weights = [1.0 / len(top7)] * len(top7)
-    else:
-        winner_names = [best_name]
-        winner_weights = [1.0]
-
-    # Curvas ROC (teste) para todos os modelos com AUC finito
-    roc_traces: list[dict[str, Any]] = []
-    for r in rows:
-        roc = r.get("roc_test") or {}
-        auc = roc.get("auc")
-        if isinstance(auc, float) and np.isfinite(auc) and roc.get("fpr"):
-            roc_traces.append(
-                {
-                    "name": r["name"],
-                    "fpr": roc["fpr"],
-                    "tpr": roc["tpr"],
-                    "auc": float(auc),
-                }
-            )
-
-    return {
-        "rows": rows,
-        "roc_traces": roc_traces,
-        "winner_names": winner_names,
-        "winner_weights": winner_weights,
-        "winner_label": best_name,
-        "threshold_y": thr,
-        "spec_by_name": spec_by_name,
-    }
-
-# ----- inlined: ts_components.py -----
-
-from typing import Any
-
-import numpy as np
-import pandas as pd
-from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.linear_model import RidgeCV
-from sklearn.metrics import mean_absolute_error
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler
-
-
-class TSLinearBridgeRegressor(BaseEstimator, RegressorMixin):
-    """
-    Ridge só em colunas `ts_*` (sinais de ST, sazonalidade explícita, etc.).
-    Captura tendência linear nos componentes temporais sem suavizar tanto quanto árvores puras.
-    """
-
-    def __init__(self, alphas: np.ndarray | None = None) -> None:
-        self.alphas = alphas if alphas is not None else np.logspace(-1.5, 3.5, 18)
-
-    def fit(self, X: pd.DataFrame, y: Any) -> TSLinearBridgeRegressor:
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        self.feature_names_in_ = np.array(X.columns, dtype=object)
-        cols = [c for c in X.columns if str(c).startswith("ts_")]
-        if len(cols) < 2:
-            cols = list(X.columns)[: min(12, X.shape[1])]
-        self.cols_: list[str] = cols
-        self.scaler_ = MinMaxScaler(feature_range=(0, 1), clip=True)
-        Z = self.scaler_.fit_transform(X[cols].astype(float))
-        self.ridge_ = RidgeCV(alphas=self.alphas, cv=3)
-        self.ridge_.fit(Z, np.asarray(y, dtype=float).ravel())
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X, columns=self.feature_names_in_)
-        Z = self.scaler_.transform(X[self.cols_].astype(float))
-        return np.maximum(self.ridge_.predict(Z), 0.0)
-
-
-def build_ts_linear_bridge_pipe() -> Pipeline:
-    return Pipeline(
-        [
-            ("ts_lin", TSLinearBridgeRegressor()),
-        ]
-    )
-
-
-class MedianQuantileBlendRegressor(BaseEstimator, RegressorMixin):
-    """
-    LGBM médio (L2) + LGBM quantil alto: mistura calibrada no fim do treino para
-    não colapsar na média quando o VGV (ou volume) tem cauda pesada.
-    """
-
-    def __init__(
-        self,
-        best_params: dict[str, Any] | None,
-        random_state: int = 42,
-        target_name: str = "valor",
-        q_high: float = 0.82,
-        horizon: int = 7,
-    ) -> None:
-        self.best_params = dict(best_params or {})
-        self.random_state = random_state
-        self.target_name = target_name
-        self.q_high = q_high
-        self.horizon = int(horizon)
-
-    def fit(self, X: pd.DataFrame, y: Any) -> MedianQuantileBlendRegressor:
-        from lightgbm import LGBMRegressor
-
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        self.feature_names_in_ = list(X.columns)
-        y_s = pd.Series(np.asarray(y, dtype=float).ravel())
-        n = len(y_s)
-        cut = max(int(n * 0.87), n - 30)
-        X_tr, y_tr = X.iloc[:cut], y_s.iloc[:cut]
-        X_ho, y_ho = X.iloc[cut:], y_s.iloc[cut:]
-
-        self.scaler_ = MinMaxScaler(feature_range=(0, 1), clip=True)
-        X_tr_s = self.scaler_.fit_transform(X_tr)
-        sw_tr = sample_weights(y_tr, True, self.target_name, self.horizon)
-
-        base = {
-            **self.best_params,
-            "random_state": self.random_state,
-            "verbosity": -1,
-            "n_jobs": -1,
-        }
-        self.med_ = LGBMRegressor(**base)
-        self.med_.fit(X_tr_s, y_tr, sample_weight=sw_tr)
-
-        q_params = {**base, "objective": "quantile", "alpha": self.q_high}
-        self.q_ = LGBMRegressor(**q_params)
-        self.q_.fit(X_tr_s, y_tr, sample_weight=sw_tr)
-
-        long_h = self.horizon >= 21
-        self.gamma_ = 0.42 if long_h else 0.34
-        if len(y_ho) > 6:
-            Xh = self.scaler_.transform(X_ho)
-            pm = self.med_.predict(Xh)
-            pq = self.q_.predict(Xh)
-            best_mae = 1e30
-            best_g = self.gamma_
-            g_lo, g_hi, n_g = (0.22, 0.78, 15) if long_h else (0.12, 0.62, 12)
-            for g in np.linspace(g_lo, g_hi, n_g):
-                pred = (1.0 - g) * pm + g * pq
-                mae = mean_absolute_error(
-                    y_ho, np.maximum(pred, 0.0)
-                )
-                if mae < best_mae:
-                    best_mae, best_g = mae, float(g)
-            self.gamma_ = best_g
-
-        X_full_s = self.scaler_.transform(X)
-        sw_full = sample_weights(y_s, True, self.target_name, self.horizon)
-        self.med_.fit(X_full_s, y_s, sample_weight=sw_full)
-        self.q_.fit(X_full_s, y_s, sample_weight=sw_full)
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X, columns=self.feature_names_in_)
-        Xs = self.scaler_.transform(X)
-        pm = self.med_.predict(Xs)
-        pq = self.q_.predict(Xs)
-        out = (1.0 - self.gamma_) * pm + self.gamma_ * pq
-        return np.maximum(np.asarray(out, dtype=float), 0.0)
-
-
-def build_median_quantile_blend_pipe(
-    best_params: dict[str, Any], rs: int, target_name: str, horizon: int = 7
-) -> Pipeline:
-    long_h = int(horizon) >= 21
-    q_hi = 0.88 if long_h else 0.84
-    inner = MedianQuantileBlendRegressor(
-        best_params, rs, target_name, q_high=q_hi, horizon=int(horizon)
-    )
-    return Pipeline([("model", inner)])
-
 # ----- inlined: train_eval.py -----
 
 import math
@@ -815,51 +390,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import optuna
 import pandas as pd
 from tqdm.auto import tqdm
 from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
-from sklearn.compose import TransformedTargetRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import (
-    ExtraTreesRegressor,
     GradientBoostingRegressor,
-    HistGradientBoostingRegressor,
     RandomForestRegressor,
-    StackingRegressor,
     VotingRegressor,
 )
-from sklearn.linear_model import ElasticNet, Ridge
-from sklearn.neighbors import KNeighborsRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.svm import SVR
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler, PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
-try:
-    from lightgbm import LGBMRegressor
-except ImportError:
-    LGBMRegressor = None  # type: ignore[misc, assignment]
 
 try:
     from xgboost import XGBRegressor
 except ImportError:
     XGBRegressor = None  # type: ignore[misc, assignment]
-
-try:
-    from catboost import CatBoostRegressor
-except ImportError:
-    CatBoostRegressor = None  # type: ignore[misc, assignment]
-
-try:
-    from ngboost import NGBRegressor
-    from ngboost.distns import Normal
-except ImportError:
-    NGBRegressor = None  # type: ignore[misc, assignment]
-    Normal = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -929,39 +478,6 @@ class _PrevHtmlQtdPredictor:
         Xt = self._enricher.transform(X)
         pr = np.asarray(self._regressor.predict(Xt), dtype=float).ravel()
         return np.maximum(0.0, np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0))
-
-
-class _FittedBlend:
-    """Combinação linear de pipelines já ajustados (pesos normalizados)."""
-
-    def __init__(self, fitted_pipes: list[Any], weights: np.ndarray) -> None:
-        self.fitted_pipes = fitted_pipes
-        self.weights = np.asarray(weights, dtype=float)
-        self.weights = self.weights / (self.weights.sum() + 1e-12)
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        P = np.column_stack([p.predict(X) for p in self.fitted_pipes])
-        out = P @ self.weights
-        return np.asarray(out, dtype=float).ravel()
-
-
-def _make_fitted_blend(
-    templates: list[Any],
-    weights: np.ndarray,
-    sw_flags: list[bool],
-    X: pd.DataFrame,
-    y: pd.Series,
-    target_name: str,
-    horizon: int = 7,
-) -> _FittedBlend:
-    w = np.asarray(weights, dtype=float)
-    w = w / (w.sum() + 1e-12)
-    fitted: list[Any] = []
-    for tpl, sw in zip(templates, sw_flags):
-        p = clone(tpl)
-        _safe_fit_pipeline(p, X, y, sw, target_name, horizon)
-        fitted.append(p)
-    return _FittedBlend(fitted, w)
 
 
 def _smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -1034,684 +550,6 @@ def temporal_train_test_indices(n: int, train_frac: float = 0.7) -> tuple[slice,
     return slice(0, i_tr), slice(i_tr, n)
 
 
-def _ensemble_selection_splits(n: int) -> tuple[slice, slice]:
-    """
-    Primeiros (~92%) para ajustar candidatos; últimos (~8%) só para MAE e escolha do blend.
-    Em modo 80/20, n é o comprimento só do bloco de treino.
-    """
-    if n < 15:
-        n_va = max(1, min(3, n // 5))
-    else:
-        n_va = max(7, int(n * 0.08))
-    n_va = min(n_va, max(1, n - max(10, n // 2)))
-    i_tr = n - n_va
-    if i_tr < 1:
-        i_tr, n_va = n - 1, 1
-    return slice(0, i_tr), slice(i_tr, n)
-
-
-def _safe_fit_pipeline(
-    pipe: Any,
-    X: pd.DataFrame,
-    y: pd.Series,
-    use_sw: bool,
-    target_name: str,
-    horizon: int = 7,
-) -> None:
-    sw = sample_weights(y, True, target_name, horizon) if use_sw else None
-    if sw is None:
-        pipe.fit(X, y)
-        return
-    try:
-        pipe.fit(X, y, model__sample_weight=sw)
-    except TypeError:
-        pipe.fit(X, y)
-
-
-def _fit_lgbm_with_early_stopping(
-    model: Any,
-    X_tr,
-    y_tr,
-    X_va,
-    y_va,
-    sample_weight,
-    *,
-    stopping_rounds: int = 48,
-) -> None:
-    """Treino LGBM com validação no fold e *early stopping* nas árvores (métrica MAE)."""
-    eval_set = [(X_va, np.asarray(y_va, dtype=float).ravel())]
-    try:
-        from lightgbm import early_stopping, log_evaluation
-
-        cbs = [
-            early_stopping(stopping_rounds=stopping_rounds, verbose=False),
-            log_evaluation(period=0),
-        ]
-        if sample_weight is not None:
-            model.fit(
-                X_tr,
-                y_tr,
-                sample_weight=sample_weight,
-                eval_set=eval_set,
-                eval_metric="mae",
-                callbacks=cbs,
-            )
-        else:
-            model.fit(X_tr, y_tr, eval_set=eval_set, eval_metric="mae", callbacks=cbs)
-    except (ImportError, TypeError, ValueError):
-        if sample_weight is not None:
-            model.fit(
-                X_tr,
-                y_tr,
-                sample_weight=sample_weight,
-                eval_set=eval_set,
-                eval_metric="mae",
-                early_stopping_rounds=stopping_rounds,
-                verbose=-1,
-            )
-        else:
-            model.fit(
-                X_tr,
-                y_tr,
-                eval_set=eval_set,
-                eval_metric="mae",
-                early_stopping_rounds=stopping_rounds,
-                verbose=-1,
-            )
-
-
-def _optuna_patience_cfg(n_trials: int) -> tuple[int, int]:
-    """(patience, min_trials) para parar Optuna quando o melhor valor estagna."""
-    nt = max(8, int(n_trials))
-    min_tr = max(14, min(52, (2 * nt) // 5))
-    pat = max(10, min(40, nt // 5))
-    if min_tr >= nt:
-        min_tr = max(8, min(nt - 2, (2 * nt) // 5))
-    return pat, max(6, min_tr)
-
-
-def _make_optuna_patience_stopping_callback(*, patience: int, min_trials: int) -> Any:
-    state: dict[str, float | int] = {"best": float("inf"), "no_improve": 0}
-
-    def _cb(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        if trial.state != optuna.trial.TrialState.COMPLETE:
-            return
-        if trial.value is None:
-            return
-        if not math.isfinite(float(trial.value)):
-            return
-        n_ok = 0
-        for t in study.trials:
-            if t.state != optuna.trial.TrialState.COMPLETE or t.value is None:
-                continue
-            if not math.isfinite(float(t.value)):
-                continue
-            n_ok += 1
-        bv = float(study.best_value)
-        if n_ok < min_trials:
-            state["best"] = bv
-            state["no_improve"] = 0
-            return
-        if bv < float(state["best"]) - 1e-9:
-            state["best"] = bv
-            state["no_improve"] = 0
-        else:
-            state["no_improve"] = int(state["no_improve"]) + 1
-        if int(state["no_improve"]) >= patience:
-            study.stop()
-
-    return _cb
-
-
-def _optuna_objective_lgbm(
-    trial: optuna.Trial,
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    n_splits: int,
-    random_state: int,
-    target_name: str,
-    horizon: int = 7,
-) -> float:
-    """
-    Otimização orientada à generalização temporal:
-    limites de complexidade escalonados com n, penalização de variância entre folds
-    (sensível a overfitting) e amplitude fold-a-fold (instabilidade).
-    """
-    if LGBMRegressor is None:
-        raise RuntimeError("lightgbm não instalado")
-
-    import sys
-
-    sys.stderr.write(f"\n[Optuna] Trial {trial.number + 1} • {target_name} • H={horizon}\n")
-    sys.stderr.flush()
-
-    is_qtd = target_name == "qtd"
-    long_h = int(horizon) >= 21
-    n = max(int(len(X_train)), 35)
-
-    leaves_cap = int(
-        min(76 if long_h else 48, max(20, int(14 + 5.2 * float(np.sqrt(float(n))))))
-    )
-    depth_cap = int(
-        min(9 if long_h else 7, max(3, 2 + int(np.log2(max(n // 42, 6)))))
-    )
-    depth_lo = 4 if long_h else 3
-    depth_cap = max(depth_lo, depth_cap)
-
-    ne_hi = int(min(495 if long_h else 360, max(125, min(430, n // 2 + 55))))
-    ne_lo = int(max(88 if long_h else 78, ne_hi - (285 if long_h else 245)))
-    ne_lo = min(max(ne_lo, 68), ne_hi - 22)
-
-    mcs_lo = int(max(26 if is_qtd else 22, min(52, n // 24 + 16)))
-    mcs_hi = int(max(mcs_lo + 14, min(112 if is_qtd else 86, n // 3 + 24)))
-
-    lr_lo, lr_hi = ((0.028, 0.13) if long_h else (0.034, 0.11))
-    subs_lo, subs_hi = ((0.52, 0.86) if long_h else (0.56, 0.86))
-    cols_lo, cols_hi = ((0.52, 0.86) if long_h else (0.58, 0.86))
-    ra_lo, ra_hi = ((0.035, 10.5) if long_h else (0.05, 14.0))
-    rl_lo, rl_hi = ((0.12, 22.0) if long_h else (0.14, 20.0))
-    mg_lo, mg_hi = ((0.002, 0.82) if long_h else (0.004, 0.95))
-
-    param = {
-        "n_estimators": trial.suggest_int("n_estimators", ne_lo, ne_hi),
-        "max_depth": trial.suggest_int("max_depth", depth_lo, depth_cap),
-        "learning_rate": trial.suggest_float("learning_rate", lr_lo, lr_hi, log=True),
-        "subsample": trial.suggest_float("subsample", subs_lo, subs_hi),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", cols_lo, cols_hi),
-        "reg_alpha": trial.suggest_float("reg_alpha", ra_lo, ra_hi, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", rl_lo, rl_hi, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 18, max(22, leaves_cap)),
-        "min_child_samples": trial.suggest_int("min_child_samples", mcs_lo, mcs_hi),
-        "min_split_gain": trial.suggest_float("min_split_gain", mg_lo, mg_hi, log=True),
-        "random_state": random_state,
-        "verbosity": -1,
-        "n_jobs": -1,
-    }
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    scores: list[float] = []
-    try:
-        for step, (tr_idx, va_idx) in enumerate(tscv.split(X_train)):
-            sys.stderr.write(f"\r[Optuna] trial {trial.number + 1} • fold {step + 1}/{n_splits}…\033[K")
-            sys.stderr.flush()
-            model = LGBMRegressor(**param)
-            y_tr = y_train.iloc[tr_idx]
-            sw = sample_weights(y_tr, True, target_name, horizon)
-            y_va_fold = y_train.iloc[va_idx]
-            es_rounds = 56 if long_h else 44
-            _fit_lgbm_with_early_stopping(
-                model,
-                X_train.iloc[tr_idx],
-                y_tr,
-                X_train.iloc[va_idx],
-                y_va_fold,
-                sw,
-                stopping_rounds=es_rounds,
-            )
-            p = model.predict(X_train.iloc[va_idx])
-            fold_mae = float(mean_absolute_error(y_train.iloc[va_idx], p))
-            scores.append(fold_mae)
-            trial.report(float(np.mean(scores)), step)
-            if step >= 1 and trial.should_prune():
-                raise optuna.TrialPruned()
-
-        mean_mae = float(np.mean(scores))
-        std_mae = float(np.std(scores)) if len(scores) > 1 else 0.0
-        spread = float(max(scores) - min(scores)) if len(scores) > 1 else 0.0
-        pen_std = 0.12 if long_h else 0.15
-        pen_sp = 0.09 if long_h else 0.105
-        return mean_mae + pen_std * std_mae + pen_sp * spread / (mean_mae + 1e-6)
-    finally:
-        sys.stderr.write("\n")
-        sys.stderr.flush()
-
-
-def _wrap_log(reg: Any) -> Any:
-    return TransformedTargetRegressor(regressor=reg, func=np.log1p, inverse_func=np.expm1)
-
-
-def _mm() -> MinMaxScaler:
-    # clip=True: valores fora do min/max vistos no fit ficam em [0,1].
-    # Sem isso, Ridge/ElasticNet explodem no teste quando há deriva de distribuição.
-    return MinMaxScaler(feature_range=(0, 1), clip=True)
-
-
-def build_ridge_pipe(rs: int) -> Pipeline:
-    return Pipeline(
-        [
-            ("scaler", _mm()),
-            ("model", Ridge(alpha=38.0, random_state=rs)),
-        ]
-    )
-
-
-def build_elastic_net_pipe(rs: int, target_name: str) -> Pipeline:
-    a = 0.18 if target_name == "qtd" else 88000.0
-    return Pipeline(
-        [
-            ("scaler", _mm()),
-            (
-                "model",
-                ElasticNet(
-                    alpha=a,
-                    l1_ratio=0.48 if target_name == "qtd" else 0.42,
-                    random_state=rs,
-                    max_iter=8000,
-                ),
-            ),
-        ]
-    )
-
-
-def build_random_forest_pipe(rs: int, horizon: int) -> Pipeline:
-    long_h = int(horizon) >= 21
-    return Pipeline(
-        [
-            ("scaler", _mm()),
-            (
-                "model",
-                RandomForestRegressor(
-                    n_estimators=300 if long_h else 240,
-                    max_depth=11 if long_h else 9,
-                    min_samples_leaf=8,
-                    min_samples_split=16,
-                    max_features="sqrt",
-                    random_state=rs,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-
-
-def build_lgbm_only_pipe(best_params: dict[str, Any], use_log: bool, rs: int) -> Pipeline:
-    lgb = LGBMRegressor(
-        **{**best_params, "random_state": rs, "verbosity": -1, "n_jobs": -1}
-    )
-    inner: Any = _wrap_log(lgb) if use_log else lgb
-    return Pipeline([("scaler", _mm()), ("model", inner)])
-
-
-def build_lgbm_fair_pipe(best_params: dict[str, Any], rs: int) -> Pipeline:
-    p = {
-        **best_params,
-        "objective": "fair",
-        "fair_c": 52.0,
-        "random_state": rs,
-        "verbosity": -1,
-        "n_jobs": -1,
-    }
-    return Pipeline([("scaler", _mm()), ("model", LGBMRegressor(**p))])
-
-
-def build_lgbm_quantile_pipe(
-    best_params: dict[str, Any], alpha: float, rs: int
-) -> Pipeline:
-    p = {
-        **best_params,
-        "objective": "quantile",
-        "alpha": float(alpha),
-        "random_state": rs,
-        "verbosity": -1,
-        "n_jobs": -1,
-    }
-    return Pipeline([("scaler", _mm()), ("model", LGBMRegressor(**p))])
-
-
-def build_hgb_pipe(rs: int, target_name: str) -> Pipeline:
-    if target_name == "qtd":
-        hgb = HistGradientBoostingRegressor(
-            max_iter=480,
-            max_depth=4,
-            min_samples_leaf=44,
-            learning_rate=0.055,
-            l2_regularization=6.2,
-            early_stopping=True,
-            validation_fraction=0.14,
-            n_iter_no_change=22,
-            random_state=rs,
-        )
-    else:
-        hgb = HistGradientBoostingRegressor(
-            max_iter=560,
-            max_depth=5,
-            min_samples_leaf=30,
-            learning_rate=0.038,
-            l2_regularization=4.6,
-            early_stopping=True,
-            validation_fraction=0.14,
-            n_iter_no_change=26,
-            random_state=rs,
-        )
-    return Pipeline([("scaler", _mm()), ("model", hgb)])
-
-
-def build_xgb_only_pipe(
-    best_params: dict[str, Any],
-    use_log: bool,
-    rs: int,
-    horizon: int = 7,
-) -> Pipeline | None:
-    if XGBRegressor is None:
-        return None
-    long_h = int(horizon) >= 21
-    nfac = 0.95 if long_h else 0.82
-    dcap = 8 if long_h else 6
-    kw = {
-        "n_estimators": min(420, int(nfac * float(best_params.get("n_estimators", 240)))),
-        "max_depth": min(dcap, int(best_params.get("max_depth", 6))),
-        "learning_rate": float(best_params.get("learning_rate", 0.055)),
-        "subsample": float(min(0.9, best_params.get("subsample", 0.82) + 0.02)),
-        "colsample_bytree": float(min(0.9, best_params.get("colsample_bytree", 0.82) + 0.02)),
-        "reg_alpha": float(max(0.08, best_params.get("reg_alpha", 0.18) * 1.22)),
-        "reg_lambda": float(max(0.65, best_params.get("reg_lambda", 1.4) * 1.52)),
-        "random_state": rs,
-        "n_jobs": -1,
-        "verbosity": 0,
-    }
-    xgb = XGBRegressor(**kw)
-    inner: Any = _wrap_log(xgb) if use_log else xgb
-    return Pipeline([("scaler", _mm()), ("model", inner)])
-
-
-def build_catboost_pipe(use_log: bool, rs: int, target_name: str) -> Pipeline | None:
-    if CatBoostRegressor is None:
-        return None
-    iters = int(0.82 * (1000 if target_name == "valor" else 750))
-    cb = CatBoostRegressor(
-        iterations=max(200, iters),
-        depth=5,
-        learning_rate=0.03,
-        l2_leaf_reg=22.0,
-        random_strength=0.52,
-        bagging_temperature=0.32,
-        rsm=0.78,
-        border_count=254,
-        random_seed=rs,
-        verbose=False,
-        loss_function="RMSE",
-        allow_writing_files=False,
-        thread_count=-1,
-    )
-    inner: Any = _wrap_log(cb) if use_log else cb
-    return Pipeline([("scaler", _mm()), ("model", inner)])
-
-
-def build_svm_pipe(rs: int, target_name: str) -> Pipeline:
-    """SVR com regularização moderada (C não excessivo) para limitar overfitting."""
-    c = 3.2 if target_name == "qtd" else 4.0
-    eps = 0.15 if target_name == "qtd" else 95_000.0
-    return Pipeline(
-        [
-            ("scaler", _mm()),
-            (
-                "model",
-                SVR(
-                    kernel="rbf",
-                    C=c,
-                    epsilon=eps,
-                    gamma="scale",
-                    max_iter=4000,
-                ),
-            ),
-        ]
-    )
-
-
-def build_knn_pipe(rs: int, target_name: str) -> Pipeline:
-    """k-NN com pesos por distância e k relativamente alto — suaviza ruído."""
-    k = 13 if target_name == "qtd" else 11
-    return Pipeline(
-        [
-            ("scaler", _mm()),
-            (
-                "model",
-                KNeighborsRegressor(
-                    n_neighbors=k,
-                    weights="distance",
-                    p=2,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-
-
-def build_extratrees_pipe(
-    best_params: dict[str, Any], use_log: bool, rs: int, horizon: int = 7
-) -> Pipeline:
-    long_h = int(horizon) >= 21
-    n_cap = 380 if long_h else 320
-    d_cap = 11 if long_h else 10
-    n_est = min(n_cap, max(220 if long_h else 200, int(best_params.get("n_estimators", 320))))
-    depth = min(d_cap, max(6 if long_h else 5, int(best_params.get("max_depth", 7))))
-    et = ExtraTreesRegressor(
-        n_estimators=n_est,
-        max_depth=depth,
-        min_samples_leaf=10,
-        min_samples_split=20,
-        max_features="sqrt",
-        random_state=rs,
-        n_jobs=-1,
-    )
-    inner: Any = _wrap_log(et) if use_log else et
-    return Pipeline([("scaler", _mm()), ("model", inner)])
-
-
-def build_ngboost_pipe(rs: int) -> Pipeline | None:
-    if NGBRegressor is None or Normal is None:
-        return None
-    ngb = NGBRegressor(
-        Dist=Normal,
-        n_estimators=240,
-        learning_rate=0.045,
-        natural_gradient=True,
-        random_state=rs,
-        verbose=False,
-    )
-    return Pipeline([("scaler", _mm()), ("model", ngb)])
-
-
-def build_light_stack_pipe(
-    best_params: dict[str, Any], use_log: bool, rs: int, target_name: str
-) -> Pipeline | None:
-    if LGBMRegressor is None:
-        return None
-    lgb_p = {**best_params, "random_state": rs, "verbosity": -1, "n_jobs": -1}
-    lgb_p["n_estimators"] = min(int(lgb_p.get("n_estimators", 200)), 200)
-    lgb_p["min_child_samples"] = max(int(lgb_p.get("min_child_samples", 20)), 22)
-    lgb = LGBMRegressor(**lgb_p)
-    hgb = HistGradientBoostingRegressor(
-        max_iter=320,
-        max_depth=4,
-        min_samples_leaf=32 if target_name == "qtd" else 22,
-        learning_rate=0.05,
-        l2_regularization=5.5 if target_name == "qtd" else 3.8,
-        early_stopping=True,
-        validation_fraction=0.12,
-        random_state=rs,
-    )
-    stack = StackingRegressor(
-        estimators=[("lgb", lgb), ("hgb", hgb)],
-        final_estimator=Ridge(alpha=44.0),
-        passthrough=False,
-        n_jobs=-1,
-    )
-    inner: Any = _wrap_log(stack) if use_log else stack
-    return Pipeline([("scaler", _mm()), ("model", inner)])
-
-
-def build_dummy_median_pipe() -> Pipeline:
-    return Pipeline(
-        [("scaler", _mm()), ("model", DummyRegressor(strategy="median"))]
-    )
-
-
-def _score_val_mae(
-    pipe: Any,
-    X_tr,
-    y_tr,
-    X_va,
-    y_va,
-    use_sw: bool,
-    target_name: str,
-    horizon: int = 7,
-) -> float:
-    p = clone(pipe)
-    _safe_fit_pipeline(p, X_tr, y_tr, use_sw, target_name, horizon)
-    pred = p.predict(X_va)
-    pred = np.maximum(np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
-    return float(mean_absolute_error(y_va, pred))
-
-
-def _collect_candidate_specs(
-    target_name: str, best_params: dict[str, Any], rs: int, horizon: int = 7
-) -> list[tuple[str, Pipeline, bool]]:
-    """Nome, pipeline (template), usar sample_weight recency (alvo valor / VGV)."""
-    out: list[tuple[str, Pipeline, bool]] = []
-    long_h = int(horizon) >= 21
-
-    out.append(("Ridge", build_ridge_pipe(rs), False))
-    out.append(("ElasticNet", build_elastic_net_pipe(rs, target_name), False))
-    out.append(("RandomForest", build_random_forest_pipe(rs, horizon), False))
-
-    if LGBMRegressor is not None:
-        out.append(("LGBM", build_lgbm_only_pipe(best_params, False, rs), True))
-        out.append(("LGBM+fair", build_lgbm_fair_pipe(best_params, rs), True))
-        out.append(("LGBM+q0.78", build_lgbm_quantile_pipe(best_params, 0.78, rs), True))
-        if long_h:
-            out.append(
-                ("LGBM+q0.85", build_lgbm_quantile_pipe(best_params, 0.85, rs), True)
-            )
-        if target_name == "valor":
-            out.append(("LGBM+q0.82", build_lgbm_quantile_pipe(best_params, 0.82, rs), True))
-            if long_h:
-                out.append(
-                    ("LGBM+q0.90", build_lgbm_quantile_pipe(best_params, 0.90, rs), True)
-                )
-            out.append(("LGBM+log1p", build_lgbm_only_pipe(best_params, True, rs), True))
-
-    out.append(("TS-linear", build_ts_linear_bridge_pipe(), False))
-    if LGBMRegressor is not None:
-        out.append(
-            (
-                "Med+High-LGBM",
-                build_median_quantile_blend_pipe(best_params, rs, target_name, horizon),
-                False,
-            )
-        )
-
-    out.append(("HGB", build_hgb_pipe(rs, target_name), False))
-
-    xgbp = build_xgb_only_pipe(best_params, False, rs, horizon)
-    if xgbp is not None:
-        out.append(("XGB", xgbp, True))
-        if target_name == "valor":
-            xl = build_xgb_only_pipe(best_params, True, rs, horizon)
-            if xl is not None:
-                out.append(("XGB+log1p", xl, True))
-
-    cb = build_catboost_pipe(False, rs, target_name)
-    if cb is not None:
-        out.append(("CatBoost", cb, False))
-        if target_name == "valor":
-            cb_log = build_catboost_pipe(True, rs, target_name)
-            if cb_log is not None:
-                out.append(("CatBoost+log1p", cb_log, False))
-
-    out.append(("ExtraTrees", build_extratrees_pipe(best_params, False, rs, horizon), True))
-    if target_name == "valor":
-        out.append(
-            ("ExtraTrees+log1p", build_extratrees_pipe(best_params, True, rs, horizon), True)
-        )
-        ngbp = build_ngboost_pipe(rs)
-        if ngbp is not None:
-            out.append(("NGBoost", ngbp, False))
-
-    lstack = build_light_stack_pipe(best_params, False, rs, target_name)
-    if lstack is not None:
-        out.append(("Stack(LGBM+HGB)", lstack, False))
-        if target_name == "valor":
-            ls2 = build_light_stack_pipe(best_params, True, rs, target_name)
-            if ls2 is not None:
-                out.append(("Stack+log1p", ls2, False))
-
-    out.append(("SVM (SVR)", build_svm_pipe(rs, target_name), False))
-    out.append(("k-NN", build_knn_pipe(rs, target_name), False))
-
-    out.append(("Baseline mediana", build_dummy_median_pipe(), False))
-    return out
-
-
-def _pick_super_ensemble(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    target_name: str,
-    best_params: dict[str, Any],
-    rs: int,
-    blend_top_k: int,
-    show_progress: bool = True,
-    horizon: int = 7,
-) -> tuple[list[Pipeline], np.ndarray, list[bool], str]:
-    long_h = int(horizon) >= 21
-    specs = _collect_candidate_specs(target_name, best_params, rs, horizon)
-    scored: list[tuple[float, str, Pipeline, bool]] = []
-    it = specs
-    if show_progress:
-        it = _pv_tqdm(
-            specs,
-            desc=f"Candidatos ({target_name})",
-            leave=False,
-            unit="modelo",
-        )
-    for name, pipe, use_sw in it:
-        try:
-            mae = _score_val_mae(
-                pipe, X_train, y_train, X_val, y_val, use_sw, target_name, horizon
-            )
-            scored.append((mae, name, pipe, use_sw))
-        except Exception:
-            continue
-
-    scored.sort(key=lambda x: x[0])
-    if not scored:
-        p = build_dummy_median_pipe()
-        return [clone(p)], np.array([1.0]), [False], "Baseline mediana (fallback)"
-
-    best_mae, best_name, best_pipe, best_sw = scored[0]
-    k = min(blend_top_k, len(scored))
-    if k < 2:
-        return [clone(best_pipe)], np.array([1.0]), [best_sw], best_name
-    top = scored[:k]
-    templates = [clone(t[2]) for t in top]
-    maes = np.array([t[0] for t in top], dtype=float)
-    sws = [t[3] for t in top]
-    names = [t[1] for t in top]
-
-    tau = max(float(np.median(maes)), 1e-9) * (0.62 if long_h else 0.78)
-    w = np.exp(-(maes - maes.min()) / tau)
-    w = w / (w.sum() + 1e-12)
-
-    blend = _make_fitted_blend(
-        templates, w, sws, X_train, y_train, target_name, horizon
-    )
-    pred_b = blend.predict(X_val)
-    pred_b = np.maximum(np.nan_to_num(pred_b, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
-    mae_blend = float(mean_absolute_error(y_val, pred_b))
-
-    rel_gain = (best_mae - mae_blend) / (best_mae + 1e-9)
-    rel_min = 0.02 if long_h else 0.024
-    if mae_blend < best_mae and k >= 2 and rel_gain > rel_min:
-        short = "+".join(names[: min(4, len(names))])
-        if len(names) > 4:
-            short += "+…"
-        return templates, w, sws, f"Super-blend ({k}): {short}"
-
-    return [clone(best_pipe)], np.array([1.0]), [best_sw], best_name
-
-
 def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
     """JSON-friendly: converte numpy e substitui NaN/Inf por null."""
 
@@ -1734,16 +572,6 @@ def _sanitize_benchmark_appendix(d: dict[str, Any]) -> dict[str, Any]:
         return x
 
     return fix(d)
-
-
-def _resolve_n_trials(n_trials: int, n_samples: int, horizon: int = 7) -> int:
-    """n_trials <= 0 → escala com log do tamanho da amostra (com poda, convém mais trials)."""
-    if n_trials > 0:
-        return n_trials
-    base = int(max(62, min(165, int(28 * np.log1p(n_samples)))))
-    if int(horizon) >= 21:
-        base = min(178, base + 28)
-    return base
 
 
 def _prevhtml_model_templates(random_state: int) -> dict[str, Any]:
@@ -2004,327 +832,24 @@ def train_one_target(
     full_period_train: bool = False,
     train_frac: float = 0.7,
 ) -> TrainResult:
-    if target_name == "qtd":
-        return _train_one_target_prevhtml(
-            X,
-            y,
-            horizon=horizon,
-            random_state=random_state,
-            show_progress=show_progress,
-            full_period_train=full_period_train,
-            train_frac=train_frac,
+    """
+    Treino único alinhado a prevhtml.py (sem Optuna): quantidade apenas.
+    Parâmetros n_trials, optuna_seed, blend_top_k e n_splits_tss mantêm-se na
+    assinatura por compatibilidade com chamadas existentes, mas são ignorados.
+    """
+    del n_trials, n_splits_tss, optuna_seed, blend_top_k
+    if target_name != "qtd":
+        raise ValueError(
+            "Apenas target_name='qtd' é suportado (pipeline prevhtml.py, sem Optuna nem VGV)."
         )
-
-    n = len(X)
-    hz = int(horizon)
-
-    if full_period_train:
-        X_fit = X
-        y_fit = y
-        sl_e_tr, sl_e_va = _ensemble_selection_splits(n)
-        X_train, y_train = X.iloc[sl_e_tr], y.iloc[sl_e_tr]
-        X_val, y_val = X.iloc[sl_e_va], y.iloc[sl_e_va]
-        dates_val = X_val.index
-        dates_test = X_fit.index
-        X_opt, y_opt = X_fit, y_fit
-        X_imp = X_fit
-        y_imp = y_fit
-    else:
-        sl_tr, sl_te = temporal_train_test_indices(n, float(train_frac))
-        X_80 = X.iloc[sl_tr]
-        y_80 = y.iloc[sl_tr]
-        X_test = X.iloc[sl_te]
-        y_test = y.iloc[sl_te]
-        sl_e_tr, sl_e_va = _ensemble_selection_splits(len(X_80))
-        X_train = X_80.iloc[sl_e_tr]
-        y_train = y_80.iloc[sl_e_tr]
-        X_val = X_80.iloc[sl_e_va]
-        y_val = y_80.iloc[sl_e_va]
-        dates_val = X_val.index
-        dates_test = X_test.index
-        X_fit = X_80
-        y_fit = y_80
-        X_opt, y_opt = X_80, y_80
-        X_imp = X
-        y_imp = y
-
-    n_splits = min(n_splits_tss, max(3, len(X_opt) // 22))
-    n_splits = max(3, n_splits)
-    nt = _resolve_n_trials(n_trials, len(X_opt), hz)
-
-    if LGBMRegressor is None:
-        if hz >= 21:
-            best_params = {
-                "n_estimators": 270,
-                "max_depth": 6,
-                "learning_rate": 0.065,
-                "subsample": 0.72,
-                "colsample_bytree": 0.72,
-                "reg_alpha": 0.32,
-                "reg_lambda": 3.0,
-                "num_leaves": 38,
-                "min_child_samples": 46,
-                "min_split_gain": 0.032,
-            }
-        else:
-            best_params = {
-                "n_estimators": 200,
-                "max_depth": 5,
-                "learning_rate": 0.068,
-                "subsample": 0.75,
-                "colsample_bytree": 0.75,
-                "reg_alpha": 0.42,
-                "reg_lambda": 3.6,
-                "num_leaves": 32,
-                "min_child_samples": 50,
-                "min_split_gain": 0.04,
-            }
-    else:
-
-        def objective(trial: optuna.Trial) -> float:
-            return _optuna_objective_lgbm(
-                trial,
-                X_opt,
-                y_opt,
-                n_splits=n_splits,
-                random_state=random_state,
-                target_name=target_name,
-                horizon=hz,
-            )
-
-        n_startup = max(12, min(32, nt // 3))
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=optuna.samplers.TPESampler(
-                seed=optuna_seed,
-                multivariate=True,
-                n_startup_trials=max(10, min(28, nt // 4)),
-            ),
-            pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=n_startup,
-                interval_steps=1,
-                n_warmup_steps=1,
-            ),
-        )
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        es_patience, es_min_trials = _optuna_patience_cfg(nt)
-        study.optimize(
-            objective,
-            n_trials=nt,
-            show_progress_bar=show_progress,
-            callbacks=[
-                _make_optuna_patience_stopping_callback(
-                    patience=es_patience,
-                    min_trials=es_min_trials,
-                )
-            ],
-        )
-        completed = [
-            t
-            for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-        ]
-        if completed:
-            best_params = study.best_params
-        else:
-            best_params = (
-                {
-                    "n_estimators": 280,
-                    "max_depth": 6,
-                    "learning_rate": 0.065,
-                    "subsample": 0.72,
-                    "colsample_bytree": 0.72,
-                    "reg_alpha": 0.35,
-                    "reg_lambda": 3.2,
-                    "num_leaves": 36,
-                    "min_child_samples": 48,
-                    "min_split_gain": 0.035,
-                }
-                if hz >= 21
-                else {
-                    "n_estimators": 210,
-                    "max_depth": 5,
-                    "learning_rate": 0.07,
-                    "subsample": 0.76,
-                    "colsample_bytree": 0.76,
-                    "reg_alpha": 0.45,
-                    "reg_lambda": 3.8,
-                    "num_leaves": 32,
-                    "min_child_samples": 52,
-                    "min_split_gain": 0.042,
-                }
-            )
-
-    specs_bm = _collect_candidate_specs(target_name, best_params, random_state, hz)
-
-    def _fit_bm(pipe: Any, X: pd.DataFrame, y: pd.Series, sw: bool) -> None:
-        _safe_fit_pipeline(pipe, X, y, sw, target_name, hz)
-
-    Xt_eval = X_test if not full_period_train else X_fit
-    yt_eval = y_test if not full_period_train else y_fit
-    bench_raw = run_model_benchmark(
-        specs_bm,
-        _fit_bm,
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_fit,
-        y_fit,
-        Xt_eval,
-        yt_eval,
+    return _train_one_target_prevhtml(
+        X,
+        y,
+        horizon=horizon,
+        random_state=random_state,
         show_progress=show_progress,
-    )
-    spec_map: dict[str, tuple[Any, bool]] = dict(bench_raw.get("spec_by_name") or {})
-    benchmark_appendix = _sanitize_benchmark_appendix(
-        {k: v for k, v in bench_raw.items() if k != "spec_by_name"}
-    )
-
-    wn = list(bench_raw.get("winner_names") or [])
-    ww = np.asarray(bench_raw.get("winner_weights") or [], dtype=float)
-    if (
-        wn
-        and len(ww) == len(wn)
-        and float(ww.sum()) > 1e-12
-        and all(n in spec_map for n in wn)
-    ):
-        ww = ww / (ww.sum() + 1e-12)
-        templates = [clone(spec_map[n][0]) for n in wn]
-        sws = [spec_map[n][1] for n in wn]
-        weights = ww
-        model_label = f"Benchmark: {bench_raw.get('winner_label', '?')}"
-    else:
-        templates, weights, sws, model_label = _pick_super_ensemble(
-            X_train,
-            y_train,
-            X_val,
-            y_val,
-            target_name,
-            best_params,
-            random_state,
-            blend_top_k=blend_top_k,
-            show_progress=show_progress,
-            horizon=hz,
-        )
-
-    pipe_val = _make_fitted_blend(
-        templates, weights, sws, X_train, y_train, target_name, hz
-    )
-    pred_val = pipe_val.predict(X_val)
-    pipe_eval = _make_fitted_blend(
-        templates, weights, sws, X_fit, y_fit, target_name, hz
-    )
-    if full_period_train:
-        pred_test = pipe_eval.predict(X_fit)
-        y_test = y_fit
-        pipe = pipe_eval
-    else:
-        pred_test = pipe_eval.predict(X_test)
-        pipe = _make_fitted_blend(
-            templates, weights, sws, X_imp, y_imp, target_name, hz
-        )
-
-    y_max_tr = float(np.percentile(y_train, 99.5)) if len(y_train) else 0.0
-    long_hz = hz >= 21
-    if target_name == "qtd":
-        cap_mult = 2.75 if long_hz else 2.35
-    else:
-        cap_mult = 4.45 if long_hz else 3.55
-    cap = max(y_max_tr * cap_mult, 1.0)
-    pred_val = np.clip(np.nan_to_num(pred_val, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap)
-    pred_test = np.clip(np.nan_to_num(pred_test, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap)
-
-    if full_period_train:
-        pred_tr_chart = np.clip(
-            np.nan_to_num(pipe_val.predict(X_train), nan=0.0, posinf=cap, neginf=0.0),
-            0.0,
-            cap,
-        )
-        chart_y_pred = np.concatenate(
-            [np.asarray(pred_tr_chart, dtype=float).ravel(), pred_val.ravel()]
-        ).tolist()
-        chart_y_real = (
-            np.asarray(y_train, dtype=float).ravel().tolist()
-            + np.asarray(y_val, dtype=float).ravel().tolist()
-        )
-        chart_dates = [d.strftime("%Y-%m-%d") for d in X_train.index] + [
-            d.strftime("%Y-%m-%d") for d in X_val.index
-        ]
-        chart_split_index = int(len(X_train))
-    else:
-        pred_tr_chart = np.clip(
-            np.nan_to_num(pipe_eval.predict(X_fit), nan=0.0, posinf=cap, neginf=0.0),
-            0.0,
-            cap,
-        )
-        chart_y_pred = np.concatenate(
-            [
-                np.asarray(pred_tr_chart, dtype=float).ravel(),
-                np.asarray(pred_test, dtype=float).ravel(),
-            ]
-        ).tolist()
-        chart_y_real = (
-            np.asarray(y_fit, dtype=float).ravel().tolist()
-            + np.asarray(y_test, dtype=float).ravel().tolist()
-        )
-        chart_dates = [d.strftime("%Y-%m-%d") for d in X_fit.index] + [
-            d.strftime("%Y-%m-%d") for d in X_test.index
-        ]
-        chart_split_index = int(len(X_fit))
-
-    metrics_val = _metrics_dict(y_val.values, pred_val, target_name)
-    metrics_test = _metrics_dict(np.asarray(y_test, dtype=float), pred_test, target_name)
-    metrics_val["n_features"] = float(X.shape[1])
-    metrics_test["n_features"] = float(X.shape[1])
-    y_tr_ref = np.asarray(y_train, dtype=float)
-    metrics_val["Acc_dir_mediana"] = _accuracy_vs_train_median(
-        y_val.values, pred_val, y_tr_ref
-    )
-    metrics_test["Acc_dir_mediana"] = _accuracy_vs_train_median(
-        np.asarray(y_test, dtype=float), pred_test, y_tr_ref
-    )
-
-    importance = pd.Series(dtype=float)
-    if LGBMRegressor is not None:
-        imp_model = LGBMRegressor(
-            **{**best_params, "random_state": random_state, "verbosity": -1, "n_jobs": -1}
-        )
-        scaler = _mm()
-        Xs = scaler.fit_transform(X_imp)
-        sw_imp = sample_weights(
-            pd.Series(np.asarray(y_imp, dtype=float)),
-            True,
-            target_name,
-            hz,
-        )
-        imp_model.fit(
-            Xs, np.asarray(y_imp, dtype=float), sample_weight=sw_imp
-        )
-        importance = (
-            pd.Series(imp_model.feature_importances_, index=X.columns)
-            .sort_values(ascending=False)
-            .head(20)
-        )
-
-    return TrainResult(
-        pipeline=pipe,
-        metrics_val=metrics_val,
-        metrics_test=metrics_test,
-        importance=importance,
-        y_val=y_val,
-        y_val_pred=pred_val,
-        y_test=y_test,
-        y_test_pred=pred_test,
-        best_params=best_params,
-        dates_val=dates_val,
-        dates_test=dates_test,
-        model_label=model_label,
         full_period_train=full_period_train,
-        chart_dates=chart_dates,
-        chart_y_real=chart_y_real,
-        chart_y_pred=chart_y_pred,
-        chart_split_index=chart_split_index,
-        benchmark_appendix=benchmark_appendix,
+        train_frac=train_frac,
     )
 
 # ----- inlined: macro_features.py -----
@@ -3280,11 +1805,14 @@ def _inject_ts_and_stl_features(
         seas_amp = np.zeros(n)
         idx_iter = range(win, n)
         if show_progress:
-            idx_iter = _pv_tqdm(
+            idx_iter = tqdm(
                 idx_iter,
                 desc=f"STL {short}",
                 leave=False,
                 unit="dia",
+                mininterval=0.12,
+                miniters=1,
+                dynamic_ncols=True,
             )
         for i in idx_iter:
             seg = arr[i - win : i]
@@ -5954,16 +4482,14 @@ def _sklearn_tree_split_thresholds_x0(tree_reg: Any) -> list[float]:
 
 
 # --- Decisões automáticas (sem input do utilizador) ---
-# Optuna: 0 = número de trials escalado ao tamanho da série em train_eval.
-OPTUNA_TRIALS_AUTO = 0
-# Top-K no super-ensemble / candidatos: 6 equilibra diversidade e custo (benchmark escolhe melhor combinação).
+# Top-K legado (relatório HTML / apêndice); o treino de quantidade é só prevhtml (competição fixa).
 BLEND_TOP_K_FIXO = 6
 RANDOM_SEED = 42
 # Split temporal 70% treino / 30% teste nas métricas reportadas (reduz ilusão de desempenho in-sample).
 TRAIN_FRAC_FIXO = 0.7
 # Holdout final nas métricas do relatório (mais fiável que 100% in-sample).
 FULL_PERIOD_TRAIN_FIXO = False
-# tqdm nas etapas longas (build master, STL, Optuna). Desative com PREVISAO_HIDE_TQDM=1.
+# tqdm nas etapas longas (build master, STL). Desative com PREVISAO_HIDE_TQDM=1.
 SHOW_ML_PROGRESS = str(os.environ.get("PREVISAO_HIDE_TQDM", "0")).lower() not in (
     "1",
     "true",
@@ -7089,10 +5615,7 @@ def run_training_pipeline(
             yq,
             horizon=h,
             target_name="qtd",
-            n_trials=OPTUNA_TRIALS_AUTO,
             random_state=RANDOM_SEED,
-            optuna_seed=RANDOM_SEED,
-            blend_top_k=BLEND_TOP_K_FIXO,
             show_progress=SHOW_ML_PROGRESS,
             full_period_train=FULL_PERIOD_TRAIN_FIXO,
             train_frac=TRAIN_FRAC_FIXO,
@@ -7149,10 +5672,7 @@ def run_training_pipeline(
                 yqc,
                 horizon=hz_eff,
                 target_name="qtd",
-                n_trials=OPTUNA_TRIALS_AUTO,
                 random_state=RANDOM_SEED,
-                optuna_seed=RANDOM_SEED + 7,
-                blend_top_k=BLEND_TOP_K_FIXO,
                 show_progress=SHOW_ML_PROGRESS,
                 full_period_train=FULL_PERIOD_TRAIN_FIXO,
                 train_frac=TRAIN_FRAC_FIXO,
@@ -7975,8 +6495,8 @@ def _render_tab_introducao() -> None:
         "é re-treinado em toda a série histórica válida para gerar a previsão do último dia."
     )
     _ix(
-        "Não há <strong>Optuna</strong> nem *TimeSeriesSplit* adicional neste percurso: os hiperparâmetros dos regressores "
-        "são os fixos definidos no *pipeline* executivo (abaixo)."
+        "Não há otimização automática de hiperparâmetros nem *TimeSeriesSplit* adicional: os regressores "
+        "utilizam os valores fixos do *pipeline* <strong>prevhtml</strong> (abaixo)."
     )
 
     st.markdown("#### 5 · Modelos utilizados na previsão (fixos)")
@@ -8363,10 +6883,11 @@ def _render_tab_introducao() -> None:
             "Instale `scikit-learn` e confirme a versão compatível com o projeto."
         )
 
-    st.markdown("#### 6 · LightGBM — parâmetros (referência)")
+    st.markdown("#### 6 · *Gradient boosting* (LightGBM) — parâmetros (referência pedagógica)")
     _ix(
-        "A tabela seguinte resume nomes usuais de hiperparâmetros; os valores efetivos resultam, contudo, "
-        "da otimização via Optuna e podem variar entre execuções."
+        "Tabela ilustrativa de hiperparâmetros típicos em bibliotecas do tipo LightGBM/XGBoost. "
+        "Na <strong>previsão de quantidade</strong> desta aplicação não se usa LightGBM nem busca automática de hiperparâmetros: "
+        "o treino segue o script <strong>prevhtml</strong> (XGBoost, Random Forest, Gradient Boosting, Ridge, Voting)."
     )
     ex_hp = pd.DataFrame(
         [
@@ -9119,7 +7640,7 @@ O relatório HTML na aba **Previsões** inclui gráficos, curvas ROC e *benchmar
         bpc = best_params_preview.get("custom") if isinstance(best_params_preview, dict) else None
         if bpc:
             st.markdown(
-                '<p class="pv-section-title">Cenário personalizado (referência Optuna)</p>',
+                '<p class="pv-section-title">Cenário personalizado (quantidade — prevhtml)</p>',
                 unsafe_allow_html=True,
             )
             st.json({"volume (qtd)": bpc.get("qtd") or {}})
@@ -9176,7 +7697,7 @@ def _render_streamlit_dossie_ml(
 - Os outliers no alvo não são truncados; o *cap* aplicado às previsões deriva, portanto, do próprio treino.
 
 **Validação / tuning (quantidade)**
-- *Split* cronológico 70/30 (e zona interna para escolha do vencedor), sem Optuna neste fluxo.
+- *Split* cronológico 70/30 (e zona interna para escolha do vencedor), alinhado ao fluxo prevhtml.
 """
         )
         m1, m2 = st.columns(2)
